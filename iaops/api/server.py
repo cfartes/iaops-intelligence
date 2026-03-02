@@ -18,6 +18,8 @@ from time import time
 from urllib.parse import parse_qs, urlparse
 
 from functions import handle_request
+from iaops.jobs import get_job_queue
+from iaops.jobs.pipeline import search_rag_documents
 from iaops.security.crypto import decrypt_text
 from iaops.security.totp import verify_totp
 try:
@@ -134,6 +136,30 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/auth/sessions":
             self._handle_auth_sessions_list()
+            return
+        if parsed.path == "/api/lgpd/policy":
+            self._handle_lgpd_policy_get()
+            return
+        if parsed.path == "/api/lgpd/rules":
+            self._handle_lgpd_rules_list()
+            return
+        if parsed.path == "/api/lgpd/dsr":
+            self._handle_lgpd_dsr_list(parsed.query)
+            return
+        if parsed.path == "/api/billing/plans":
+            self._handle_billing_plans_list()
+            return
+        if parsed.path == "/api/billing/subscription":
+            self._handle_billing_subscription_get()
+            return
+        if parsed.path == "/api/billing/installments":
+            self._handle_billing_installments_list(parsed.query)
+            return
+        if parsed.path == "/api/jobs":
+            self._handle_jobs_list(parsed.query)
+            return
+        if parsed.path == "/api/observability/metrics":
+            self._handle_observability_metrics()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -252,6 +278,39 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channel/webhook/whatsapp":
             self._handle_channel_webhook("whatsapp")
+            return
+        if parsed.path == "/api/lgpd/policy":
+            self._handle_lgpd_policy_upsert()
+            return
+        if parsed.path == "/api/lgpd/rules":
+            self._handle_lgpd_rule_upsert()
+            return
+        if parsed.path == "/api/lgpd/dsr":
+            self._handle_lgpd_dsr_open()
+            return
+        if parsed.path == "/api/lgpd/dsr/resolve":
+            self._handle_lgpd_dsr_resolve()
+            return
+        if parsed.path == "/api/billing/subscription":
+            self._handle_billing_subscription_upsert()
+            return
+        if parsed.path == "/api/billing/installments/generate":
+            self._handle_billing_installments_generate()
+            return
+        if parsed.path == "/api/billing/installments/pay":
+            self._handle_billing_installment_pay()
+            return
+        if parsed.path == "/api/jobs/ingest-metadata":
+            self._handle_jobs_enqueue("ingest_metadata")
+            return
+        if parsed.path == "/api/jobs/rag-rebuild":
+            self._handle_jobs_enqueue("rag_rebuild")
+            return
+        if parsed.path == "/api/jobs/monitor-scan":
+            self._handle_jobs_enqueue("monitor_scan")
+            return
+        if parsed.path == "/api/jobs/billing-cycle":
+            self._handle_jobs_enqueue("billing_cycle")
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -3185,7 +3244,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _execute_nl_chat_query(self, context: dict, question_text: str, language_code: str | None = None) -> dict:
         resolved_language = language_code or self._resolve_language_code(context)
         response_mode = self._resolve_chat_response_mode(context)
-        rag = self._build_rag_context(context)
+        rag = self._build_rag_context(context, question_text)
         planned = self._plan_sql_from_question(context, question_text, rag)
         sql_text = planned.get("sql_text")
         if not sql_text:
@@ -3268,7 +3327,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         return self._resolve_language_code(runtime_context)
 
-    def _build_rag_context(self, context: dict) -> dict:
+    def _build_rag_context(self, context: dict, question_text: str = "") -> dict:
+        semantic_docs: list[dict] = []
+        try:
+            semantic_docs = search_rag_documents(
+                tenant_id=int(context.get("tenant_id") or 0),
+                query_text=str(question_text or ""),
+                limit=8,
+            )
+        except Exception:
+            semantic_docs = []
         table_result = self._call_mcp(
             {
                 "context": context,
@@ -3297,7 +3365,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             key = f"{table.get('schema_name')}.{table.get('table_name')}"
             columns_by_table[key] = (column_result.get("data") or {}).get("columns") or []
         relationships = self._infer_table_relationships(tables, columns_by_table)
-        return {"tables": tables, "columns": columns_by_table, "relationships": relationships}
+        return {"tables": tables, "columns": columns_by_table, "relationships": relationships, "semantic_docs": semantic_docs}
 
     @staticmethod
     def _infer_table_relationships(tables: list[dict], columns_by_table: dict[str, list[dict]]) -> list[dict]:
@@ -3408,6 +3476,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "tables": rag.get("tables") or [],
             "columns": rag.get("columns") or {},
             "relationships": rag.get("relationships") or [],
+            "semantic_docs": [
+                {
+                    "doc_key": item.get("doc_key"),
+                    "content_text": item.get("content_text"),
+                    "score": item.get("score"),
+                }
+                for item in (rag.get("semantic_docs") or [])[:8]
+            ],
             "allowed_schemas_hint": ["public", "analytics", "iaops_gov"],
         }
         llm_output = self._invoke_llm_json(
@@ -3751,6 +3827,205 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error": None,
             },
         )
+
+    def _handle_lgpd_policy_get(self) -> None:
+        context = self._request_context()
+        try:
+            policy = self._db_get_lgpd_policy(tenant_id=int(context["tenant_id"]))
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "lgpd.policy.get",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"policy": policy},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.policy.get", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_policy_upsert(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        try:
+            policy = self._db_upsert_lgpd_policy(
+                tenant_id=int(context["tenant_id"]),
+                user_id=int(context["user_id"]),
+                dpo_name=body.get("dpo_name"),
+                dpo_email=body.get("dpo_email"),
+                retention_days=body.get("retention_days"),
+                legal_notes=body.get("legal_notes"),
+            )
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.policy.upsert", "correlation_id": str(uuid.uuid4()), "data": {"policy": policy}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.policy.upsert", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_rules_list(self) -> None:
+        context = self._request_context()
+        try:
+            rows = self._db_list_lgpd_rules(tenant_id=int(context["tenant_id"]))
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.rules.list", "correlation_id": str(uuid.uuid4()), "data": {"rules": rows}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.rules.list", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_rule_upsert(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        try:
+            rule = self._db_upsert_lgpd_rule(
+                tenant_id=int(context["tenant_id"]),
+                user_id=int(context["user_id"]),
+                rule_id=body.get("id"),
+                schema_name=body.get("schema_name"),
+                table_name=body.get("table_name"),
+                column_name=body.get("column_name"),
+                rule_type=body.get("rule_type"),
+                rule_config=body.get("rule_config") if isinstance(body.get("rule_config"), dict) else {},
+                is_active=bool(body.get("is_active", True)),
+            )
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.rules.upsert", "correlation_id": str(uuid.uuid4()), "data": {"rule": rule}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.rules.upsert", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_dsr_list(self, query: str) -> None:
+        context = self._request_context()
+        qs = parse_qs(query)
+        status = qs.get("status", [None])[0]
+        try:
+            rows = self._db_list_lgpd_dsr(tenant_id=int(context["tenant_id"]), status=status)
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.dsr.list", "correlation_id": str(uuid.uuid4()), "data": {"requests": rows}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.dsr.list", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_dsr_open(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        try:
+            req = self._db_open_lgpd_dsr(
+                tenant_id=int(context["tenant_id"]),
+                user_id=int(context["user_id"]),
+                requester_name=body.get("requester_name"),
+                requester_email=body.get("requester_email"),
+                request_type=body.get("request_type"),
+                subject_key=body.get("subject_key"),
+                notes=body.get("notes"),
+            )
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.dsr.open", "correlation_id": str(uuid.uuid4()), "data": {"request": req}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.dsr.open", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_lgpd_dsr_resolve(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        try:
+            req = self._db_resolve_lgpd_dsr(
+                tenant_id=int(context["tenant_id"]),
+                user_id=int(context["user_id"]),
+                request_id=body.get("request_id"),
+                notes=body.get("notes"),
+            )
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "lgpd.dsr.resolve", "correlation_id": str(uuid.uuid4()), "data": {"request": req}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "lgpd.dsr.resolve", "data": {}, "error": {"code": "lgpd_error", "message": str(exc)}})
+
+    def _handle_billing_plans_list(self) -> None:
+        try:
+            plans = self._db_list_billing_plans()
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.plans.list", "correlation_id": str(uuid.uuid4()), "data": {"plans": plans}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.plans.list", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_subscription_get(self) -> None:
+        context = self._request_context()
+        try:
+            sub = self._db_get_billing_subscription(client_id=int(context["client_id"]))
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.subscription.get", "correlation_id": str(uuid.uuid4()), "data": {"subscription": sub}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.subscription.get", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_subscription_upsert(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        try:
+            sub = self._db_upsert_billing_subscription(
+                client_id=int(context["client_id"]),
+                plan_code=body.get("plan_code"),
+                tolerance_days=body.get("tolerance_days"),
+            )
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.subscription.upsert", "correlation_id": str(uuid.uuid4()), "data": {"subscription": sub}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.subscription.upsert", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_installments_list(self, query: str) -> None:
+        context = self._request_context()
+        qs = parse_qs(query)
+        status = qs.get("status", [None])[0]
+        try:
+            rows = self._db_list_billing_installments(client_id=int(context["client_id"]), status=status)
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.installments.list", "correlation_id": str(uuid.uuid4()), "data": {"installments": rows}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.list", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_installments_generate(self) -> None:
+        context = self._request_context()
+        body = self._read_json_body()
+        due_date = body.get("due_date")
+        if not due_date:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.generate", "data": {}, "error": {"code": "invalid_input", "message": "due_date obrigatorio"}})
+            return
+        try:
+            result = self._db_generate_billing_installment(client_id=int(context["client_id"]), due_date=str(due_date))
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.installments.generate", "correlation_id": str(uuid.uuid4()), "data": result, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.generate", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_installment_pay(self) -> None:
+        body = self._read_json_body()
+        installment_id = body.get("installment_id")
+        if installment_id is None:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.pay", "data": {}, "error": {"code": "invalid_input", "message": "installment_id obrigatorio"}})
+            return
+        try:
+            row = self._db_pay_billing_installment(installment_id=int(installment_id))
+            self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.installments.pay", "correlation_id": str(uuid.uuid4()), "data": {"installment": row}, "error": None})
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.pay", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_jobs_enqueue(self, job_kind: str) -> None:
+        body = self._read_json_body()
+        context = self._request_context()
+        queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
+        payload = dict(body) if isinstance(body, dict) else {}
+        payload.setdefault("tenant_id", int(context.get("tenant_id") or 0))
+        result = queue.enqueue(tenant_id=int(context.get("tenant_id") or 0), job_kind=job_kind, payload=payload)
+        self._send_json(HTTPStatus.OK, {"status": "success", "tool": f"jobs.{job_kind}", "correlation_id": str(uuid.uuid4()), "data": result, "error": None})
+
+    def _handle_jobs_list(self, query: str) -> None:
+        context = self._request_context()
+        qs = parse_qs(query)
+        limit = int(qs.get("limit", ["50"])[0])
+        queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
+        rows = queue.list_jobs(tenant_id=int(context.get("tenant_id") or 0), limit=limit)
+        self._send_json(HTTPStatus.OK, {"status": "success", "tool": "jobs.list", "correlation_id": str(uuid.uuid4()), "data": {"jobs": rows}, "error": None})
+
+    def _handle_observability_metrics(self) -> None:
+        context = self._request_context()
+        tenant_id = int(context.get("tenant_id") or 0)
+        metrics = {
+            "active_sessions": len(self.active_sessions),
+            "failed_login_buckets": len(self.failed_login_attempts),
+            "failed_ip_buckets": len(self.failed_login_attempts_ip),
+            "pending_mfa_challenges": len(self.mfa_login_challenges),
+            "pending_password_resets": len(self.pending_password_resets),
+            "tenant_id": tenant_id,
+        }
+        if self._is_db_enabled():
+            try:
+                metrics.update(self._db_collect_observability_metrics(tenant_id=tenant_id))
+            except Exception:
+                pass
+        self._send_json(HTTPStatus.OK, {"status": "success", "tool": "observability.metrics", "correlation_id": str(uuid.uuid4()), "data": metrics, "error": None})
 
     def _handle_generic_call(self) -> None:
         body = self._read_json_body()
@@ -4191,6 +4466,526 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "message": f"Falha de conectividade {label} em {host}:{port} - {exc}",
                 "network": {"host": host, "port": port},
             }
+
+    def _db_get_lgpd_policy(self, *, tenant_id: int) -> dict:
+        if not self._is_db_enabled():
+            return {}
+        schema = self.signup_schema
+        sql = f"""
+            SELECT dpo_name, dpo_email, retention_days, legal_notes, updated_by_user_id, updated_at
+            FROM {schema}.lgpd_policy
+            WHERE tenant_id = %(tenant_id)s
+            LIMIT 1
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "dpo_name": row[0],
+            "dpo_email": row[1],
+            "retention_days": row[2],
+            "legal_notes": row[3],
+            "updated_by_user_id": row[4],
+            "updated_at": row[5].isoformat() if row[5] else None,
+        }
+
+    def _db_upsert_lgpd_policy(
+        self,
+        *,
+        tenant_id: int,
+        user_id: int,
+        dpo_name: object,
+        dpo_email: object,
+        retention_days: object,
+        legal_notes: object,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema = self.signup_schema
+        sql = f"""
+            INSERT INTO {schema}.lgpd_policy (
+                tenant_id, dpo_name, dpo_email, retention_days, legal_notes, updated_by_user_id, updated_at
+            )
+            VALUES (
+                %(tenant_id)s, %(dpo_name)s, %(dpo_email)s, %(retention_days)s, %(legal_notes)s, %(user_id)s, NOW()
+            )
+            ON CONFLICT (tenant_id)
+            DO UPDATE SET
+                dpo_name = EXCLUDED.dpo_name,
+                dpo_email = EXCLUDED.dpo_email,
+                retention_days = EXCLUDED.retention_days,
+                legal_notes = EXCLUDED.legal_notes,
+                updated_by_user_id = EXCLUDED.updated_by_user_id,
+                updated_at = NOW()
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "tenant_id": tenant_id,
+                    "dpo_name": str(dpo_name or "").strip() or None,
+                    "dpo_email": str(dpo_email or "").strip() or None,
+                    "retention_days": int(retention_days) if retention_days not in (None, "") else None,
+                    "legal_notes": str(legal_notes or "").strip() or None,
+                    "user_id": user_id,
+                },
+            )
+            conn.commit()
+        return self._db_get_lgpd_policy(tenant_id=tenant_id)
+
+    def _db_list_lgpd_rules(self, *, tenant_id: int) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        schema = self.signup_schema
+        sql = f"""
+            SELECT id, schema_name, table_name, column_name, rule_type, rule_config, is_active, updated_at
+            FROM {schema}.lgpd_rule
+            WHERE tenant_id = %(tenant_id)s
+            ORDER BY id DESC
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            rows = cur.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "schema_name": row[1],
+                "table_name": row[2],
+                "column_name": row[3],
+                "rule_type": row[4],
+                "rule_config": row[5] or {},
+                "is_active": bool(row[6]),
+                "updated_at": row[7].isoformat() if row[7] else None,
+            }
+            for row in rows
+        ]
+
+    def _db_upsert_lgpd_rule(
+        self,
+        *,
+        tenant_id: int,
+        user_id: int,
+        rule_id: object,
+        schema_name: object,
+        table_name: object,
+        column_name: object,
+        rule_type: object,
+        rule_config: dict,
+        is_active: bool,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema_name_v = str(schema_name or "").strip()
+        table_name_v = str(table_name or "").strip()
+        column_name_v = str(column_name or "").strip()
+        rule_type_v = str(rule_type or "").strip()
+        if not schema_name_v or not table_name_v or not column_name_v or not rule_type_v:
+            raise ValueError("schema_name, table_name, column_name e rule_type obrigatorios")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            if rule_id not in (None, ""):
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.lgpd_rule
+                       SET schema_name = %(schema_name)s,
+                           table_name = %(table_name)s,
+                           column_name = %(column_name)s,
+                           rule_type = %(rule_type)s,
+                           rule_config = %(rule_config)s::jsonb,
+                           is_active = %(is_active)s,
+                           updated_at = NOW()
+                     WHERE id = %(id)s
+                       AND tenant_id = %(tenant_id)s
+                    RETURNING id
+                    """,
+                    {
+                        "id": int(rule_id),
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name_v,
+                        "table_name": table_name_v,
+                        "column_name": column_name_v,
+                        "rule_type": rule_type_v,
+                        "rule_config": json.dumps(rule_config or {}, ensure_ascii=True),
+                        "is_active": bool(is_active),
+                    },
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("regra nao encontrada")
+                new_id = int(row[0])
+            else:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.lgpd_rule (
+                        tenant_id, schema_name, table_name, column_name, rule_type, rule_config, is_active, created_by_user_id
+                    )
+                    VALUES (
+                        %(tenant_id)s, %(schema_name)s, %(table_name)s, %(column_name)s, %(rule_type)s, %(rule_config)s::jsonb, %(is_active)s, %(user_id)s
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name_v,
+                        "table_name": table_name_v,
+                        "column_name": column_name_v,
+                        "rule_type": rule_type_v,
+                        "rule_config": json.dumps(rule_config or {}, ensure_ascii=True),
+                        "is_active": bool(is_active),
+                        "user_id": user_id,
+                    },
+                )
+                new_id = int(cur.fetchone()[0])
+            conn.commit()
+        rows = self._db_list_lgpd_rules(tenant_id=tenant_id)
+        return next((item for item in rows if int(item["id"]) == int(new_id)), {})
+
+    def _db_list_lgpd_dsr(self, *, tenant_id: int, status: str | None) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        schema = self.signup_schema
+        sql = f"""
+            SELECT id, requester_name, requester_email, request_type, subject_key, status, notes, created_at, resolved_at
+            FROM {schema}.lgpd_dsr_request
+            WHERE tenant_id = %(tenant_id)s
+              AND (%(status)s IS NULL OR status = %(status)s)
+            ORDER BY id DESC
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id, "status": status})
+            rows = cur.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "requester_name": row[1],
+                "requester_email": row[2],
+                "request_type": row[3],
+                "subject_key": row[4],
+                "status": row[5],
+                "notes": row[6],
+                "created_at": row[7].isoformat() if row[7] else None,
+                "resolved_at": row[8].isoformat() if row[8] else None,
+            }
+            for row in rows
+        ]
+
+    def _db_open_lgpd_dsr(
+        self,
+        *,
+        tenant_id: int,
+        user_id: int,
+        requester_name: object,
+        requester_email: object,
+        request_type: object,
+        subject_key: object,
+        notes: object,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        requester_name_v = str(requester_name or "").strip()
+        requester_email_v = str(requester_email or "").strip()
+        request_type_v = str(request_type or "").strip()
+        if not requester_name_v or not requester_email_v or not request_type_v:
+            raise ValueError("requester_name, requester_email e request_type obrigatorios")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.lgpd_dsr_request (
+                    tenant_id, requester_name, requester_email, request_type, subject_key, status, notes, opened_by_user_id
+                )
+                VALUES (
+                    %(tenant_id)s, %(requester_name)s, %(requester_email)s, %(request_type)s, %(subject_key)s, 'open', %(notes)s, %(user_id)s
+                )
+                RETURNING id
+                """,
+                {
+                    "tenant_id": tenant_id,
+                    "requester_name": requester_name_v,
+                    "requester_email": requester_email_v,
+                    "request_type": request_type_v,
+                    "subject_key": str(subject_key or "").strip() or None,
+                    "notes": str(notes or "").strip() or None,
+                    "user_id": user_id,
+                },
+            )
+            req_id = int(cur.fetchone()[0])
+            conn.commit()
+        rows = self._db_list_lgpd_dsr(tenant_id=tenant_id, status=None)
+        return next((item for item in rows if int(item["id"]) == req_id), {})
+
+    def _db_resolve_lgpd_dsr(self, *, tenant_id: int, user_id: int, request_id: object, notes: object) -> dict:
+        if request_id in (None, ""):
+            raise ValueError("request_id obrigatorio")
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {schema}.lgpd_dsr_request
+                   SET status = 'resolved',
+                       notes = COALESCE(%(notes)s, notes),
+                       resolved_by_user_id = %(user_id)s,
+                       resolved_at = NOW()
+                 WHERE tenant_id = %(tenant_id)s
+                   AND id = %(id)s
+                RETURNING id
+                """,
+                {
+                    "tenant_id": tenant_id,
+                    "id": int(request_id),
+                    "notes": str(notes or "").strip() or None,
+                    "user_id": user_id,
+                },
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("solicitacao nao encontrada")
+            conn.commit()
+        rows = self._db_list_lgpd_dsr(tenant_id=tenant_id, status=None)
+        return next((item for item in rows if int(item["id"]) == int(request_id)), {})
+
+    def _db_list_billing_plans(self) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, code, name, max_tenants, max_users, monthly_price_cents, is_active
+                FROM {schema}.billing_plan
+                ORDER BY id
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "code": row[1],
+                "name": row[2],
+                "max_tenants": int(row[3]),
+                "max_users": int(row[4]),
+                "monthly_price_cents": int(row[5]),
+                "is_active": bool(row[6]),
+            }
+            for row in rows
+        ]
+
+    def _db_get_billing_subscription(self, *, client_id: int) -> dict:
+        if not self._is_db_enabled():
+            return {}
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT s.id, s.client_id, s.plan_id, p.code, p.name, s.status, s.tolerance_days, s.starts_at, s.ends_at
+                FROM {schema}.billing_subscription s
+                JOIN {schema}.billing_plan p ON p.id = s.plan_id
+                WHERE s.client_id = %(client_id)s
+                ORDER BY s.id DESC
+                LIMIT 1
+                """,
+                {"client_id": client_id},
+            )
+            row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "id": int(row[0]),
+            "client_id": int(row[1]),
+            "plan_id": int(row[2]),
+            "plan_code": row[3],
+            "plan_name": row[4],
+            "status": row[5],
+            "tolerance_days": int(row[6]),
+            "starts_at": row[7].isoformat() if row[7] else None,
+            "ends_at": row[8].isoformat() if row[8] else None,
+        }
+
+    def _db_upsert_billing_subscription(self, *, client_id: int, plan_code: object, tolerance_days: object) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        plan_code_v = str(plan_code or "").strip().lower()
+        if not plan_code_v:
+            raise ValueError("plan_code obrigatorio")
+        schema = self.signup_schema
+        tol = int(tolerance_days) if tolerance_days not in (None, "") else 5
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT id FROM {schema}.billing_plan WHERE code = %(code)s LIMIT 1", {"code": plan_code_v})
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("plan_code nao encontrado")
+            plan_id = int(row[0])
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.billing_subscription (
+                    client_id, plan_id, status, starts_at, ends_at, tolerance_days, updated_at
+                )
+                VALUES (
+                    %(client_id)s, %(plan_id)s, 'active', NOW(), NULL, %(tolerance_days)s, NOW()
+                )
+                ON CONFLICT DO NOTHING
+                """,
+                {"client_id": client_id, "plan_id": plan_id, "tolerance_days": tol},
+            )
+            cur.execute(
+                f"""
+                UPDATE {schema}.billing_subscription
+                   SET plan_id = %(plan_id)s,
+                       tolerance_days = %(tolerance_days)s,
+                       status = 'active',
+                       updated_at = NOW()
+                 WHERE id = (
+                    SELECT id FROM {schema}.billing_subscription
+                    WHERE client_id = %(client_id)s
+                    ORDER BY id DESC
+                    LIMIT 1
+                 )
+                """,
+                {"client_id": client_id, "plan_id": plan_id, "tolerance_days": tol},
+            )
+            conn.commit()
+        return self._db_get_billing_subscription(client_id=client_id)
+
+    def _db_list_billing_installments(self, *, client_id: int, status: str | None) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        schema = self.signup_schema
+        sql = f"""
+            SELECT i.id, i.subscription_id, i.due_date, i.amount_cents, i.status, i.paid_at, i.created_at
+            FROM {schema}.billing_installment i
+            JOIN {schema}.billing_subscription s ON s.id = i.subscription_id
+            WHERE s.client_id = %(client_id)s
+              AND (%(status)s IS NULL OR i.status = %(status)s)
+            ORDER BY i.due_date DESC, i.id DESC
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"client_id": client_id, "status": status})
+            rows = cur.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "subscription_id": int(row[1]),
+                "due_date": row[2].isoformat() if row[2] else None,
+                "amount_cents": int(row[3]),
+                "status": row[4],
+                "paid_at": row[5].isoformat() if row[5] else None,
+                "created_at": row[6].isoformat() if row[6] else None,
+            }
+            for row in rows
+        ]
+
+    def _db_generate_billing_installment(self, *, client_id: int, due_date: str) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT s.id, p.monthly_price_cents
+                FROM {schema}.billing_subscription s
+                JOIN {schema}.billing_plan p ON p.id = s.plan_id
+                WHERE s.client_id = %(client_id)s
+                ORDER BY s.id DESC
+                LIMIT 1
+                """,
+                {"client_id": client_id},
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("assinatura nao encontrada para o cliente")
+            subscription_id = int(row[0])
+            amount_cents = int(row[1])
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.billing_installment (
+                    subscription_id, due_date, amount_cents, status
+                )
+                VALUES (
+                    %(subscription_id)s, %(due_date)s::date, %(amount_cents)s, 'open'
+                )
+                RETURNING id
+                """,
+                {"subscription_id": subscription_id, "due_date": due_date, "amount_cents": amount_cents},
+            )
+            installment_id = int(cur.fetchone()[0])
+            conn.commit()
+        rows = self._db_list_billing_installments(client_id=client_id, status=None)
+        created = next((item for item in rows if int(item["id"]) == installment_id), None)
+        return {"installment": created}
+
+    def _db_pay_billing_installment(self, *, installment_id: int) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {schema}.billing_installment
+                   SET status = 'paid',
+                       paid_at = NOW()
+                 WHERE id = %(id)s
+                RETURNING id, subscription_id, due_date, amount_cents, status, paid_at, created_at
+                """,
+                {"id": installment_id},
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("parcela nao encontrada")
+            conn.commit()
+        return {
+            "id": int(row[0]),
+            "subscription_id": int(row[1]),
+            "due_date": row[2].isoformat() if row[2] else None,
+            "amount_cents": int(row[3]),
+            "status": row[4],
+            "paid_at": row[5].isoformat() if row[5] else None,
+            "created_at": row[6].isoformat() if row[6] else None,
+        }
+
+    def _db_collect_observability_metrics(self, *, tenant_id: int) -> dict:
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema}.incident
+                WHERE tenant_id = %(tenant_id)s
+                  AND status = 'open'
+                """,
+                {"tenant_id": tenant_id},
+            )
+            open_incidents = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema}.event
+                WHERE tenant_id = %(tenant_id)s
+                  AND severity = 'critical'
+                """,
+                {"tenant_id": tenant_id},
+            )
+            critical_events = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE status IN ('queued','running')) AS jobs_inflight,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS jobs_failed
+                FROM {schema}.async_job_run
+                WHERE tenant_id = %(tenant_id)s
+                """,
+                {"tenant_id": tenant_id},
+            )
+            jobs = cur.fetchone()
+        return {
+            "open_incidents": open_incidents,
+            "critical_events": critical_events,
+            "jobs_inflight": int((jobs[0] or 0) if jobs else 0),
+            "jobs_failed": int((jobs[1] or 0) if jobs else 0),
+        }
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))

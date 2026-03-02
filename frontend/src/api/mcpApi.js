@@ -609,3 +609,150 @@ export async function channelWebhookWhatsapp(payload) {
   });
   return parseWebhookResponse(response);
 }
+
+export async function getLgpdPolicy() {
+  const response = await fetch("/api/lgpd/policy", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertLgpdPolicy(payload) {
+  const response = await fetch("/api/lgpd/policy", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listLgpdRules() {
+  const response = await fetch("/api/lgpd/rules", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertLgpdRule(payload) {
+  const response = await fetch("/api/lgpd/rules", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listLgpdDsr(status) {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const response = await fetch(`/api/lgpd/dsr${query}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function openLgpdDsr(payload) {
+  const response = await fetch("/api/lgpd/dsr", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function resolveLgpdDsr(payload) {
+  const response = await fetch("/api/lgpd/dsr/resolve", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listBillingPlans() {
+  const response = await fetch("/api/billing/plans", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function getBillingSubscription() {
+  const response = await fetch("/api/billing/subscription", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertBillingSubscription(payload) {
+  const response = await fetch("/api/billing/subscription", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listBillingInstallments(status) {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const response = await fetch(`/api/billing/installments${query}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function generateBillingInstallment(payload) {
+  const response = await fetch("/api/billing/installments/generate", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function payBillingInstallment(payload) {
+  const response = await fetch("/api/billing/installments/pay", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function enqueueIngestionJob(payload = {}) {
+  const response = await fetch("/api/jobs/ingest-metadata", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function enqueueRagRebuildJob(payload = {}) {
+  const response = await fetch("/api/jobs/rag-rebuild", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listAsyncJobs(limit = 50) {
+  const response = await fetch(`/api/jobs?limit=${encodeURIComponent(limit)}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function getObservabilityMetrics() {
+  const response = await fetch("/api/observability/metrics", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}

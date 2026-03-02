@@ -11,7 +11,8 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - iaops_db_data:/var/lib/postgresql/data
-      - ./sql:/docker-entrypoint-initdb.d:ro
+      - ./sql/000_bootstrap_dev.sql:/docker-entrypoint-initdb.d/000_bootstrap_dev.sql:ro
+      - ./sql:/docker-entrypoint-initdb.d/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iaops}"]
       interval: 10s
@@ -39,6 +40,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       IAOPS_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-iaops}
       IAOPS_DB_SCHEMA: ${IAOPS_DB_SCHEMA:-iaops_gov}
@@ -50,8 +53,30 @@ services:
       IAOPS_SMTP_PASS: ${IAOPS_SMTP_PASS:-}
       IAOPS_SMTP_FROM: ${IAOPS_SMTP_FROM:-}
       IAOPS_SMTP_STARTTLS: ${IAOPS_SMTP_STARTTLS:-1}
+      IAOPS_USE_CELERY: ${IAOPS_USE_CELERY:-1}
+      IAOPS_CELERY_BROKER_URL: ${IAOPS_CELERY_BROKER_URL:-redis://redis:6379/0}
+      IAOPS_CELERY_RESULT_BACKEND: ${IAOPS_CELERY_RESULT_BACKEND:-redis://redis:6379/0}
     ports:
       - "${API_PORT:-8000}:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: iaops-worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      IAOPS_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-iaops}
+      IAOPS_DB_SCHEMA: ${IAOPS_DB_SCHEMA:-iaops_gov}
+      IAOPS_USE_CELERY: 1
+      IAOPS_CELERY_BROKER_URL: ${IAOPS_CELERY_BROKER_URL:-redis://redis:6379/0}
+      IAOPS_CELERY_RESULT_BACKEND: ${IAOPS_CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+    command: ["celery", "-A", "iaops.jobs.celery_app:celery_app", "worker", "-l", "INFO"]
 
   frontend:
     build:

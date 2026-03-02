@@ -1709,6 +1709,35 @@ class PostgresMCPRepository(MCPRepository):
             "applied_masks": [],
         }
 
+    def list_active_lgpd_rules(self, tenant_id: int) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT
+                schema_name,
+                table_name,
+                column_name,
+                rule_type,
+                rule_config
+            FROM {self.schema}.lgpd_rule
+            WHERE tenant_id = %(tenant_id)s
+              AND is_active = TRUE
+            ORDER BY id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            rows = cur.fetchall()
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            normalized.append(
+                {
+                    "schema_name": str(row.get("schema_name") or "").strip().lower(),
+                    "table_name": str(row.get("table_name") or "").strip().lower(),
+                    "column_name": str(row.get("column_name") or "").strip().lower(),
+                    "rule_type": str(row.get("rule_type") or "").strip().lower(),
+                    "rule_config": row.get("rule_config") or {},
+                }
+            )
+        return normalized
+
     def create_incident(
         self,
         tenant_id: int,

@@ -14,6 +14,7 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - [MFA por usuario (TOTP)](sql/006_user_mfa.sql)
 - [Flag de superadmin](sql/007_superadmin_user.sql)
 - [Contexto de tenant por canal](sql/008_channel_tenant_context.sql)
+- [Extensoes de plataforma (LGPD/Billing/RAG/Jobs)](sql/011_platform_ops.sql)
 - [Seed MCP baseline](sql/003_mcp_seed.sql)
 - [Dados demo locais](sql/004_demo_data.sql)
 - [Bootstrap dev unico](sql/000_bootstrap_dev.sql)
@@ -115,6 +116,7 @@ Ou aplicar scripts SQL manualmente:
 \i sql/006_user_mfa.sql
 \i sql/007_superadmin_user.sql
 \i sql/008_channel_tenant_context.sql
+\i sql/011_platform_ops.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql
 ```
@@ -162,11 +164,18 @@ Servicos:
 - API: `http://SEU_HOST:8000`
 - PostgreSQL: `SEU_HOST:5432`
 - Redis: `SEU_HOST:6379`
+- Worker Celery: `iaops-worker` (interno no compose)
 
 Observacoes de producao:
 - Configure `IAOPS_CRYPTO_KEY` no `.env` (Fernet key valida).
 - Configure SMTP (`IAOPS_SMTP_*`) para confirmacao de cadastro e reset de senha.
 - O backend instala `msodbcsql18`, `pyodbc`, `pymysql` e `oracledb` para testes autenticados de conectores.
+- Jobs assinc:
+  - `POST /api/jobs/ingest-metadata`
+  - `POST /api/jobs/rag-rebuild`
+  - `POST /api/jobs/monitor-scan`
+  - `POST /api/jobs/billing-cycle`
+  - `GET /api/jobs`
 
 ## Objetivo
 Este repositorio inicia com baseline de produto e arquitetura para acelerar implementacao por iteracoes.

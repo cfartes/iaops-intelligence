@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import Any, Callable
 
 from .models import ROLE_ORDER, RequestContext, ToolExecutionResult
 from .repository import MCPRepository
+
+
+class LgpdBlockedError(ValueError):
+    def __init__(self, blocked_fields: list[str]) -> None:
+        self.blocked_fields = blocked_fields
+        joined = ", ".join(sorted(set(blocked_fields))[:10])
+        super().__init__(f"consulta bloqueada por regra LGPD nas colunas: {joined}")
 
 
 class MCPGateway:
@@ -134,6 +142,13 @@ class MCPGateway:
         try:
             data = self._handlers[tool_name](context, tool_input, max_rows)
             result = ToolExecutionResult("success", data)
+        except LgpdBlockedError as exc:
+            result = ToolExecutionResult(
+                "denied",
+                {"blocked_fields": sorted(set(exc.blocked_fields))},
+                "lgpd_blocked",
+                str(exc),
+            )
         except ValueError as exc:
             result = ToolExecutionResult("denied", {}, "invalid_input", str(exc))
         except Exception as exc:  # pragma: no cover - scaffold fallback
@@ -660,7 +675,179 @@ class MCPGateway:
         self._assert_safe_select(sql_text)
         sql_policy = self.repository.get_sql_security_policy(context.tenant_id)
         self._assert_allowed_schemas(sql_text, sql_policy.get("allowed_schema_patterns") or [])
-        return self.repository.execute_safe_sql(context.tenant_id, sql_text, max_rows)
+        result = self.repository.execute_safe_sql(context.tenant_id, sql_text, max_rows)
+        if not bool(sql_policy.get("require_masking", True)):
+            return result
+        rules = self.repository.list_active_lgpd_rules(context.tenant_id)
+        if not rules:
+            return result
+        blocked = self._enforce_lgpd_block_rules(sql_text=sql_text, rows=result.get("rows") or [], columns=result.get("columns") or [], rules=rules)
+        if blocked:
+            raise LgpdBlockedError(blocked)
+        rows = result.get("rows") or []
+        columns = result.get("columns") or []
+        masked_rows, applied_masks = self._apply_lgpd_masks(sql_text=sql_text, rows=rows, columns=columns, rules=rules)
+        result["rows"] = masked_rows
+        result["applied_masks"] = sorted(set((result.get("applied_masks") or []) + applied_masks))
+        return result
+
+    def _enforce_lgpd_block_rules(
+        self,
+        *,
+        sql_text: str,
+        rows: list[Any],
+        columns: list[Any],
+        rules: list[dict[str, Any]],
+    ) -> list[str]:
+        if not rows:
+            return []
+        table_refs = self._extract_sql_table_refs(sql_text)
+        blocked_rules = [
+            rule
+            for rule in rules
+            if str(rule.get("rule_type") or "").strip().lower() in {"block", "deny", "forbid", "deny_access"}
+        ]
+        if not blocked_rules:
+            return []
+        by_col: dict[str, list[dict[str, Any]]] = {}
+        for rule in blocked_rules:
+            col = str(rule.get("column_name") or "").strip().lower()
+            if col:
+                by_col.setdefault(col, []).append(rule)
+        if not by_col:
+            return []
+        blocked_fields: list[str] = []
+        normalized_columns = {str(c or "").strip().lower() for c in columns if str(c or "").strip()}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate_cols = normalized_columns | {str(k).strip().lower() for k in row.keys()}
+            for col_key in candidate_cols:
+                rules_for_col = by_col.get(col_key)
+                if not rules_for_col:
+                    continue
+                matched_rule = self._select_rule_for_sql_refs(rules_for_col, table_refs)
+                if not matched_rule:
+                    continue
+                blocked_fields.append(
+                    f"{matched_rule.get('schema_name')}.{matched_rule.get('table_name')}.{matched_rule.get('column_name')}"
+                )
+        return blocked_fields
+
+    def _apply_lgpd_masks(
+        self,
+        *,
+        sql_text: str,
+        rows: list[Any],
+        columns: list[Any],
+        rules: list[dict[str, Any]],
+    ) -> tuple[list[Any], list[str]]:
+        if not rows:
+            return rows, []
+        table_refs = self._extract_sql_table_refs(sql_text)
+        by_column: dict[str, list[dict[str, Any]]] = {}
+        for rule in rules:
+            col = str(rule.get("column_name") or "").strip().lower()
+            if not col:
+                continue
+            by_column.setdefault(col, []).append(rule)
+        if not by_column:
+            return rows, []
+
+        normalized_columns = [str(c or "").strip() for c in columns]
+        applied: list[str] = []
+        masked_rows: list[Any] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                masked_rows.append(row)
+                continue
+            item = dict(row)
+            candidate_cols = set(item.keys()) | set(normalized_columns)
+            for raw_col in candidate_cols:
+                if not raw_col:
+                    continue
+                key = str(raw_col).strip().lower()
+                rules_for_col = by_column.get(key)
+                if not rules_for_col:
+                    continue
+                matched_rule = self._select_rule_for_sql_refs(rules_for_col, table_refs)
+                if not matched_rule:
+                    continue
+                if raw_col not in item:
+                    for existing in list(item.keys()):
+                        if str(existing).strip().lower() == key:
+                            raw_col = existing
+                            break
+                    if raw_col not in item:
+                        continue
+                item[raw_col] = self._mask_value(
+                    value=item.get(raw_col),
+                    rule_type=str(matched_rule.get("rule_type") or "").strip().lower(),
+                    rule_config=matched_rule.get("rule_config") or {},
+                )
+                applied.append(f"{matched_rule.get('schema_name')}.{matched_rule.get('table_name')}.{key}")
+            masked_rows.append(item)
+        return masked_rows, applied
+
+    def _select_rule_for_sql_refs(
+        self,
+        rules_for_col: list[dict[str, Any]],
+        table_refs: set[tuple[str, str]],
+    ) -> dict[str, Any] | None:
+        if not rules_for_col:
+            return None
+        if not table_refs:
+            return rules_for_col[0]
+        for rule in rules_for_col:
+            schema_name = str(rule.get("schema_name") or "").strip().lower()
+            table_name = str(rule.get("table_name") or "").strip().lower()
+            if (schema_name, table_name) in table_refs:
+                return rule
+        return None
+
+    def _extract_sql_table_refs(self, sql_text: str) -> set[tuple[str, str]]:
+        refs: set[tuple[str, str]] = set()
+        pattern = re.compile(r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?", re.IGNORECASE)
+        for match in pattern.finditer(sql_text):
+            first = str(match.group(1) or "").strip().lower()
+            second = str(match.group(2) or "").strip().lower()
+            if first and second:
+                refs.add((first, second))
+            elif first:
+                refs.add(("public", first))
+        return refs
+
+    def _mask_value(self, *, value: Any, rule_type: str, rule_config: dict[str, Any]) -> Any:
+        if value is None:
+            return None
+        text = str(value)
+        mask_char = str(rule_config.get("mask_char") or "*")
+        if rule_type in {"mask", "full_mask", "anonymize"}:
+            return mask_char * max(4, len(text))
+        if rule_type in {"email_mask", "mask_email"}:
+            return self._mask_email(text=text, mask_char=mask_char)
+        if rule_type in {"hash", "sha256"}:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if rule_type in {"last4", "keep_last4"}:
+            show_last = int(rule_config.get("show_last") or 4)
+            keep = max(0, min(show_last, len(text)))
+            return (mask_char * max(0, len(text) - keep)) + text[-keep:]
+        if rule_type in {"cpf_mask"}:
+            digits = re.sub(r"\D", "", text)
+            if len(digits) >= 11:
+                return "***.***.***-**"
+            return mask_char * max(4, len(text))
+        return mask_char * max(4, len(text))
+
+    def _mask_email(self, *, text: str, mask_char: str) -> str:
+        if "@" not in text:
+            return mask_char * max(4, len(text))
+        local, domain = text.split("@", 1)
+        if not local:
+            return f"{mask_char}@{domain}"
+        if len(local) == 1:
+            return f"{local}{mask_char}@{domain}"
+        return f"{local[0]}{mask_char * (len(local) - 1)}@{domain}"
 
     def _handle_security_sql_get_policy(
         self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None

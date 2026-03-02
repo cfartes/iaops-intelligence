@@ -3,3 +3,4 @@ cryptography>=43,<45
 pyodbc>=5.1,<6
 pymysql>=1.1,<2
 oracledb>=2.2,<3
+celery[redis]>=5.4,<6

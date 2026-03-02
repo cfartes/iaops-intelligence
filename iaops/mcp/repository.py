@@ -283,6 +283,10 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_active_lgpd_rules(self, tenant_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
     def create_incident(
         self,
         tenant_id: int,
@@ -1224,6 +1228,10 @@ class InMemoryMCPRepository(MCPRepository):
             "execution_ms": 42,
             "applied_masks": ["customer_cpf"],
         }
+
+    def list_active_lgpd_rules(self, tenant_id: int) -> list[dict[str, Any]]:
+        _ = tenant_id
+        return []
 
     def create_incident(
         self,

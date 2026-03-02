@@ -17,6 +17,9 @@ import SqlSecurityPanel from "./pages/SqlSecurityPanel";
 import ChatBiPanel from "./pages/ChatBiPanel";
 import AccessPanel from "./pages/AccessPanel";
 import ConfiguracaoPanel from "./pages/ConfiguracaoPanel";
+import LgpdPanel from "./pages/LgpdPanel";
+import BillingPanel from "./pages/BillingPanel";
+import InstallmentsPanel from "./pages/InstallmentsPanel";
 import { NAV_ITEMS } from "./state/nav";
 import {
   createIncident,
@@ -1248,6 +1251,12 @@ export default function App() {
             }}
             onSessionRevokedCurrent={() => performLogout()}
           />
+        ) : activePage === "lgpd" ? (
+          <LgpdPanel onSystemMessage={openSystemMessage} />
+        ) : activePage === "faturamento" ? (
+          <BillingPanel onSystemMessage={openSystemMessage} />
+        ) : activePage === "parcelas" ? (
+          <InstallmentsPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "incidentes" ? (
           <IncidentPanel
             onOpenCreate={() => setIsIncidentModalOpen(true)}
