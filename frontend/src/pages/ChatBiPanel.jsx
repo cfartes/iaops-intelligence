@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { runChatBiQuery } from "../api/mcpApi";
+import { tUi } from "../i18n/uiText";
 
 function summarizeResult(rows) {
   if (!rows || rows.length === 0) return "Pergunta processada com sucesso, sem registros retornados.";
@@ -19,7 +20,7 @@ export default function ChatBiPanel({ onSystemMessage }) {
 
   const askQuestion = async () => {
     if (!question.trim()) {
-      onSystemMessage("warning", "Pergunta vazia", "Informe uma pergunta em linguagem natural.");
+      onSystemMessage("warning", tUi("chat.emptyQuestion.title", "Pergunta vazia"), tUi("chat.emptyQuestion.message", "Informe uma pergunta em linguagem natural."));
       return;
     }
     setLoading(true);
@@ -35,7 +36,7 @@ export default function ChatBiPanel({ onSystemMessage }) {
         setAnswer(`Consulta concluida com ${data?.result?.rows?.length || 0} linha(s).`);
       }
     } catch (error) {
-      onSystemMessage("error", "Falha no Chat BI", error.message);
+      onSystemMessage("error", tUi("chat.fail.title", "Falha no Chat BI"), error.message);
     } finally {
       setLoading(false);
     }
@@ -45,34 +46,36 @@ export default function ChatBiPanel({ onSystemMessage }) {
     <section className="page-panel">
       <header>
         <h2>Chat BI</h2>
-        <p>Perguntas em linguagem natural com RAG de metadados e execucao segura.</p>
+        <p>{tUi("chat.header.subtitle", "Perguntas em linguagem natural com RAG de metadados e execucao segura.")}</p>
       </header>
 
       <div className="form-grid chat-grid">
         <label>
-          Pergunta
+          {tUi("chat.label.question", "Pergunta")}
           <textarea
             className="chat-textarea"
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
-            placeholder="Ex.: Quantos incidentes abertos temos agora?"
+            placeholder={tUi("chat.placeholder.question", "Ex.: Quantos incidentes abertos temos agora?")}
           />
         </label>
 
         <div className="page-actions">
           <button type="button" className="btn btn-primary" onClick={askQuestion}>
-            Perguntar
+            {tUi("chat.ask", "Perguntar")}
           </button>
         </div>
       </div>
 
-      {loading && <p className="empty-state">Processando pergunta...</p>}
+      {loading && <p className="empty-state">{tUi("chat.loading", "Processando pergunta...")}</p>}
 
       {answer && !loading && <p className="chat-summary">{answer}</p>}
 
       {result && !loading && (
         <div className="chat-result">
-          <p className="chat-summary">{summarizeResult(rows)} Modo: {responseMode === "detailed" ? "Detalhada" : "Executiva"}.</p>
+          <p className="chat-summary">
+            {summarizeResult(rows)} {tUi("chat.mode.label", "Modo")}: {responseMode === "detailed" ? tUi("chat.mode.detailed", "Detalhada") : tUi("chat.mode.executive", "Executiva")}.
+          </p>
 
           {responseMode === "detailed" && columns.length > 0 && rows.length > 0 && (
             <div className="table-wrap">

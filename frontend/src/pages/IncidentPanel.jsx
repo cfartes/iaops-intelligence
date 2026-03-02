@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listIncidents } from "../api/mcpApi";
+import { tUi } from "../i18n/uiText";
 
 const STATUS_OPTIONS = ["open", "ack", "resolved", "closed"];
 const SEVERITY_OPTIONS = ["low", "medium", "high", "critical"];
@@ -33,7 +34,7 @@ export default function IncidentPanel({
       });
       setItems(data.incidents || []);
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar incidentes", error.message);
+      onSystemMessage("error", tUi("incident.fail", "Erro ao carregar incidentes"), error.message);
     } finally {
       setLoading(false);
     }
@@ -46,22 +47,22 @@ export default function IncidentPanel({
   return (
     <section className="page-panel">
       <header>
-        <h2>Incidentes</h2>
-        <p>Abertura e acompanhamento de incidentes operacionais via MCP.</p>
+        <h2>{tUi("incident.header.title", "Incidentes")}</h2>
+        <p>{tUi("incident.header.subtitle", "Abertura e acompanhamento de incidentes operacionais via MCP.")}</p>
       </header>
 
       <div className="page-actions">
         <button type="button" className="btn btn-primary" onClick={onOpenCreate}>
-          Novo Incidente (Modal)
+          {tUi("incident.new", "Novo Incidente (Modal)")}
         </button>
         <button type="button" className="btn btn-secondary" onClick={loadIncidents}>
-          Atualizar Lista
+          {tUi("incident.refresh", "Atualizar Lista")}
         </button>
       </div>
 
       <div className="inline-form">
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="">Status: todos</option>
+          <option value="">{tUi("incident.filter.statusAll", "Status: todos")}</option>
           {STATUS_OPTIONS.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -69,7 +70,7 @@ export default function IncidentPanel({
           ))}
         </select>
         <select value={severityFilter} onChange={(e) => setSeverityFilter(e.target.value)}>
-          <option value="">Severidade: todas</option>
+          <option value="">{tUi("incident.filter.severityAll", "Severidade: todas")}</option>
           {SEVERITY_OPTIONS.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -77,13 +78,13 @@ export default function IncidentPanel({
           ))}
         </select>
         <button type="button" className="btn btn-secondary" onClick={loadIncidents}>
-          Aplicar Filtro
+          {tUi("incident.filter.apply", "Aplicar Filtro")}
         </button>
       </div>
 
       <ul className="data-list">
-        {loading && <li className="empty-state">Carregando...</li>}
-        {!loading && items.length === 0 && <li className="empty-state">Nenhum incidente encontrado.</li>}
+        {loading && <li className="empty-state">{tUi("common.loading", "Carregando...")}</li>}
+        {!loading && items.length === 0 && <li className="empty-state">{tUi("incident.empty", "Nenhum incidente encontrado.")}</li>}
         {items.map((item) => (
           <li key={item.incident_id} className="row-card">
             <div>
@@ -103,7 +104,7 @@ export default function IncidentPanel({
                 </button>
               ))}
               <button type="button" className="btn btn-secondary btn-small" onClick={() => onOpenStatusModal(item)}>
-                Atualizar Status
+                {tUi("incident.updateStatus", "Atualizar Status")}
               </button>
             </div>
           </li>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { channelWebhookTelegram, channelWebhookWhatsapp, getOperationHealth } from "../api/mcpApi";
+import { tUi } from "../i18n/uiText";
 
 export default function OperationPanel({ onSystemMessage }) {
   const [health, setHealth] = useState(null);
@@ -15,7 +16,7 @@ export default function OperationPanel({ onSystemMessage }) {
       const data = await getOperationHealth(60);
       setHealth(data);
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar saude operacional", error.message);
+      onSystemMessage("error", tUi("op.fail.health", "Erro ao carregar saude operacional"), error.message);
     }
   };
 
@@ -35,7 +36,7 @@ export default function OperationPanel({ onSystemMessage }) {
 
   const sendChannelMessage = async () => {
     if (!externalUserKey.trim() || !conversationKey.trim()) {
-      onSystemMessage("warning", "Campos obrigatorios", "Informe external_user_key e conversation_key.");
+      onSystemMessage("warning", tUi("op.required.title", "Campos obrigatorios"), tUi("op.required.message", "Informe external_user_key e conversation_key."));
       return;
     }
     setIsSending(true);
@@ -51,9 +52,9 @@ export default function OperationPanel({ onSystemMessage }) {
           ? await channelWebhookTelegram(payload)
           : await channelWebhookWhatsapp(payload);
       setWebhookResponse(data);
-      onSystemMessage("success", "Webhook processado", "Mensagem processada com sucesso no canal.");
+      onSystemMessage("success", tUi("op.webhook.ok.title", "Webhook processado"), tUi("op.webhook.ok.message", "Mensagem processada com sucesso no canal."));
     } catch (error) {
-      onSystemMessage("error", "Erro no webhook", error.message);
+      onSystemMessage("error", tUi("op.webhook.fail.title", "Erro no webhook"), error.message);
     } finally {
       setIsSending(false);
     }
@@ -62,34 +63,34 @@ export default function OperationPanel({ onSystemMessage }) {
   return (
     <section className="page-panel">
       <header>
-        <h2>Operacao</h2>
-        <p>Painel de saude operacional e canais de notificacao.</p>
+        <h2>{tUi("op.header.title", "Operacao")}</h2>
+        <p>{tUi("op.header.subtitle", "Painel de saude operacional e canais de notificacao.")}</p>
       </header>
 
       <div className="page-actions">
         <button type="button" className="btn btn-secondary" onClick={loadHealth}>
-          Atualizar Saude
+          {tUi("op.refresh", "Atualizar Saude")}
         </button>
       </div>
 
-      {!health && <p className="empty-state">Sem dados de saude.</p>}
+      {!health && <p className="empty-state">{tUi("op.empty", "Sem dados de saude.")}</p>}
 
       {health && (
         <div className="metric-grid">
           <article className="metric-card">
-            <h4>Incidentes abertos</h4>
+            <h4>{tUi("op.metric.openIncidents", "Incidentes abertos")}</h4>
             <strong>{health.open_incidents}</strong>
           </article>
           <article className="metric-card">
-            <h4>Eventos criticos (janela)</h4>
+            <h4>{tUi("op.metric.criticalEvents", "Eventos criticos (janela)")}</h4>
             <strong>{health.critical_events}</strong>
           </article>
           <article className="metric-card">
-            <h4>Ultima varredura</h4>
+            <h4>{tUi("op.metric.lastScan", "Ultima varredura")}</h4>
             <strong>{health.last_scan_at || "n/a"}</strong>
           </article>
           <article className="metric-card">
-            <h4>Canais</h4>
+            <h4>{tUi("op.metric.channels", "Canais")}</h4>
             <div className="chip-row">
               {Object.entries(health.channels_health || {}).map(([name, status]) => (
                 <span key={name} className="chip">{name}: {status}</span>
@@ -100,10 +101,9 @@ export default function OperationPanel({ onSystemMessage }) {
       )}
 
       <section className="catalog-block channel-tester">
-        <h3>Tester de Canal (Telegram/WhatsApp)</h3>
+        <h3>{tUi("op.tester.title", "Tester de Canal (Telegram/WhatsApp)")}</h3>
         <p className="muted">
-          Simula entrada de webhook com comandos: <code>tenant list</code>, <code>tenant select &lt;id&gt;</code>,
-          <code>tenant active</code> e perguntas em linguagem natural.
+          {tUi("op.tester.subtitle", "Simula entrada de webhook com comandos e linguagem natural.")}
         </p>
 
         <div className="inline-form">
@@ -127,17 +127,17 @@ export default function OperationPanel({ onSystemMessage }) {
           <input
             value={messageText}
             onChange={(event) => setMessageText(event.target.value)}
-            placeholder="Mensagem / comando"
+            placeholder={tUi("op.tester.message.placeholder", "Mensagem / comando")}
           />
           <button type="button" className="btn btn-primary" onClick={sendChannelMessage} disabled={isSending}>
-            {isSending ? "Enviando..." : "Enviar para Webhook"}
+            {isSending ? tUi("op.tester.sending", "Enviando...") : tUi("op.tester.send", "Enviar para Webhook")}
           </button>
         </div>
 
         {webhookResponse && (
           <article className="metric-card webhook-output">
-            <h4>Resposta do Bot</h4>
-            <pre>{webhookResponse.reply_text || "Sem resposta textual"}</pre>
+            <h4>{tUi("op.tester.reply", "Resposta do Bot")}</h4>
+            <pre>{webhookResponse.reply_text || tUi("op.tester.noReply", "Sem resposta textual")}</pre>
           </article>
         )}
       </section>

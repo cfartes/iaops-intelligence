@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listAuditCalls } from "../api/mcpApi";
+import { tUi } from "../i18n/uiText";
 
 const STATUS_OPTIONS = ["success", "denied", "error", "timeout"];
 
@@ -21,7 +22,7 @@ export default function AuditPanel({ onSystemMessage }) {
       });
       setItems(data.calls || []);
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar auditoria", error.message);
+      onSystemMessage("error", tUi("audit.fail", "Erro ao carregar auditoria"), error.message);
     } finally {
       setLoading(false);
     }
@@ -34,14 +35,14 @@ export default function AuditPanel({ onSystemMessage }) {
   return (
     <section className="page-panel">
       <header>
-        <h2>Auditoria</h2>
-        <p>Rastreio de chamadas MCP por tenant.</p>
+        <h2>{tUi("audit.header.title", "Auditoria")}</h2>
+        <p>{tUi("audit.header.subtitle", "Rastreio de chamadas MCP por tenant.")}</p>
       </header>
 
       <div className="inline-form">
-        <input placeholder="Tool (ex.: incident.list)" value={toolFilter} onChange={(e) => setToolFilter(e.target.value)} />
+        <input placeholder={tUi("audit.tool.placeholder", "Tool (ex.: incident.list)")} value={toolFilter} onChange={(e) => setToolFilter(e.target.value)} />
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="">Status: todos</option>
+          <option value="">{tUi("audit.status.all", "Status: todos")}</option>
           {STATUS_OPTIONS.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -49,18 +50,18 @@ export default function AuditPanel({ onSystemMessage }) {
           ))}
         </select>
         <input
-          placeholder="Correlation ID"
+          placeholder={tUi("audit.correlation.placeholder", "Correlation ID")}
           value={correlationFilter}
           onChange={(e) => setCorrelationFilter(e.target.value)}
         />
         <button type="button" className="btn btn-secondary" onClick={loadCalls}>
-          Aplicar Filtro
+          {tUi("audit.filter.apply", "Aplicar Filtro")}
         </button>
       </div>
 
       <ul className="data-list">
-        {loading && <li className="empty-state">Carregando...</li>}
-        {!loading && items.length === 0 && <li className="empty-state">Nenhum log encontrado.</li>}
+        {loading && <li className="empty-state">{tUi("common.loading", "Carregando...")}</li>}
+        {!loading && items.length === 0 && <li className="empty-state">{tUi("audit.empty", "Nenhum log encontrado.")}</li>}
         {items.map((item) => (
           <li key={item.call_id || `${item.correlation_id}-${item.created_at}`} className="row-card">
             <div>

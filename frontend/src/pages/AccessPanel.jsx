@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { adminResetMfa, createTenant, getTenantLimits, listAccessUsers, listClientTenants, updateTenantStatus } from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import TenantFormModal from "../components/TenantFormModal";
+import { tUi } from "../i18n/uiText";
 
 export default function AccessPanel({ onSystemMessage }) {
   const [users, setUsers] = useState([]);
@@ -19,7 +20,7 @@ export default function AccessPanel({ onSystemMessage }) {
       const data = await listAccessUsers();
       setUsers(data.users || []);
     } catch (error) {
-      onSystemMessage("error", "Falha ao listar usuarios", error.message);
+      onSystemMessage("error", tUi("access.fail.users", "Falha ao listar usuarios"), error.message);
     } finally {
       setLoading(false);
     }
@@ -31,7 +32,7 @@ export default function AccessPanel({ onSystemMessage }) {
       setTenants(tenantData.tenants || []);
       setLimits(limitData.limits || null);
     } catch (error) {
-      onSystemMessage("error", "Falha ao listar tenants", error.message);
+      onSystemMessage("error", tUi("access.fail.tenants", "Falha ao listar tenants"), error.message);
     }
   };
 
@@ -46,11 +47,15 @@ export default function AccessPanel({ onSystemMessage }) {
     try {
       await adminResetMfa({ target_user_id: pendingResetUser.user_id });
       setPendingResetUser(null);
-      onSystemMessage("success", "MFA resetado", `MFA resetado para ${pendingResetUser.email}.`);
+      onSystemMessage(
+        "success",
+        tUi("access.ok.reset.title", "MFA resetado"),
+        tUi("access.ok.reset.message", `MFA resetado para ${pendingResetUser.email}.`, { email: pendingResetUser.email })
+      );
       await loadUsers();
       await loadTenants();
     } catch (error) {
-      onSystemMessage("error", "Falha no reset de MFA", error.message);
+      onSystemMessage("error", tUi("access.fail.reset", "Falha no reset de MFA"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -61,10 +66,14 @@ export default function AccessPanel({ onSystemMessage }) {
     try {
       await createTenant(payload);
       setTenantModalOpen(false);
-      onSystemMessage("success", "Tenant criado", `Tenant ${payload.name} criado com sucesso.`);
+      onSystemMessage(
+        "success",
+        tUi("access.ok.createTenant.title", "Tenant criado"),
+        tUi("access.ok.createTenant.message", `Tenant ${payload.name} criado com sucesso.`, { name: payload.name })
+      );
       await loadTenants();
     } catch (error) {
-      onSystemMessage("error", "Falha ao criar tenant", error.message);
+      onSystemMessage("error", tUi("access.fail.createTenant", "Falha ao criar tenant"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -81,12 +90,15 @@ export default function AccessPanel({ onSystemMessage }) {
       setPendingTenantAction(null);
       onSystemMessage(
         "success",
-        "Tenant atualizado",
-        `Tenant ${pendingTenantAction.tenant.name} atualizado para ${pendingTenantAction.nextStatus}.`
+        tUi("access.ok.updateTenant.title", "Tenant atualizado"),
+        tUi("access.ok.updateTenant.message", `Tenant ${pendingTenantAction.tenant.name} atualizado para ${pendingTenantAction.nextStatus}.`, {
+          name: pendingTenantAction.tenant.name,
+          status: pendingTenantAction.nextStatus,
+        })
       );
       await loadTenants();
     } catch (error) {
-      onSystemMessage("error", "Falha ao atualizar tenant", error.message);
+      onSystemMessage("error", tUi("access.fail.updateTenant", "Falha ao atualizar tenant"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -95,18 +107,18 @@ export default function AccessPanel({ onSystemMessage }) {
   return (
     <section className="page-panel">
       <header>
-        <h2>Acesso</h2>
-        <p>Gestao de usuarios por tenant e reset MFA (admin/owner).</p>
+        <h2>{tUi("access.header.title", "Acesso")}</h2>
+        <p>{tUi("access.header.subtitle", "Gestao de usuarios por tenant e reset MFA (admin/owner).")}</p>
       </header>
       <div className="page-actions">
         <button type="button" className="btn btn-secondary" onClick={loadUsers}>
-          Atualizar Usuarios
+          {tUi("access.refreshUsers", "Atualizar Usuarios")}
         </button>
       </div>
       {loading ? (
-        <p className="empty-state">Carregando usuarios...</p>
+        <p className="empty-state">{tUi("access.loadingUsers", "Carregando usuarios...")}</p>
       ) : users.length === 0 ? (
-        <p className="empty-state">Nenhum usuario encontrado.</p>
+        <p className="empty-state">{tUi("access.emptyUsers", "Nenhum usuario encontrado.")}</p>
       ) : (
         <div className="table-wrap">
           <table className="data-table">
@@ -128,15 +140,15 @@ export default function AccessPanel({ onSystemMessage }) {
                   <td>{item.full_name}</td>
                   <td>{item.email}</td>
                   <td>{item.role}</td>
-                  <td>{item.is_active ? "Ativo" : "Inativo"}</td>
-                  <td>{item.mfa_enabled ? "Habilitado" : "Desabilitado"}</td>
+                  <td>{item.is_active ? tUi("access.status.active", "Ativo") : tUi("access.status.inactive", "Inativo")}</td>
+                  <td>{item.mfa_enabled ? tUi("access.mfa.enabled", "Habilitado") : tUi("access.mfa.disabled", "Desabilitado")}</td>
                   <td>
                     <button
                       type="button"
                       className="btn btn-small btn-secondary"
                       onClick={() => setPendingResetUser(item)}
                     >
-                      Reset MFA
+                      {tUi("access.resetMfa", "Reset MFA")}
                     </button>
                   </td>
                 </tr>
@@ -148,16 +160,19 @@ export default function AccessPanel({ onSystemMessage }) {
 
       <section className="catalog-block">
         <div className="section-header">
-          <h3>Tenants do cliente</h3>
+          <h3>{tUi("access.tenants.title", "Tenants do cliente")}</h3>
           <button type="button" className="btn btn-primary btn-small" onClick={() => setTenantModalOpen(true)}>
-            Novo Tenant
+            {tUi("access.tenants.new", "Novo Tenant")}
           </button>
         </div>
         <p className="muted">
-          Limite do plano: {limits?.active_tenants ?? 0}/{limits?.max_tenants ?? 0} tenants ativos.
+          {tUi("access.tenants.limit", `Limite do plano: ${limits?.active_tenants ?? 0}/${limits?.max_tenants ?? 0} tenants ativos.`, {
+            active: limits?.active_tenants ?? 0,
+            max: limits?.max_tenants ?? 0,
+          })}
         </p>
         {tenants.length === 0 ? (
-          <p className="empty-state">Nenhum tenant encontrado.</p>
+          <p className="empty-state">{tUi("access.tenants.empty", "Nenhum tenant encontrado.")}</p>
         ) : (
           <div className="table-wrap">
             <table className="data-table">
@@ -188,7 +203,9 @@ export default function AccessPanel({ onSystemMessage }) {
                           })
                         }
                       >
-                        {item.status === "active" ? "Desabilitar" : "Reativar"}
+                        {item.status === "active"
+                          ? tUi("access.tenant.disable", "Desabilitar")
+                          : tUi("access.tenant.reactivate", "Reativar")}
                       </button>
                     </td>
                   </tr>
@@ -201,13 +218,17 @@ export default function AccessPanel({ onSystemMessage }) {
 
       <ConfirmActionModal
         open={Boolean(pendingResetUser)}
-        title="Resetar MFA do usuario"
+        title={tUi("access.modal.reset.title", "Resetar MFA do usuario")}
         message={
           pendingResetUser
-            ? `Resetar MFA de ${pendingResetUser.email}? O usuario precisara configurar novamente.`
+            ? tUi(
+                "access.modal.reset.message",
+                `Resetar MFA de ${pendingResetUser.email}? O usuario precisara configurar novamente.`,
+                { email: pendingResetUser.email }
+              )
             : ""
         }
-        confirmLabel="Resetar MFA"
+        confirmLabel={tUi("access.modal.reset.confirm", "Resetar MFA")}
         loading={submitting}
         onConfirm={confirmReset}
         onClose={() => {
@@ -217,15 +238,25 @@ export default function AccessPanel({ onSystemMessage }) {
 
       <ConfirmActionModal
         open={Boolean(pendingTenantAction)}
-        title="Atualizar status do tenant"
+        title={tUi("access.modal.status.title", "Atualizar status do tenant")}
         message={
           pendingTenantAction
-            ? `Deseja ${pendingTenantAction.nextStatus === "active" ? "reativar" : "desabilitar"} o tenant ${
-                pendingTenantAction.tenant.name
-              }?`
+            ? tUi(
+                "access.modal.status.message",
+                `Deseja ${pendingTenantAction.nextStatus === "active" ? "reativar" : "desabilitar"} o tenant ${
+                  pendingTenantAction.tenant.name
+                }?`,
+                {
+                  action:
+                    pendingTenantAction.nextStatus === "active"
+                      ? tUi("access.tenant.reactivate.lower", "reativar")
+                      : tUi("access.tenant.disable.lower", "desabilitar"),
+                  name: pendingTenantAction.tenant.name,
+                }
+              )
             : ""
         }
-        confirmLabel="Confirmar"
+        confirmLabel={tUi("common.confirm", "Confirmar")}
         loading={submitting}
         onConfirm={confirmTenantStatusChange}
         onClose={() => {

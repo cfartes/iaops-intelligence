@@ -16,6 +16,7 @@ import {
 import AppLlmConfigModal from "../components/AppLlmConfigModal";
 import MfaCodeModal from "../components/MfaCodeModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
+import { tUi } from "../i18n/uiText";
 
 export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied }) {
   const [mfa, setMfa] = useState(null);
@@ -41,7 +42,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       const data = await getMfaStatus();
       setMfa(data.mfa || null);
     } catch (error) {
-      onSystemMessage("error", "Falha ao carregar MFA", error.message);
+      onSystemMessage("error", tUi("config.fail.mfa", "Falha ao carregar MFA"), error.message);
     } finally {
       setLoading(false);
     }
@@ -71,7 +72,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       setTenantLlmProviders(providersData.providers || []);
       setTenantLlmConfig(cfgData.config || null);
     } catch (error) {
-      onSystemMessage("error", "Falha ao carregar LLM do tenant", error.message);
+      onSystemMessage("error", tUi("config.fail.tenantLlm", "Falha ao carregar LLM do tenant"), error.message);
     }
   };
 
@@ -84,7 +85,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       setThemeDraft(pref?.theme_code || "light");
       setChatResponseModeDraft(pref?.chat_response_mode || "executive");
     } catch (error) {
-      onSystemMessage("error", "Falha ao carregar preferencias", error.message);
+      onSystemMessage("error", tUi("config.fail.pref", "Falha ao carregar preferencias"), error.message);
     }
   };
 
@@ -95,7 +96,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       setSetupInfo(data.setup);
       setModalMode("enable");
     } catch (error) {
-      onSystemMessage("error", "Falha ao iniciar setup MFA", error.message);
+      onSystemMessage("error", tUi("config.fail.startMfa", "Falha ao iniciar setup MFA"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -107,10 +108,14 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       await enableMfa({ otp_code });
       setModalMode(null);
       setSetupInfo(null);
-      onSystemMessage("success", "MFA habilitado", "MFA TOTP habilitado com sucesso.");
+      onSystemMessage(
+        "success",
+        tUi("config.ok.mfaEnable.title", "MFA habilitado"),
+        tUi("config.ok.mfaEnable.message", "MFA TOTP habilitado com sucesso.")
+      );
       await loadStatus();
     } catch (error) {
-      onSystemMessage("error", "Falha ao habilitar MFA", error.message);
+      onSystemMessage("error", tUi("config.fail.enableMfa", "Falha ao habilitar MFA"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -122,10 +127,14 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       await disableMfa({ otp_code });
       setModalMode(null);
       setSetupInfo(null);
-      onSystemMessage("success", "MFA desabilitado", "MFA desabilitado para seu usuario.");
+      onSystemMessage(
+        "success",
+        tUi("config.ok.mfaDisable.title", "MFA desabilitado"),
+        tUi("config.ok.mfaDisable.message", "MFA desabilitado para seu usuario.")
+      );
       await loadStatus();
     } catch (error) {
-      onSystemMessage("error", "Falha ao desabilitar MFA", error.message);
+      onSystemMessage("error", tUi("config.fail.disableMfa", "Falha ao desabilitar MFA"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -137,9 +146,13 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       const data = await updateAdminLlmConfig(payload);
       setLlmConfig(data.config || null);
       setLlmModalOpen(false);
-      onSystemMessage("success", "LLM do app atualizada", "Configuracao da LLM padrao atualizada com sucesso.");
+      onSystemMessage(
+        "success",
+        tUi("config.ok.appLlm.title", "LLM do app atualizada"),
+        tUi("config.ok.appLlm.message", "Configuracao da LLM padrao atualizada com sucesso.")
+      );
     } catch (error) {
-      onSystemMessage("error", "Falha ao atualizar LLM do app", error.message);
+      onSystemMessage("error", tUi("config.fail.appLlm", "Falha ao atualizar LLM do app"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -151,9 +164,13 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       const data = await updateTenantLlmConfig(payload);
       setTenantLlmConfig(data.config || null);
       setTenantLlmModalOpen(false);
-      onSystemMessage("success", "LLM do tenant atualizada", "Configuracao de LLM do tenant salva com sucesso.");
+      onSystemMessage(
+        "success",
+        tUi("config.ok.tenantLlm.title", "LLM do tenant atualizada"),
+        tUi("config.ok.tenantLlm.message", "Configuracao de LLM do tenant salva com sucesso.")
+      );
     } catch (error) {
-      onSystemMessage("error", "Falha ao salvar LLM do tenant", error.message);
+      onSystemMessage("error", tUi("config.fail.saveTenantLlm", "Falha ao salvar LLM do tenant"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -170,9 +187,13 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       const pref = data.preference || null;
       setUserPref(pref);
       onPreferenceApplied?.(pref);
-      onSystemMessage("success", "Preferencias salvas", "Idioma, tema e modo de resposta foram atualizados.");
+      onSystemMessage(
+        "success",
+        tUi("config.ok.pref.title", "Preferencias salvas"),
+        tUi("config.ok.pref.message", "Idioma, tema e modo de resposta foram atualizados.")
+      );
     } catch (error) {
-      onSystemMessage("error", "Falha ao salvar preferencia", error.message);
+      onSystemMessage("error", tUi("config.fail.savePref", "Falha ao salvar preferencia"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -181,27 +202,27 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
   return (
     <section className="page-panel">
       <header>
-        <h2>Configuracao</h2>
-        <p>MFA por usuario com TOTP (ativacao voluntaria).</p>
+        <h2>{tUi("config.header.title", "Configuracao")}</h2>
+        <p>{tUi("config.header.subtitle", "MFA por usuario com TOTP (ativacao voluntaria).")}</p>
       </header>
       {loading ? (
-        <p className="empty-state">Carregando configuracao MFA...</p>
+        <p className="empty-state">{tUi("config.loading.mfa", "Carregando configuracao MFA...")}</p>
       ) : (
         <>
           <div className="metric-grid">
             <article className="metric-card">
-              <h4>Status MFA</h4>
-              <p>{mfa?.enabled ? "Habilitado" : "Desabilitado"}</p>
+              <h4>{tUi("config.mfa.status", "Status MFA")}</h4>
+              <p>{mfa?.enabled ? tUi("access.mfa.enabled", "Habilitado") : tUi("access.mfa.disabled", "Desabilitado")}</p>
             </article>
             <article className="metric-card">
-              <h4>Setup pendente</h4>
-              <p>{mfa?.has_pending_setup ? "Sim" : "Nao"}</p>
+              <h4>{tUi("config.mfa.pending", "Setup pendente")}</h4>
+              <p>{mfa?.has_pending_setup ? tUi("common.yes", "Sim") : tUi("common.no", "Nao")}</p>
             </article>
           </div>
 
           <div className="page-actions">
             <button type="button" className="btn btn-primary" onClick={startSetup} disabled={submitting}>
-              Ativar MFA
+              {tUi("config.mfa.enable", "Ativar MFA")}
             </button>
             <button
               type="button"
@@ -209,10 +230,10 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
               onClick={() => setModalMode("disable")}
               disabled={submitting || !mfa?.enabled}
             >
-              Desativar MFA
+              {tUi("config.mfa.disable", "Desativar MFA")}
             </button>
             <button type="button" className="btn btn-secondary" onClick={loadStatus}>
-              Atualizar Status
+              {tUi("config.refresh.status", "Atualizar Status")}
             </button>
           </div>
         </>
@@ -220,21 +241,21 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
 
       <section className="catalog-block">
         <header>
-          <h3>Preferencias Usuario + Tenant</h3>
+          <h3>{tUi("config.pref.title", "Preferencias Usuario + Tenant")}</h3>
         </header>
         <div className="table-wrap">
           <table className="data-table">
             <tbody>
               <tr>
-                <th>Modo atual (Chat BI)</th>
+                <th>{tUi("config.pref.currentMode", "Modo atual (Chat BI)")}</th>
                 <td>{userPref?.chat_response_mode || "-"}</td>
               </tr>
               <tr>
-                <th>Idioma atual</th>
+                <th>{tUi("config.pref.currentLanguage", "Idioma atual")}</th>
                 <td>{userPref?.language_code || "-"}</td>
               </tr>
               <tr>
-                <th>Tema atual</th>
+                <th>{tUi("config.pref.currentTheme", "Tema atual")}</th>
                 <td>{userPref?.theme_code || "-"}</td>
               </tr>
             </tbody>
@@ -251,28 +272,28 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
             <option value="ocean">Ocean</option>
           </select>
           <select value={chatResponseModeDraft} onChange={(event) => setChatResponseModeDraft(event.target.value)}>
-            <option value="executive">Executiva</option>
-            <option value="detailed">Detalhada</option>
+            <option value="executive">{tUi("chat.mode.executive", "Executiva")}</option>
+            <option value="detailed">{tUi("chat.mode.detailed", "Detalhada")}</option>
           </select>
           <button type="button" className="btn btn-primary" onClick={saveUserPreference} disabled={submitting}>
-            Salvar Preferencias
+            {tUi("config.pref.save", "Salvar Preferencias")}
           </button>
           <button type="button" className="btn btn-secondary" onClick={loadUserPreference} disabled={submitting}>
-            Atualizar Preferencia
+            {tUi("config.pref.refresh", "Atualizar Preferencia")}
           </button>
         </div>
       </section>
 
       <section className="catalog-block">
         <header>
-          <h3>LLM do Tenant</h3>
+          <h3>{tUi("config.tenantLlm.title", "LLM do Tenant")}</h3>
         </header>
         <div className="table-wrap">
           <table className="data-table">
             <tbody>
               <tr>
-                <th>Usar LLM do app</th>
-                <td>{tenantLlmConfig?.use_app_default_llm ? "Sim" : "Nao"}</td>
+                <th>{tUi("config.tenantLlm.useApp", "Usar LLM do app")}</th>
+                <td>{tenantLlmConfig?.use_app_default_llm ? tUi("common.yes", "Sim") : tUi("common.no", "Nao")}</td>
               </tr>
               <tr>
                 <th>Provedor</th>
@@ -291,20 +312,20 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
         </div>
         <div className="page-actions">
           <button type="button" className="btn btn-primary" onClick={() => setTenantLlmModalOpen(true)} disabled={submitting}>
-            Configurar LLM do Tenant
+            {tUi("config.tenantLlm.configure", "Configurar LLM do Tenant")}
           </button>
           <button type="button" className="btn btn-secondary" onClick={loadTenantLlmConfig}>
-            Atualizar LLM Tenant
+            {tUi("config.tenantLlm.refresh", "Atualizar LLM Tenant")}
           </button>
         </div>
       </section>
 
       <section className="catalog-block">
         <header>
-          <h3>LLM Padrao do App (Superadmin)</h3>
+          <h3>{tUi("config.appLlm.title", "LLM Padrao do App (Superadmin)")}</h3>
         </header>
         {llmDenied ? (
-          <p className="empty-state">Acesso restrito a superadmin.</p>
+          <p className="empty-state">{tUi("config.appLlm.denied", "Acesso restrito a superadmin.")}</p>
         ) : (
           <>
             <div className="table-wrap">
@@ -331,10 +352,10 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
             </div>
             <div className="page-actions">
               <button type="button" className="btn btn-primary" onClick={() => setLlmModalOpen(true)} disabled={submitting}>
-                Configurar LLM do App
+                {tUi("config.appLlm.configure", "Configurar LLM do App")}
               </button>
               <button type="button" className="btn btn-secondary" onClick={loadLlmAdmin}>
-                Atualizar LLM
+                {tUi("config.appLlm.refresh", "Atualizar LLM")}
               </button>
             </div>
           </>
@@ -343,10 +364,10 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
 
       <MfaCodeModal
         open={modalMode === "enable"}
-        title="Ativar MFA TOTP"
-        subtitle="Escaneie o secret/URI no app autenticador e informe o codigo para ativar."
+        title={tUi("config.modal.enable.title", "Ativar MFA TOTP")}
+        subtitle={tUi("config.modal.enable.subtitle", "Escaneie o secret/URI no app autenticador e informe o codigo para ativar.")}
         setupInfo={setupInfo}
-        submitLabel="Confirmar Ativacao"
+        submitLabel={tUi("config.modal.enable.confirm", "Confirmar Ativacao")}
         loading={submitting}
         onClose={() => {
           if (!submitting) setModalMode(null);
@@ -356,10 +377,10 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
 
       <MfaCodeModal
         open={modalMode === "disable"}
-        title="Desativar MFA TOTP"
-        subtitle="Informe o codigo TOTP atual para confirmar a desativacao."
+        title={tUi("config.modal.disable.title", "Desativar MFA TOTP")}
+        subtitle={tUi("config.modal.disable.subtitle", "Informe o codigo TOTP atual para confirmar a desativacao.")}
         setupInfo={null}
-        submitLabel="Confirmar Desativacao"
+        submitLabel={tUi("config.modal.disable.confirm", "Confirmar Desativacao")}
         loading={submitting}
         onClose={() => {
           if (!submitting) setModalMode(null);

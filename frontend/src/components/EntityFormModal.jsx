@@ -1,19 +1,50 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-const FORM_TEMPLATE = {
+const buildFormTemplate = (defaultLanguage = "pt-BR") => ({
   clientName: "",
   legalName: "",
   cnpj: "",
   contactEmail: "",
+  languageCode: defaultLanguage,
+});
+
+const DEFAULT_LABELS = {
+  clientName: "Nome Fantasia",
+  legalName: "Razao Social",
+  cnpj: "CNPJ",
+  contactEmail: "E-mail Contato",
+  language: "Idioma",
+  cancel: "Cancelar",
+  save: "Salvar",
 };
 
-export default function EntityFormModal({ open, title, onClose, onSubmit }) {
-  const [form, setForm] = useState(FORM_TEMPLATE);
+const DEFAULT_LANGUAGE_OPTIONS = [
+  { value: "pt-BR", label: "Portugues (Brasil)" },
+  { value: "en-US", label: "English (US)" },
+  { value: "es-ES", label: "Espanol" },
+];
+
+export default function EntityFormModal({
+  open,
+  title,
+  onClose,
+  onSubmit,
+  defaultLanguage = "pt-BR",
+  labels = DEFAULT_LABELS,
+  languageOptions = DEFAULT_LANGUAGE_OPTIONS,
+}) {
+  const [form, setForm] = useState(() => buildFormTemplate(defaultLanguage));
 
   const canSubmit = useMemo(
     () => form.clientName && form.legalName && form.cnpj && form.contactEmail,
     [form]
   );
+
+  useEffect(() => {
+    if (open) {
+      setForm(buildFormTemplate(defaultLanguage));
+    }
+  }, [open, defaultLanguage]);
 
   if (!open) return null;
 
@@ -23,7 +54,7 @@ export default function EntityFormModal({ open, title, onClose, onSubmit }) {
     event.preventDefault();
     if (!canSubmit) return;
     onSubmit(form);
-    setForm(FORM_TEMPLATE);
+    setForm(buildFormTemplate(defaultLanguage));
   };
 
   return (
@@ -34,31 +65,41 @@ export default function EntityFormModal({ open, title, onClose, onSubmit }) {
         </header>
         <form className="modal-content form-grid" onSubmit={handleSubmit}>
           <label>
-            Nome Fantasia
+            {labels.clientName}
             <input value={form.clientName} onChange={(e) => updateField("clientName", e.target.value)} />
           </label>
           <label>
-            Razao Social
+            {labels.legalName}
             <input value={form.legalName} onChange={(e) => updateField("legalName", e.target.value)} />
           </label>
           <label>
-            CNPJ
+            {labels.cnpj}
             <input value={form.cnpj} onChange={(e) => updateField("cnpj", e.target.value)} />
           </label>
           <label>
-            E-mail Contato
+            {labels.contactEmail}
             <input
               type="email"
               value={form.contactEmail}
               onChange={(e) => updateField("contactEmail", e.target.value)}
             />
           </label>
+          <label>
+            {labels.language}
+            <select value={form.languageCode} onChange={(e) => updateField("languageCode", e.target.value)}>
+              {languageOptions.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>
-              Cancelar
+              {labels.cancel}
             </button>
             <button type="submit" className="btn btn-primary" disabled={!canSubmit}>
-              Salvar
+              {labels.save}
             </button>
           </div>
         </form>

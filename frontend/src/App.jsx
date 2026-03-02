@@ -17,7 +17,7 @@ import ChatBiPanel from "./pages/ChatBiPanel";
 import AccessPanel from "./pages/AccessPanel";
 import ConfiguracaoPanel from "./pages/ConfiguracaoPanel";
 import { NAV_ITEMS } from "./state/nav";
-import { createIncident, getUserTenantPreference, updateIncidentStatus } from "./api/mcpApi";
+import { createIncident, getUserTenantPreference, updateIncidentStatus, updateUserTenantPreference } from "./api/mcpApi";
 
 const UI_TEXT = {
   pt: {
@@ -58,6 +58,17 @@ const UI_TEXT = {
     genericAlertTitle: "Alerta de Governanca",
     genericAlertMessage: "Este tenant possui configuracoes pendentes de LGPD e deve ser revisado.",
     entityCreateTitlePrefix: "Novo cadastro",
+    entityForm: {
+      clientName: "Nome Fantasia",
+      legalName: "Razao Social",
+      cnpj: "CNPJ",
+      contactEmail: "E-mail Contato",
+      language: "Idioma",
+      cancel: "Cancelar",
+      save: "Salvar",
+    },
+    entityCreateSuccessTitle: "Cadastro confirmado",
+    entityCreateSuccessMessage: "Cadastro recebido para {name}. Idioma inicial: {language}.",
   },
   en: {
     nav: {
@@ -97,6 +108,17 @@ const UI_TEXT = {
     genericAlertTitle: "Governance Alert",
     genericAlertMessage: "This tenant has pending LGPD settings and must be reviewed.",
     entityCreateTitlePrefix: "New record",
+    entityForm: {
+      clientName: "Trade Name",
+      legalName: "Legal Name",
+      cnpj: "Tax ID (CNPJ)",
+      contactEmail: "Contact Email",
+      language: "Language",
+      cancel: "Cancel",
+      save: "Save",
+    },
+    entityCreateSuccessTitle: "Registration confirmed",
+    entityCreateSuccessMessage: "Registration received for {name}. Initial language: {language}.",
   },
   es: {
     nav: {
@@ -136,6 +158,17 @@ const UI_TEXT = {
     genericAlertTitle: "Alerta de Gobernanza",
     genericAlertMessage: "Este tenant tiene configuraciones LGPD pendientes y debe revisarse.",
     entityCreateTitlePrefix: "Nuevo registro",
+    entityForm: {
+      clientName: "Nombre Comercial",
+      legalName: "Razon Social",
+      cnpj: "CNPJ",
+      contactEmail: "Correo de Contacto",
+      language: "Idioma",
+      cancel: "Cancelar",
+      save: "Guardar",
+    },
+    entityCreateSuccessTitle: "Registro confirmado",
+    entityCreateSuccessMessage: "Registro recibido para {name}. Idioma inicial: {language}.",
   },
 };
 
@@ -216,8 +249,19 @@ export default function App() {
   };
 
   const handleEntityFormSubmit = (payload) => {
+    const selectedLanguage = payload.languageCode || "pt-BR";
+    setUiLanguage(selectedLanguage);
     setIsEntityModalOpen(false);
-    openSystemMessage("success", "Cadastro confirmado", `Cadastro recebido para ${payload.clientName}.`);
+    updateUserTenantPreference({ language_code: selectedLanguage }).catch(() => {
+      openSystemMessage("warning", "Preferencias", "Nao foi possivel persistir o idioma inicial.");
+    });
+    openSystemMessage(
+      "success",
+      uiText.entityCreateSuccessTitle,
+      uiText.entityCreateSuccessMessage
+        .replace("{name}", payload.clientName)
+        .replace("{language}", selectedLanguage)
+    );
   };
 
   const handleIncidentSubmit = async (payload) => {
@@ -330,6 +374,13 @@ export default function App() {
       <EntityFormModal
         open={isEntityModalOpen}
         title={`${uiText.entityCreateTitlePrefix} - ${activeLabel}`}
+        defaultLanguage={uiLanguage}
+        labels={uiText.entityForm}
+        languageOptions={[
+          { value: "pt-BR", label: "Portugues (Brasil)" },
+          { value: "en-US", label: "English (US)" },
+          { value: "es-ES", label: "Espanol" },
+        ]}
         onClose={() => setIsEntityModalOpen(false)}
         onSubmit={handleEntityFormSubmit}
       />
