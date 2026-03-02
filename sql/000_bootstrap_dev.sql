@@ -9,5 +9,6 @@
 \i sql/007_superadmin_user.sql
 \i sql/008_channel_tenant_context.sql
 \i sql/009_user_tenant_chat_mode.sql
+\i sql/010_client_signup.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql

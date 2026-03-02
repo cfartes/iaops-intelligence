@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { adminResetMfa, createTenant, getTenantLimits, listAccessUsers, listClientTenants, updateTenantStatus } from "../api/mcpApi";
+import { adminResetMfa, createTenant, getSetupProgress, getTenantLimits, listAccessUsers, listClientTenants, updateTenantStatus } from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import TenantFormModal from "../components/TenantFormModal";
 import { tUi } from "../i18n/uiText";
@@ -13,6 +13,7 @@ export default function AccessPanel({ onSystemMessage }) {
   const [pendingTenantAction, setPendingTenantAction] = useState(null);
   const [tenantModalOpen, setTenantModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [tenantSetupById, setTenantSetupById] = useState({});
 
   const loadUsers = async () => {
     setLoading(true);
@@ -29,11 +30,41 @@ export default function AccessPanel({ onSystemMessage }) {
   const loadTenants = async () => {
     try {
       const [tenantData, limitData] = await Promise.all([listClientTenants(), getTenantLimits()]);
-      setTenants(tenantData.tenants || []);
+      const rows = tenantData.tenants || [];
+      setTenants(rows);
       setLimits(limitData.limits || null);
+      await loadTenantSetup(rows);
     } catch (error) {
       onSystemMessage("error", tUi("access.fail.tenants", "Falha ao listar tenants"), error.message);
     }
+  };
+
+  const loadTenantSetup = async (rows) => {
+    const settled = await Promise.allSettled(
+      rows.map(async (item) => {
+        const data = await getSetupProgress(item.id);
+        return [item.id, data?.progress || null];
+      })
+    );
+    const next = {};
+    settled.forEach((entry) => {
+      if (entry.status !== "fulfilled") return;
+      const [tenantId, progress] = entry.value;
+      next[tenantId] = progress;
+    });
+    setTenantSetupById(next);
+  };
+
+  const setupStatus = (tenantId) => {
+    const snapshot = tenantSetupById[tenantId]?.snapshot || {};
+    const counts = snapshot.counts || {};
+    const done = Number(counts.done || 0);
+    const partial = Number(counts.partial || 0);
+    const blocked = Number(counts.blocked || 0);
+    if (done >= 4) return tUi("access.setup.done", "Concluido");
+    if (blocked > 0) return tUi("access.setup.blocked", "Bloqueado");
+    if (partial > 0 || done > 0) return tUi("access.setup.partial", "Parcial");
+    return tUi("access.setup.pending", "Pendente");
   };
 
   useEffect(() => {
@@ -182,6 +213,7 @@ export default function AccessPanel({ onSystemMessage }) {
                   <th>Nome</th>
                   <th>Slug</th>
                   <th>Status</th>
+                  <th>{tUi("access.setup.column", "Setup")}</th>
                   <th>Acoes</th>
                 </tr>
               </thead>
@@ -192,6 +224,9 @@ export default function AccessPanel({ onSystemMessage }) {
                     <td>{item.name}</td>
                     <td>{item.slug}</td>
                     <td>{item.status}</td>
+                    <td>
+                      <span className="chip">{setupStatus(item.id)}</span>
+                    </td>
                     <td>
                       <button
                         type="button"

@@ -79,6 +79,8 @@ class MCPGateway:
             "events.list": self._handle_events_list,
             "audit.list_calls": self._handle_audit_list_calls,
             "ops.get_health_summary": self._handle_health_summary,
+            "setup.get_progress": self._handle_setup_get_progress,
+            "setup.upsert_progress": self._handle_setup_upsert_progress,
         }
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -755,6 +757,34 @@ class MCPGateway:
         _ = max_rows
         window_minutes = int(tool_input.get("window_minutes", 60))
         return self.repository.get_health_summary(context.tenant_id, window_minutes)
+
+    def _handle_setup_get_progress(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        return {"progress": self.repository.get_setup_progress(context.tenant_id)}
+
+    def _handle_setup_upsert_progress(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        snapshot = tool_input.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValueError("snapshot deve ser objeto")
+        progress = self.repository.upsert_setup_progress(
+            client_id=context.client_id,
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            correlation_id=context.correlation_id,
+            snapshot=snapshot,
+        )
+        return {"progress": progress}
 
     def _finalize_log(
         self,

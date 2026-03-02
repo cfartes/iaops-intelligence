@@ -60,6 +60,8 @@ DEFAULT_TOOL_POLICIES = {
     "security_sql.get_policy": ToolPolicy("security_sql.get_policy", "viewer", True, 200, 120, True, None),
     "security_sql.update_policy": ToolPolicy("security_sql.update_policy", "admin", True, 200, 120, True, None),
     "ops.get_health_summary": ToolPolicy("ops.get_health_summary", "viewer", True, None, 120, True, None),
+    "setup.get_progress": ToolPolicy("setup.get_progress", "admin", True, None, 120, True, None),
+    "setup.upsert_progress": ToolPolicy("setup.upsert_progress", "admin", True, None, 120, True, None),
 }
 
 
@@ -1997,6 +1999,48 @@ class PostgresMCPRepository(MCPRepository):
             "critical_events": int(row["critical_events"] or 0),
             "channels_health": channels_health,
             "last_scan_at": row["last_scan_at"].isoformat() if row["last_scan_at"] else None,
+        }
+
+    def get_setup_progress(self, tenant_id: int) -> dict[str, Any] | None:
+        sql = f"""
+            SELECT response_payload_json
+            FROM {self.schema}.mcp_call_log
+            WHERE tenant_id = %(tenant_id)s
+              AND status = 'success'
+              AND mcp_tool_id = (
+                  SELECT id
+                  FROM {self.schema}.mcp_tool
+                  WHERE tool_name = 'setup.upsert_progress'
+                  LIMIT 1
+              )
+            ORDER BY requested_at DESC
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            row = cur.fetchone()
+        if not row:
+            return None
+        payload = row.get("response_payload_json") or {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        progress = data.get("progress") if isinstance(data, dict) else None
+        return progress if isinstance(progress, dict) else None
+
+    def upsert_setup_progress(
+        self,
+        *,
+        client_id: int,
+        tenant_id: int,
+        user_id: int,
+        correlation_id: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        _ = client_id, correlation_id
+        return {
+            "tenant_id": tenant_id,
+            "updated_by_user_id": user_id,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "snapshot": snapshot or {},
         }
 
     def log_mcp_call(

@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import SideMenu from "./components/SideMenu";
 import EntityFormModal from "./components/EntityFormModal";
 import SystemMessageModal from "./components/SystemMessageModal";
 import IncidentFormModal from "./components/IncidentFormModal";
 import IncidentStatusModal from "./components/IncidentStatusModal";
 import SetupAssistantModal, { ASSISTANT_STEPS } from "./components/SetupAssistantModal";
+import ClientSignupModal from "./components/ClientSignupModal";
+import LoginModal from "./components/LoginModal";
 import PagePanel from "./pages/PagePanel";
 import OnboardingPanel from "./pages/OnboardingPanel";
 import InventoryPanel from "./pages/InventoryPanel";
@@ -27,6 +29,15 @@ import {
   listOnboardingMonitoredColumns,
   listOnboardingMonitoredTables,
   listTenantDataSources,
+  getSetupProgress,
+  signupClient,
+  confirmClientSignup,
+  loginClient,
+  verifyLoginMfa,
+  getAuthContext as getStoredAuthContext,
+  setAuthContext as setStoredAuthContext,
+  clearAuthContext as clearStoredAuthContext,
+  upsertSetupProgress,
   updateIncidentStatus,
   updateUserTenantPreference,
 } from "./api/mcpApi";
@@ -35,6 +46,7 @@ const SETUP_PROGRESS_STORAGE_KEY = "iaops_setup_assistant_progress_v1";
 const SETUP_DEFER_UNTIL_STORAGE_KEY = "iaops_setup_assistant_defer_until_v1";
 const SETUP_MINI_CHECKLIST_COLLAPSED_KEY = "iaops_setup_mini_checklist_collapsed_v1";
 const SETUP_DEFER_HOURS = 24;
+const SESSION_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 
 const UI_TEXT = {
   pt: {
@@ -75,6 +87,51 @@ const UI_TEXT = {
     genericAlertTitle: "Alerta de Governanca",
     genericAlertMessage: "Este tenant possui configuracoes pendentes de LGPD e deve ser revisado.",
     entityCreateTitlePrefix: "Novo cadastro",
+    signUp: "Cadastre-se",
+    signIn: "Entrar",
+    signOut: "Sair",
+    sessionLabel: "Sessao: {email} ({role})",
+    loginModal: {
+      title: "Acesso ao IAOps",
+      email: "E-mail de acesso",
+      password: "Senha",
+      login: "Entrar",
+      logging: "Entrando...",
+      mfa_intro: "MFA ativo. Informe o codigo TOTP para concluir o acesso.",
+      otp_code: "Codigo TOTP",
+      verify: "Validar MFA",
+      verifying: "Validando...",
+      ok_title: "Login concluido",
+      ok_message: "Acesso autenticado com sucesso.",
+      fail_title: "Falha no login",
+    },
+    inactivityLogoutTitle: "Sessao encerrada",
+    inactivityLogoutMessage: "Voce ficou 5 minutos inativo. Faca login novamente.",
+    signupModal: {
+      title: "Cadastro de Novo Cliente",
+      trade_name: "Nome Fantasia",
+      legal_name: "Razao Social",
+      cnpj: "CNPJ",
+      address_text: "Endereco",
+      phone_contact: "Telefone contato",
+      email_contact: "E-mail contato",
+      email_access: "E-mail acesso",
+      email_notification: "E-mail notificacao",
+      password: "Senha",
+      plan_code: "Plano",
+      language_code: "Idioma",
+      submit: "Cadastrar",
+      submitting: "Cadastrando...",
+      confirm_intro: "Informe o token de confirmacao enviado por e-mail para ativar o acesso.",
+      confirm_token: "Token de confirmacao",
+      confirm: "Confirmar cadastro",
+      confirming: "Confirmando...",
+      cancel: "Cancelar",
+      ok_signup_title: "Cadastro recebido",
+      ok_signup_message: "Cadastro criado em modo pendente. Verifique seu e-mail para confirmar.",
+      ok_confirm_title: "Cadastro confirmado",
+      ok_confirm_message: "Cliente confirmado com sucesso. Primeiro acesso liberado.",
+    },
     setupWizard: {
       title: "Assistente Inicial de Configuracao",
       intro: "Use as etapas abaixo para configurar o app no primeiro acesso. Voce pode pular qualquer etapa.",
@@ -88,8 +145,14 @@ const UI_TEXT = {
       markDone: "Marcar como concluida",
       completeCurrent: "Concluir etapa atual",
       continue: "Continuar de onde parei",
+      nextPending: "Ir para proxima pendente",
       collapse: "Recolher trilha",
       expand: "Expandir trilha",
+      statusSummary: {
+        done: "Concluidas: {count}",
+        partial: "Parciais: {count}",
+        blocked: "Bloqueadas: {count}",
+      },
       close: "Fechar",
       postpone: "Lembrar mais tarde",
       stepDoneTitle: "Etapa concluida",
@@ -174,6 +237,51 @@ const UI_TEXT = {
     genericAlertTitle: "Governance Alert",
     genericAlertMessage: "This tenant has pending LGPD settings and must be reviewed.",
     entityCreateTitlePrefix: "New record",
+    signUp: "Sign up",
+    signIn: "Sign in",
+    signOut: "Sign out",
+    sessionLabel: "Session: {email} ({role})",
+    loginModal: {
+      title: "IAOps Sign in",
+      email: "Access e-mail",
+      password: "Password",
+      login: "Sign in",
+      logging: "Signing in...",
+      mfa_intro: "MFA enabled. Enter your TOTP code to finish sign in.",
+      otp_code: "TOTP code",
+      verify: "Verify MFA",
+      verifying: "Verifying...",
+      ok_title: "Signed in",
+      ok_message: "Access authenticated successfully.",
+      fail_title: "Sign in failed",
+    },
+    inactivityLogoutTitle: "Session ended",
+    inactivityLogoutMessage: "You were inactive for 5 minutes. Please sign in again.",
+    signupModal: {
+      title: "New Client Registration",
+      trade_name: "Trade Name",
+      legal_name: "Legal Name",
+      cnpj: "Tax ID (CNPJ)",
+      address_text: "Address",
+      phone_contact: "Contact phone",
+      email_contact: "Contact email",
+      email_access: "Access email",
+      email_notification: "Notification email",
+      password: "Password",
+      plan_code: "Plan",
+      language_code: "Language",
+      submit: "Register",
+      submitting: "Registering...",
+      confirm_intro: "Enter the confirmation token sent by e-mail to activate access.",
+      confirm_token: "Confirmation token",
+      confirm: "Confirm registration",
+      confirming: "Confirming...",
+      cancel: "Cancel",
+      ok_signup_title: "Registration received",
+      ok_signup_message: "Registration created as pending. Check your email to confirm.",
+      ok_confirm_title: "Registration confirmed",
+      ok_confirm_message: "Client confirmed successfully. First access unlocked.",
+    },
     setupWizard: {
       title: "Initial Setup Assistant",
       intro: "Use the steps below to configure the app on first access. You can skip any step.",
@@ -187,8 +295,14 @@ const UI_TEXT = {
       markDone: "Mark as done",
       completeCurrent: "Complete current step",
       continue: "Continue where I left off",
+      nextPending: "Go to next pending",
       collapse: "Collapse tracker",
       expand: "Expand tracker",
+      statusSummary: {
+        done: "Done: {count}",
+        partial: "Partial: {count}",
+        blocked: "Blocked: {count}",
+      },
       close: "Close",
       postpone: "Remind later",
       stepDoneTitle: "Step completed",
@@ -273,6 +387,51 @@ const UI_TEXT = {
     genericAlertTitle: "Alerta de Gobernanza",
     genericAlertMessage: "Este tenant tiene configuraciones LGPD pendientes y debe revisarse.",
     entityCreateTitlePrefix: "Nuevo registro",
+    signUp: "Registrarse",
+    signIn: "Iniciar sesion",
+    signOut: "Salir",
+    sessionLabel: "Sesion: {email} ({role})",
+    loginModal: {
+      title: "Acceso IAOps",
+      email: "Correo de acceso",
+      password: "Contrasena",
+      login: "Iniciar sesion",
+      logging: "Iniciando...",
+      mfa_intro: "MFA activo. Informe el codigo TOTP para concluir el acceso.",
+      otp_code: "Codigo TOTP",
+      verify: "Validar MFA",
+      verifying: "Validando...",
+      ok_title: "Login completado",
+      ok_message: "Acceso autenticado con exito.",
+      fail_title: "Fallo de login",
+    },
+    inactivityLogoutTitle: "Sesion finalizada",
+    inactivityLogoutMessage: "Estuvo inactivo por 5 minutos. Inicie sesion nuevamente.",
+    signupModal: {
+      title: "Registro de Nuevo Cliente",
+      trade_name: "Nombre Comercial",
+      legal_name: "Razon Social",
+      cnpj: "CNPJ",
+      address_text: "Direccion",
+      phone_contact: "Telefono de contacto",
+      email_contact: "Correo de contacto",
+      email_access: "Correo de acceso",
+      email_notification: "Correo de notificacion",
+      password: "Contrasena",
+      plan_code: "Plan",
+      language_code: "Idioma",
+      submit: "Registrar",
+      submitting: "Registrando...",
+      confirm_intro: "Informe el token de confirmacion enviado por correo para activar el acceso.",
+      confirm_token: "Token de confirmacion",
+      confirm: "Confirmar registro",
+      confirming: "Confirmando...",
+      cancel: "Cancelar",
+      ok_signup_title: "Registro recibido",
+      ok_signup_message: "Registro creado como pendiente. Verifique su correo para confirmar.",
+      ok_confirm_title: "Registro confirmado",
+      ok_confirm_message: "Cliente confirmado con exito. Primer acceso liberado.",
+    },
     setupWizard: {
       title: "Asistente Inicial de Configuracion",
       intro: "Use las etapas abajo para configurar la app en el primer acceso. Puede omitir cualquier etapa.",
@@ -286,8 +445,14 @@ const UI_TEXT = {
       markDone: "Marcar como completada",
       completeCurrent: "Completar etapa actual",
       continue: "Continuar donde lo deje",
+      nextPending: "Ir a la siguiente pendiente",
       collapse: "Contraer seguimiento",
       expand: "Expandir seguimiento",
+      statusSummary: {
+        done: "Completadas: {count}",
+        partial: "Parciales: {count}",
+        blocked: "Bloqueadas: {count}",
+      },
       close: "Cerrar",
       postpone: "Recordar despues",
       stepDoneTitle: "Etapa completada",
@@ -337,6 +502,10 @@ const UI_TEXT = {
 };
 
 export default function App() {
+  const setupSyncSignatureRef = useRef("");
+  const inactivityTimerRef = useRef(null);
+  const [authContext, setAuthContext] = useState(() => getStoredAuthContext());
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState(() => !getStoredAuthContext());
   const [activePage, setActivePage] = useState("onboarding");
   const [userTheme, setUserTheme] = useState("light");
   const [uiLanguage, setUiLanguage] = useState("pt-BR");
@@ -346,6 +515,7 @@ export default function App() {
   const [setupPendingReasons, setSetupPendingReasons] = useState({});
   const [miniChecklistCollapsed, setMiniChecklistCollapsed] = useState(false);
   const [isEntityModalOpen, setIsEntityModalOpen] = useState(false);
+  const [isSignupModalOpen, setIsSignupModalOpen] = useState(false);
   const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
   const [isIncidentStatusModalOpen, setIsIncidentStatusModalOpen] = useState(false);
   const [selectedIncident, setSelectedIncident] = useState(null);
@@ -407,12 +577,69 @@ export default function App() {
     }
     return status;
   }, [effectiveCompletedSetupSteps, setupPendingReasons, uiText]);
+  const setupStatusCounts = useMemo(() => {
+    const counters = { done: 0, partial: 0, blocked: 0, pending: 0 };
+    for (const step of ASSISTANT_STEPS) {
+      const status = setupStepStatusByKey[step.key] || "pending";
+      counters[status] = (counters[status] || 0) + 1;
+    }
+    return counters;
+  }, [setupStepStatusByKey]);
 
   const openSystemMessage = (tone, title, message) => {
     setMessageModal({ open: true, tone, title, message });
   };
 
+  const performLogout = ({ dueToInactivity = false } = {}) => {
+    clearStoredAuthContext();
+    setAuthContext(null);
+    setIsSetupAssistantOpen(false);
+    setIsLoginModalOpen(true);
+    if (dueToInactivity) {
+      openSystemMessage("warning", uiText.inactivityLogoutTitle, uiText.inactivityLogoutMessage);
+    }
+  };
+
   useEffect(() => {
+    if (!authContext) {
+      if (inactivityTimerRef.current) {
+        window.clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = null;
+      }
+      return undefined;
+    }
+
+    const resetInactivityTimer = () => {
+      if (inactivityTimerRef.current) {
+        window.clearTimeout(inactivityTimerRef.current);
+      }
+      inactivityTimerRef.current = window.setTimeout(() => {
+        performLogout({ dueToInactivity: true });
+      }, SESSION_INACTIVITY_TIMEOUT_MS);
+    };
+
+    const activityEvents = ["mousemove", "mousedown", "keydown", "scroll", "touchstart", "focus"];
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        resetInactivityTimer();
+      }
+    };
+    activityEvents.forEach((eventName) => window.addEventListener(eventName, resetInactivityTimer, { passive: true }));
+    document.addEventListener("visibilitychange", handleVisibility);
+    resetInactivityTimer();
+
+    return () => {
+      activityEvents.forEach((eventName) => window.removeEventListener(eventName, resetInactivityTimer));
+      document.removeEventListener("visibilitychange", handleVisibility);
+      if (inactivityTimerRef.current) {
+        window.clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = null;
+      }
+    };
+  }, [authContext, uiText.inactivityLogoutMessage, uiText.inactivityLogoutTitle]);
+
+  useEffect(() => {
+    if (!authContext) return;
     const rawCompleted = window.localStorage.getItem(SETUP_PROGRESS_STORAGE_KEY);
     const rawDeferred = window.localStorage.getItem(SETUP_DEFER_UNTIL_STORAGE_KEY);
     const rawCollapsed = window.localStorage.getItem(SETUP_MINI_CHECKLIST_COLLAPSED_KEY);
@@ -437,15 +664,22 @@ export default function App() {
     if (hasPending && canAutoOpen) {
       setIsSetupAssistantOpen(true);
     }
+    loadSetupProgressFromBackend();
     evaluateSetupProgress();
     loadUserPreference();
-  }, []);
+  }, [authContext]);
 
   useEffect(() => {
+    if (!authContext) return;
     if (isSetupAssistantOpen) {
       evaluateSetupProgress();
     }
-  }, [isSetupAssistantOpen]);
+  }, [authContext, isSetupAssistantOpen]);
+
+  useEffect(() => {
+    if (!authContext) return;
+    evaluateSetupProgress();
+  }, [authContext, languageBucket]);
 
   useEffect(() => {
     document.documentElement.setAttribute("lang", uiLanguage || "pt-BR");
@@ -456,6 +690,7 @@ export default function App() {
   }, [userTheme]);
 
   const loadUserPreference = async () => {
+    if (!authContext) return;
     try {
       const data = await getUserTenantPreference();
       const preference = data.preference || {};
@@ -463,6 +698,21 @@ export default function App() {
       setUserTheme(preference.theme_code || "light");
     } catch (error) {
       openSystemMessage("warning", "Preferencias padrao", "Nao foi possivel carregar preferencias do usuario+tenant.");
+    }
+  };
+
+  const loadSetupProgressFromBackend = async () => {
+    if (!authContext) return;
+    try {
+      const data = await getSetupProgress();
+      const progress = data?.progress || null;
+      const snapshot = progress?.snapshot || {};
+      const remoteCompleted = Array.isArray(snapshot.completed_steps) ? snapshot.completed_steps : [];
+      if (remoteCompleted.length > 0) {
+        markSetupStepsCompleted(remoteCompleted);
+      }
+    } catch (_) {
+      // sem bloqueio de UX em caso de falha de sync backend
     }
   };
 
@@ -476,6 +726,7 @@ export default function App() {
   };
 
   const evaluateSetupProgress = async () => {
+    if (!authContext) return;
     try {
       const [sourcesData, usersData, tenantLlmData, mfaData, healthData] = await Promise.all([
         listTenantDataSources(),
@@ -566,6 +817,39 @@ export default function App() {
     });
   };
 
+  useEffect(() => {
+    if (!authContext) return;
+    const snapshot = {
+      completed_steps: effectiveCompletedSetupSteps,
+      validated_steps: validatedSetupSteps,
+      step_status: setupStepStatusByKey,
+      pending_reasons: setupPendingReasons,
+      counts: {
+        done: setupStatusCounts.done,
+        partial: setupStatusCounts.partial,
+        blocked: setupStatusCounts.blocked,
+        pending: setupStatusCounts.pending,
+      },
+      language_code: uiLanguage,
+      active_page: activePage,
+    };
+    const signature = JSON.stringify(snapshot);
+    if (signature === setupSyncSignatureRef.current) return;
+    setupSyncSignatureRef.current = signature;
+    upsertSetupProgress({ snapshot }).catch(() => {
+      // sem bloqueio de UX em caso de falha de sync backend
+    });
+  }, [
+    authContext,
+    activePage,
+    effectiveCompletedSetupSteps,
+    setupPendingReasons,
+    setupStatusCounts,
+    setupStepStatusByKey,
+    uiLanguage,
+    validatedSetupSteps,
+  ]);
+
   const handleEntityFormSubmit = (payload) => {
     const selectedLanguage = payload.languageCode || "pt-BR";
     setUiLanguage(selectedLanguage);
@@ -580,6 +864,57 @@ export default function App() {
         .replace("{name}", payload.clientName)
         .replace("{language}", selectedLanguage)
     );
+  };
+
+  const handleClientSignup = async (payload) => {
+    const data = await signupClient(payload);
+    openSystemMessage("success", uiText.signupModal.ok_signup_title, uiText.signupModal.ok_signup_message);
+    return data;
+  };
+
+  const handleClientSignupConfirm = async (payload) => {
+    await confirmClientSignup(payload);
+    setIsSignupModalOpen(false);
+    openSystemMessage("success", uiText.signupModal.ok_confirm_title, uiText.signupModal.ok_confirm_message);
+  };
+
+  const handleLoginSubmit = async (payload) => {
+    try {
+      const data = await loginClient(payload);
+      if (data?.mfa_required) {
+        return data;
+      }
+      const ctx = {
+        ...(data?.auth_context || {}),
+        ...(data?.profile || {}),
+      };
+      setStoredAuthContext(ctx);
+      setAuthContext(ctx);
+      setIsLoginModalOpen(false);
+      openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
+      return data;
+    } catch (error) {
+      openSystemMessage("error", uiText.loginModal.fail_title, error.message);
+      throw error;
+    }
+  };
+
+  const handleVerifyLoginMfa = async (payload) => {
+    try {
+      const data = await verifyLoginMfa(payload);
+      const ctx = {
+        ...(data?.auth_context || {}),
+        ...(data?.profile || {}),
+      };
+      setStoredAuthContext(ctx);
+      setAuthContext(ctx);
+      setIsLoginModalOpen(false);
+      openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
+      return data;
+    } catch (error) {
+      openSystemMessage("error", uiText.loginModal.fail_title, error.message);
+      throw error;
+    }
   };
 
   const handleIncidentSubmit = async (payload) => {
@@ -633,8 +968,41 @@ export default function App() {
 
       <main className="content-area">
         <div className="page-actions">
+          {authContext ? (
+            <>
+              <span className="chip">
+                {uiText.sessionLabel
+                  .replace("{email}", authContext.email || "-")
+                  .replace("{role}", authContext.role || "viewer")}
+              </span>
+              <button
+                type="button"
+                className="btn btn-secondary btn-small"
+                onClick={() => performLogout()}
+              >
+                {uiText.signOut}
+              </button>
+            </>
+          ) : (
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsLoginModalOpen(true)}>
+              {uiText.signIn}
+            </button>
+          )}
+          <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSignupModalOpen(true)}>
+            {uiText.signUp}
+          </button>
           <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSetupAssistantOpen(true)}>
             {uiText.setupAssistant}
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary btn-small"
+            onClick={() => {
+              if (pendingSetupStep) setActivePage(pendingSetupStep.targetPage);
+            }}
+            disabled={!pendingSetupStep}
+          >
+            {uiText.setupWizard.nextPending}
           </button>
           {currentSetupStep && !effectiveCompletedSetupSteps.includes(currentSetupStep.key) && (
             <button
@@ -658,6 +1026,17 @@ export default function App() {
           >
             {miniChecklistCollapsed ? uiText.setupWizard.expand : uiText.setupWizard.collapse}
           </button>
+        </div>
+        <div className="setup-status-summary">
+          <span className="chip chip-step-done">
+            {uiText.setupWizard.statusSummary.done.replace("{count}", String(setupStatusCounts.done))}
+          </span>
+          <span className="chip chip-step-partial">
+            {uiText.setupWizard.statusSummary.partial.replace("{count}", String(setupStatusCounts.partial))}
+          </span>
+          <span className="chip chip-step-blocked">
+            {uiText.setupWizard.statusSummary.blocked.replace("{count}", String(setupStatusCounts.blocked))}
+          </span>
         </div>
         <div className={`setup-mini-checklist-wrap ${miniChecklistCollapsed ? "collapsed" : ""}`} aria-hidden={miniChecklistCollapsed}>
           <div className="setup-mini-checklist" role="navigation" aria-label={uiText.setupAssistant}>
@@ -751,6 +1130,21 @@ export default function App() {
         ]}
         onClose={() => setIsEntityModalOpen(false)}
         onSubmit={handleEntityFormSubmit}
+      />
+
+      <ClientSignupModal
+        open={isSignupModalOpen}
+        onClose={() => setIsSignupModalOpen(false)}
+        onSignup={handleClientSignup}
+        onConfirm={handleClientSignupConfirm}
+        labels={uiText.signupModal}
+      />
+
+      <LoginModal
+        open={isLoginModalOpen}
+        labels={uiText.loginModal}
+        onLogin={handleLoginSubmit}
+        onVerifyMfa={handleVerifyLoginMfa}
       />
 
       <IncidentFormModal

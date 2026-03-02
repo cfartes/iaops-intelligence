@@ -336,6 +336,22 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_setup_progress(self, tenant_id: int) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_setup_progress(
+        self,
+        *,
+        client_id: int,
+        tenant_id: int,
+        user_id: int,
+        correlation_id: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
     def log_mcp_call(
         self,
         *,
@@ -418,6 +434,8 @@ class InMemoryMCPRepository(MCPRepository):
                 "security_sql.update_policy",
             ): ToolPolicy("security_sql.update_policy", "admin", True, 200, 120, True, ["public", "analytics"]),
             (10, "ops.get_health_summary"): ToolPolicy("ops.get_health_summary", "viewer", True, None, 120, True, None),
+            (10, "setup.get_progress"): ToolPolicy("setup.get_progress", "admin", True, None, 120, True, None),
+            (10, "setup.upsert_progress"): ToolPolicy("setup.upsert_progress", "admin", True, None, 120, True, None),
         }
         self._tables = {
             10: [
@@ -495,6 +513,7 @@ class InMemoryMCPRepository(MCPRepository):
             },
         ]
         self._call_logs: list[dict[str, Any]] = []
+        self._setup_progress: dict[int, dict[str, Any]] = {}
         self._users = {
             100: {"id": 100, "email": "owner@iaops.demo", "full_name": "Owner Demo", "is_active": True, "is_superadmin": True},
             101: {"id": 101, "email": "admin@iaops.demo", "full_name": "Admin Demo", "is_active": True},
@@ -1313,6 +1332,29 @@ class InMemoryMCPRepository(MCPRepository):
             "channels_health": {"telegram": "healthy", "whatsapp": "degraded"},
             "last_scan_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
+
+    def get_setup_progress(self, tenant_id: int) -> dict[str, Any] | None:
+        data = self._setup_progress.get(tenant_id)
+        return dict(data) if data else None
+
+    def upsert_setup_progress(
+        self,
+        *,
+        client_id: int,
+        tenant_id: int,
+        user_id: int,
+        correlation_id: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        _ = client_id, correlation_id
+        payload = {
+            "tenant_id": tenant_id,
+            "updated_by_user_id": user_id,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "snapshot": snapshot or {},
+        }
+        self._setup_progress[tenant_id] = payload
+        return dict(payload)
 
     def log_mcp_call(
         self,

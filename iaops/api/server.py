@@ -3,18 +3,34 @@ from __future__ import annotations
 import json
 import os
 import re
+import smtplib
 import urllib.error
 import urllib.request
 import uuid
+from email.message import EmailMessage
+from hashlib import pbkdf2_hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from secrets import token_hex
+from time import time
 from urllib.parse import parse_qs, urlparse
 
 from functions import handle_request
+from iaops.security.crypto import decrypt_text
+from iaops.security.totp import verify_totp
+try:
+    from psycopg import connect
+except Exception:  # pragma: no cover - depende de ambiente
+    connect = None
 
 
 class IAOpsAPIHandler(BaseHTTPRequestHandler):
     server_version = "IAOpsAPI/0.1"
+    signup_schema = "iaops_gov"
+    signup_tables_ready = False
+    pending_signups: dict[str, dict] = {}
+    confirmed_signups: dict[str, dict] = {}
+    mfa_login_challenges: dict[str, dict] = {}
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json(HTTPStatus.NO_CONTENT, {})
@@ -84,10 +100,25 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preferences/user-tenant":
             self._handle_user_tenant_preference_get()
             return
+        if parsed.path == "/api/setup/progress":
+            self._handle_setup_progress_get()
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/login":
+            self._handle_auth_login()
+            return
+        if parsed.path == "/api/auth/mfa/verify":
+            self._handle_auth_mfa_verify()
+            return
+        if parsed.path == "/api/auth/signup":
+            self._handle_auth_signup()
+            return
+        if parsed.path == "/api/auth/confirm":
+            self._handle_auth_confirm()
+            return
         if parsed.path == "/api/mcp/call":
             self._handle_generic_call()
             return
@@ -153,6 +184,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/preferences/user-tenant":
             self._handle_user_tenant_preference_update()
+            return
+        if parsed.path == "/api/setup/progress":
+            self._handle_setup_progress_upsert()
             return
         if parsed.path == "/api/channel/tenants/list":
             self._handle_channel_list_tenants()
@@ -599,6 +633,930 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
         }
         self._dispatch_mcp(payload)
+
+    def _handle_setup_progress_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "setup.get_progress",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_setup_progress_upsert(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "setup.upsert_progress",
+            "input": {
+                "snapshot": body.get("snapshot") if isinstance(body.get("snapshot"), dict) else {},
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_auth_signup(self) -> None:
+        body = self._read_json_body()
+        required_fields = [
+            "trade_name",
+            "legal_name",
+            "cnpj",
+            "address_text",
+            "phone_contact",
+            "email_contact",
+            "email_access",
+            "email_notification",
+            "password",
+            "plan_code",
+            "language_code",
+        ]
+        missing = [field for field in required_fields if not str(body.get(field) or "").strip()]
+        if missing:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.signup",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": f"Campos obrigatorios ausentes: {', '.join(missing)}"},
+                },
+            )
+            return
+
+        email_access = str(body.get("email_access") or "").strip().lower()
+        confirm_token = token_hex(16)
+        expires_at = int(time()) + (24 * 60 * 60)
+        password = str(body.get("password") or "")
+        salt = token_hex(16)
+        password_hash = pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240000).hex()
+        encoded_password = f"pbkdf2_sha256$240000${salt}${password_hash}"
+
+        signup_data = {
+            "trade_name": str(body.get("trade_name") or "").strip(),
+            "legal_name": str(body.get("legal_name") or "").strip(),
+            "cnpj": str(body.get("cnpj") or "").strip(),
+            "address_text": str(body.get("address_text") or "").strip(),
+            "phone_contact": str(body.get("phone_contact") or "").strip(),
+            "email_contact": str(body.get("email_contact") or "").strip(),
+            "email_access": email_access,
+            "email_notification": str(body.get("email_notification") or "").strip(),
+            "password_hash": encoded_password,
+            "plan_code": str(body.get("plan_code") or "").strip(),
+            "language_code": str(body.get("language_code") or "pt-BR").strip(),
+            "status": "pending_email_confirmation",
+            "created_at_epoch": int(time()),
+            "expires_at_epoch": expires_at,
+        }
+
+        db_error = self._persist_pending_signup_db(confirm_token=confirm_token, signup_data=signup_data)
+        if db_error:
+            if db_error == "already_exists":
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "auth.signup",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "already_exists", "message": "Cliente ja cadastrado para este CNPJ/e-mail."},
+                    },
+                )
+                return
+            if db_error == "pending_exists":
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "auth.signup",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "pending_exists", "message": "Ja existe cadastro pendente para este CNPJ/e-mail."},
+                    },
+                )
+                return
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.signup",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "db_unavailable", "message": "Nao foi possivel persistir o cadastro no banco."},
+                },
+            )
+            return
+
+        delivered, detail = self._send_signup_email(
+            to_email=email_access,
+            trade_name=signup_data["trade_name"],
+            confirm_token=confirm_token,
+        )
+
+        response_data = {
+            "pending_email_access": email_access,
+            "expires_at_epoch": expires_at,
+            "delivery": detail,
+        }
+        if not delivered:
+            response_data["confirm_token"] = confirm_token
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.signup",
+                "correlation_id": str(uuid.uuid4()),
+                "data": response_data,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_login(self) -> None:
+        body = self._read_json_body()
+        email = str(body.get("email") or "").strip().lower()
+        password = str(body.get("password") or "")
+        tenant_id_raw = body.get("tenant_id")
+        tenant_id = None
+        if tenant_id_raw not in (None, ""):
+            try:
+                tenant_id = int(tenant_id_raw)
+            except (TypeError, ValueError):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "auth.login",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "invalid_input", "message": "tenant_id invalido"},
+                    },
+                )
+                return
+        if not email or not password:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.login",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "email e password obrigatorios"},
+                },
+            )
+            return
+
+        result = self._login_user(email=email, password=password, tenant_id=tenant_id)
+        if result.get("error_code"):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.login",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": result["error_code"], "message": result.get("message", "Falha no login")},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.login",
+                "correlation_id": str(uuid.uuid4()),
+                "data": result,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_mfa_verify(self) -> None:
+        body = self._read_json_body()
+        challenge_token = str(body.get("challenge_token") or "").strip()
+        otp_code = str(body.get("otp_code") or "").strip()
+        if not challenge_token or not otp_code:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.mfa.verify",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "challenge_token e otp_code obrigatorios"},
+                },
+            )
+            return
+
+        result = self._verify_login_mfa(challenge_token=challenge_token, otp_code=otp_code)
+        if result.get("error_code"):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.mfa.verify",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": result["error_code"], "message": result.get("message", "Falha na validacao MFA")},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.mfa.verify",
+                "correlation_id": str(uuid.uuid4()),
+                "data": result,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_confirm(self) -> None:
+        body = self._read_json_body()
+        confirm_token = str(body.get("confirm_token") or "").strip()
+        if not confirm_token:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "confirm_token obrigatorio"},
+                },
+            )
+            return
+
+        confirm_result = self._confirm_pending_signup_db(confirm_token=confirm_token)
+        if confirm_result is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_token", "message": "Token de confirmacao invalido."},
+                },
+            )
+            return
+        if confirm_result == "expired_token":
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "expired_token", "message": "Token de confirmacao expirado."},
+                },
+            )
+            return
+        if confirm_result == "invalid_token":
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_token", "message": "Token de confirmacao invalido."},
+                },
+            )
+            return
+        if confirm_result == "already_exists":
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "already_exists", "message": "Cliente ja confirmado para este CNPJ/e-mail."},
+                },
+            )
+            return
+        if confirm_result == "plan_not_found":
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "plan_not_found", "message": "Plano informado nao foi encontrado."},
+                },
+            )
+            return
+        if confirm_result == "db_unavailable":
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.confirm",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "db_unavailable", "message": "Nao foi possivel confirmar cadastro no banco."},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.confirm",
+                "correlation_id": str(uuid.uuid4()),
+                "data": confirm_result,
+                "error": None,
+            },
+        )
+
+    def _persist_pending_signup_db(self, *, confirm_token: str, signup_data: dict) -> str | None:
+        if not self._is_db_enabled():
+            if signup_data["email_access"] in self.confirmed_signups:
+                return "already_exists"
+            self.pending_signups[confirm_token] = signup_data
+            return None
+        try:
+            self._ensure_signup_tables()
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {schema}.client c
+                    WHERE c.cnpj = %(cnpj)s
+                       OR LOWER(c.access_email) = %(email_access)s
+                    LIMIT 1
+                    """,
+                    {
+                        "cnpj": signup_data["cnpj"],
+                        "email_access": signup_data["email_access"],
+                    },
+                )
+                if cur.fetchone():
+                    return "already_exists"
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {schema}.client_signup_pending p
+                    WHERE p.status = 'pending'
+                      AND p.expires_at > NOW()
+                      AND (
+                        p.cnpj = %(cnpj)s
+                        OR LOWER(p.email_access) = %(email_access)s
+                      )
+                    LIMIT 1
+                    """,
+                    {
+                        "cnpj": signup_data["cnpj"],
+                        "email_access": signup_data["email_access"],
+                    },
+                )
+                if cur.fetchone():
+                    return "pending_exists"
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.client_signup_pending (
+                        confirm_token,
+                        trade_name,
+                        legal_name,
+                        cnpj,
+                        address_text,
+                        phone_contact,
+                        email_contact,
+                        email_access,
+                        email_notification,
+                        password_hash,
+                        plan_code,
+                        language_code,
+                        status,
+                        expires_at
+                    )
+                    VALUES (
+                        %(confirm_token)s,
+                        %(trade_name)s,
+                        %(legal_name)s,
+                        %(cnpj)s,
+                        %(address_text)s,
+                        %(phone_contact)s,
+                        %(email_contact)s,
+                        %(email_access)s,
+                        %(email_notification)s,
+                        %(password_hash)s,
+                        %(plan_code)s,
+                        %(language_code)s,
+                        'pending',
+                        NOW() + INTERVAL '24 hours'
+                    )
+                    """,
+                    {
+                        "confirm_token": confirm_token,
+                        "trade_name": signup_data["trade_name"],
+                        "legal_name": signup_data["legal_name"],
+                        "cnpj": signup_data["cnpj"],
+                        "address_text": signup_data["address_text"],
+                        "phone_contact": signup_data["phone_contact"],
+                        "email_contact": signup_data["email_contact"],
+                        "email_access": signup_data["email_access"],
+                        "email_notification": signup_data["email_notification"],
+                        "password_hash": signup_data["password_hash"],
+                        "plan_code": signup_data["plan_code"],
+                        "language_code": signup_data["language_code"],
+                    },
+                )
+                conn.commit()
+            return None
+        except Exception:
+            return "db_unavailable"
+
+    def _confirm_pending_signup_db(self, *, confirm_token: str) -> dict | str | None:
+        if not self._is_db_enabled():
+            record = self.pending_signups.get(confirm_token)
+            if not record:
+                return None
+            if int(record.get("expires_at_epoch") or 0) < int(time()):
+                self.pending_signups.pop(confirm_token, None)
+                return "expired_token"
+            record["status"] = "active"
+            record["confirmed_at_epoch"] = int(time())
+            self.confirmed_signups[record["email_access"]] = record
+            self.pending_signups.pop(confirm_token, None)
+            return {
+                "email_access": record["email_access"],
+                "status": record["status"],
+                "confirmed_at_epoch": record["confirmed_at_epoch"],
+            }
+
+        try:
+            self._ensure_signup_tables()
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        id,
+                        trade_name,
+                        legal_name,
+                        cnpj,
+                        address_text,
+                        phone_contact,
+                        email_contact,
+                        email_access,
+                        email_notification,
+                        password_hash,
+                        plan_code,
+                        language_code,
+                        expires_at,
+                        status
+                    FROM {schema}.client_signup_pending
+                    WHERE confirm_token = %(confirm_token)s
+                    LIMIT 1
+                    """,
+                    {"confirm_token": confirm_token},
+                )
+                pending = cur.fetchone()
+                if not pending:
+                    return None
+                if pending[13] != "pending":
+                    return "invalid_token"
+                if pending[12] is None or pending[12].timestamp() < time():
+                    cur.execute(
+                        f"""
+                        UPDATE {schema}.client_signup_pending
+                           SET status = 'expired'
+                         WHERE id = %(id)s
+                        """,
+                        {"id": pending[0]},
+                    )
+                    conn.commit()
+                    return "expired_token"
+
+                cnpj = str(pending[3]).strip()
+                email_access = str(pending[7]).strip().lower()
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {schema}.client c
+                    WHERE c.cnpj = %(cnpj)s
+                       OR LOWER(c.access_email) = %(email_access)s
+                    LIMIT 1
+                    """,
+                    {"cnpj": cnpj, "email_access": email_access},
+                )
+                if cur.fetchone():
+                    return "already_exists"
+
+                cur.execute(
+                    f"""
+                    SELECT id
+                    FROM {schema}.plan
+                    WHERE code = %(plan_code)s
+                    LIMIT 1
+                    """,
+                    {"plan_code": pending[10]},
+                )
+                plan_row = cur.fetchone()
+                if not plan_row:
+                    return "plan_not_found"
+                plan_id = int(plan_row[0])
+
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.client (
+                        fantasy_name,
+                        legal_name,
+                        cnpj,
+                        address_text,
+                        contact_phone,
+                        contact_email,
+                        access_email,
+                        notification_email,
+                        password_hash,
+                        email_confirmed_at,
+                        status
+                    )
+                    VALUES (
+                        %(fantasy_name)s,
+                        %(legal_name)s,
+                        %(cnpj)s,
+                        %(address_text)s,
+                        %(contact_phone)s,
+                        %(contact_email)s,
+                        %(access_email)s,
+                        %(notification_email)s,
+                        %(password_hash)s,
+                        NOW(),
+                        'active'
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        "fantasy_name": pending[1],
+                        "legal_name": pending[2],
+                        "cnpj": cnpj,
+                        "address_text": pending[4],
+                        "contact_phone": pending[5],
+                        "contact_email": pending[6],
+                        "access_email": email_access,
+                        "notification_email": pending[8],
+                        "password_hash": pending[9],
+                    },
+                )
+                client_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.subscription (
+                        client_id,
+                        plan_id,
+                        starts_at,
+                        ends_at,
+                        status
+                    )
+                    VALUES (
+                        %(client_id)s,
+                        %(plan_id)s,
+                        NOW(),
+                        NULL,
+                        'active'
+                    )
+                    """,
+                    {
+                        "client_id": client_id,
+                        "plan_id": plan_id,
+                    },
+                )
+
+                tenant_name = str(pending[1]).strip() or "Tenant Principal"
+                tenant_slug = self._build_unique_tenant_slug(
+                    cur=cur,
+                    client_id=client_id,
+                    desired_name=tenant_name,
+                    schema=schema,
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.tenant (
+                        client_id,
+                        name,
+                        slug,
+                        status
+                    )
+                    VALUES (
+                        %(client_id)s,
+                        %(name)s,
+                        %(slug)s,
+                        'active'
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        "client_id": client_id,
+                        "name": tenant_name,
+                        "slug": tenant_slug,
+                    },
+                )
+                tenant_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.app_user (
+                        client_id,
+                        email,
+                        full_name,
+                        password_hash,
+                        is_active
+                    )
+                    VALUES (
+                        %(client_id)s,
+                        %(email)s,
+                        %(full_name)s,
+                        %(password_hash)s,
+                        TRUE
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        "client_id": client_id,
+                        "email": email_access,
+                        "full_name": str(pending[1]).strip() or str(pending[2]).strip(),
+                        "password_hash": pending[9],
+                    },
+                )
+                owner_user_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.tenant_user_role (
+                        tenant_id,
+                        user_id,
+                        role
+                    )
+                    VALUES (
+                        %(tenant_id)s,
+                        %(user_id)s,
+                        'owner'
+                    )
+                    """,
+                    {
+                        "tenant_id": tenant_id,
+                        "user_id": owner_user_id,
+                    },
+                )
+
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.user_tenant_preference (
+                        tenant_id,
+                        user_id,
+                        language_code,
+                        theme_code
+                    )
+                    VALUES (
+                        %(tenant_id)s,
+                        %(user_id)s,
+                        %(language_code)s,
+                        'light'
+                    )
+                    """,
+                    {
+                        "tenant_id": tenant_id,
+                        "user_id": owner_user_id,
+                        "language_code": str(pending[11] or "pt-BR"),
+                    },
+                )
+
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.client_signup_pending
+                       SET status = 'confirmed',
+                           confirmed_at = NOW()
+                     WHERE id = %(id)s
+                    """,
+                    {"id": pending[0]},
+                )
+                conn.commit()
+                return {
+                    "email_access": email_access,
+                    "status": "active",
+                    "client_id": client_id,
+                    "tenant_id": tenant_id,
+                    "user_id": owner_user_id,
+                    "confirmed_at_epoch": int(time()),
+                }
+        except Exception:
+            return "db_unavailable"
+
+    def _login_user(self, *, email: str, password: str, tenant_id: int | None) -> dict:
+        if not self._is_db_enabled():
+            return {"error_code": "db_unavailable", "message": "Login requer IAOPS_DB_DSN configurado."}
+        try:
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        u.id AS user_id,
+                        u.client_id,
+                        u.email,
+                        u.full_name,
+                        u.password_hash,
+                        u.is_active,
+                        c.status AS client_status,
+                        c.email_confirmed_at
+                    FROM {schema}.app_user u
+                    JOIN {schema}.client c ON c.id = u.client_id
+                    WHERE LOWER(u.email) = %(email)s
+                    LIMIT 1
+                    """,
+                    {"email": email},
+                )
+                user = cur.fetchone()
+                if not user:
+                    return {"error_code": "invalid_credentials", "message": "Credenciais invalidas."}
+                if not bool(user[5]):
+                    return {"error_code": "user_inactive", "message": "Usuario inativo."}
+                if str(user[6] or "") != "active":
+                    return {"error_code": "client_inactive", "message": "Cliente inativo."}
+                if user[7] is None:
+                    return {"error_code": "email_unconfirmed", "message": "E-mail do cliente nao confirmado."}
+                if not self._verify_password_hash(password, str(user[4] or "")):
+                    return {"error_code": "invalid_credentials", "message": "Credenciais invalidas."}
+
+                role_and_tenant = self._resolve_login_tenant(cur=cur, client_id=int(user[1]), user_id=int(user[0]), tenant_id=tenant_id)
+                if not role_and_tenant:
+                    return {"error_code": "tenant_not_found", "message": "Nenhum tenant ativo vinculado ao usuario."}
+                resolved_tenant_id, tenant_name, role = role_and_tenant
+
+                cur.execute(
+                    f"""
+                    SELECT is_enabled, totp_secret_ciphertext
+                    FROM {schema}.user_mfa_config
+                    WHERE user_id = %(user_id)s
+                    LIMIT 1
+                    """,
+                    {"user_id": int(user[0])},
+                )
+                mfa_row = cur.fetchone()
+                mfa_enabled = bool(mfa_row and mfa_row[0])
+                if mfa_enabled:
+                    challenge_token = token_hex(18)
+                    self.mfa_login_challenges[challenge_token] = {
+                        "client_id": int(user[1]),
+                        "tenant_id": resolved_tenant_id,
+                        "user_id": int(user[0]),
+                        "email": str(user[2]),
+                        "full_name": str(user[3] or ""),
+                        "role": role,
+                        "tenant_name": tenant_name,
+                        "totp_secret_ciphertext": str(mfa_row[1] or ""),
+                        "expires_at_epoch": int(time()) + (5 * 60),
+                    }
+                    return {
+                        "mfa_required": True,
+                        "challenge_token": challenge_token,
+                        "expires_at_epoch": int(time()) + (5 * 60),
+                    }
+
+                return {
+                    "mfa_required": False,
+                    "auth_context": {
+                        "client_id": int(user[1]),
+                        "tenant_id": resolved_tenant_id,
+                        "user_id": int(user[0]),
+                    },
+                    "profile": {
+                        "email": str(user[2]),
+                        "full_name": str(user[3] or ""),
+                        "role": role,
+                        "tenant_name": tenant_name,
+                    },
+                }
+        except Exception:
+            return {"error_code": "login_failed", "message": "Falha ao processar login."}
+
+    def _verify_login_mfa(self, *, challenge_token: str, otp_code: str) -> dict:
+        challenge = self.mfa_login_challenges.get(challenge_token)
+        if not challenge:
+            return {"error_code": "invalid_challenge", "message": "Challenge MFA invalido."}
+        if int(challenge.get("expires_at_epoch") or 0) < int(time()):
+            self.mfa_login_challenges.pop(challenge_token, None)
+            return {"error_code": "expired_challenge", "message": "Challenge MFA expirado."}
+        secret_ciphertext = str(challenge.get("totp_secret_ciphertext") or "")
+        if not secret_ciphertext:
+            return {"error_code": "mfa_unavailable", "message": "Segredo MFA indisponivel."}
+        try:
+            secret = decrypt_text(secret_ciphertext)
+        except Exception:
+            return {"error_code": "mfa_unavailable", "message": "Nao foi possivel validar MFA."}
+        if not verify_totp(secret, otp_code):
+            return {"error_code": "invalid_otp", "message": "Codigo TOTP invalido."}
+        self.mfa_login_challenges.pop(challenge_token, None)
+        return {
+            "mfa_required": False,
+            "auth_context": {
+                "client_id": int(challenge["client_id"]),
+                "tenant_id": int(challenge["tenant_id"]),
+                "user_id": int(challenge["user_id"]),
+            },
+            "profile": {
+                "email": str(challenge["email"]),
+                "full_name": str(challenge["full_name"] or ""),
+                "role": str(challenge["role"] or "viewer"),
+                "tenant_name": str(challenge["tenant_name"] or ""),
+            },
+        }
+
+    @staticmethod
+    def _verify_password_hash(password: str, encoded_hash: str) -> bool:
+        value = str(encoded_hash or "").strip()
+        if not value:
+            return False
+        if value.startswith("pbkdf2_sha256$"):
+            parts = value.split("$")
+            if len(parts) != 4:
+                return False
+            try:
+                iterations = int(parts[1])
+            except ValueError:
+                return False
+            salt = parts[2]
+            expected = parts[3]
+            calculated = pbkdf2_hmac(
+                "sha256",
+                str(password).encode("utf-8"),
+                salt.encode("utf-8"),
+                iterations,
+            ).hex()
+            return calculated == expected
+        return str(password) == value
+
+    @staticmethod
+    def _resolve_login_tenant(*, cur, client_id: int, user_id: int, tenant_id: int | None) -> tuple[int, str, str] | None:
+        base_sql = """
+            SELECT
+                t.id AS tenant_id,
+                t.name AS tenant_name,
+                tur.role
+            FROM iaops_gov.tenant_user_role tur
+            JOIN iaops_gov.tenant t ON t.id = tur.tenant_id
+            WHERE tur.user_id = %(user_id)s
+              AND t.client_id = %(client_id)s
+              AND t.status = 'active'
+        """
+        if tenant_id:
+            cur.execute(
+                base_sql + " AND t.id = %(tenant_id)s LIMIT 1",
+                {
+                    "user_id": user_id,
+                    "client_id": client_id,
+                    "tenant_id": int(tenant_id),
+                },
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return int(row[0]), str(row[1]), str(row[2])
+        cur.execute(
+            base_sql
+            + """
+              ORDER BY CASE tur.role WHEN 'owner' THEN 3 WHEN 'admin' THEN 2 ELSE 1 END DESC, t.id
+              LIMIT 1
+            """,
+            {
+                "user_id": user_id,
+                "client_id": client_id,
+            },
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return int(row[0]), str(row[1]), str(row[2])
+
+    @staticmethod
+    def _slugify_text(value: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9]+", "-", str(value or "").strip().lower())
+        normalized = re.sub(r"-+", "-", normalized).strip("-")
+        return normalized or "tenant-principal"
+
+    def _build_unique_tenant_slug(self, *, cur, client_id: int, desired_name: str, schema: str) -> str:
+        base = self._slugify_text(desired_name)
+        for index in range(0, 100):
+            slug = base if index == 0 else f"{base}-{index + 1}"
+            cur.execute(
+                f"""
+                SELECT 1
+                FROM {schema}.tenant
+                WHERE client_id = %(client_id)s
+                  AND slug = %(slug)s
+                LIMIT 1
+                """,
+                {
+                    "client_id": client_id,
+                    "slug": slug,
+                },
+            )
+            if not cur.fetchone():
+                return slug
+        return f"{base}-{token_hex(2)}"
 
     def _handle_channel_list_tenants(self) -> None:
         body = self._read_json_body()
@@ -1543,6 +2501,74 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "correlation_id": self.headers.get("X-Correlation-Id", str(uuid.uuid4())),
         }
 
+    @staticmethod
+    def _get_db_dsn() -> str | None:
+        explicit = os.getenv("IAOPS_DB_DSN")
+        if explicit:
+            return explicit
+        host = os.getenv("IAOPS_DB_HOST") or os.getenv("PGHOST")
+        user = os.getenv("IAOPS_DB_USER") or os.getenv("PGUSER")
+        password = os.getenv("IAOPS_DB_PASSWORD") or os.getenv("PGPASSWORD")
+        dbname = os.getenv("IAOPS_DB_NAME") or os.getenv("PGDATABASE")
+        port = os.getenv("IAOPS_DB_PORT") or os.getenv("PGPORT") or "5432"
+        if host and user and dbname:
+            if password:
+                return f"host={host} port={port} dbname={dbname} user={user} password={password}"
+            return f"host={host} port={port} dbname={dbname} user={user}"
+        return None
+
+    @classmethod
+    def _is_db_enabled(cls) -> bool:
+        return bool(connect is not None and cls._get_db_dsn())
+
+    @classmethod
+    def _ensure_signup_tables(cls) -> None:
+        if cls.signup_tables_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {schema}.client_signup_pending (
+                    id BIGSERIAL PRIMARY KEY,
+                    confirm_token TEXT NOT NULL UNIQUE,
+                    trade_name TEXT NOT NULL,
+                    legal_name TEXT NOT NULL,
+                    cnpj TEXT NOT NULL,
+                    address_text TEXT NOT NULL,
+                    phone_contact TEXT NOT NULL,
+                    email_contact TEXT NOT NULL,
+                    email_access TEXT NOT NULL,
+                    email_notification TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    plan_code TEXT NOT NULL,
+                    language_code TEXT NOT NULL DEFAULT 'pt-BR',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    confirmed_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_client_signup_pending_email
+                    ON {schema}.client_signup_pending (LOWER(email_access))
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_client_signup_pending_cnpj
+                    ON {schema}.client_signup_pending (cnpj)
+                """
+            )
+            conn.commit()
+        cls.signup_tables_ready = True
+
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
@@ -1551,6 +2577,41 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not raw:
             return {}
         return json.loads(raw.decode("utf-8"))
+
+    @staticmethod
+    def _send_signup_email(*, to_email: str, trade_name: str, confirm_token: str) -> tuple[bool, str]:
+        smtp_host = os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
+        smtp_user = os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or ""
+        smtp_pass = os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or ""
+        smtp_from = os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or smtp_user
+        smtp_tls = str(os.getenv("IAOPS_SMTP_STARTTLS") or "1").strip() not in {"0", "false", "False"}
+
+        if not smtp_host or not smtp_from:
+            return False, "SMTP nao configurado no ambiente de desenvolvimento."
+
+        subject = "IAOps Governance - Confirmacao de cadastro"
+        body = (
+            f"Ola, {trade_name}.\n\n"
+            "Seu cadastro foi recebido. Use o token abaixo para confirmar o acesso no app:\n\n"
+            f"{confirm_token}\n\n"
+            "Se voce nao solicitou este cadastro, ignore esta mensagem."
+        )
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = smtp_from
+        message["To"] = to_email
+        message.set_content(body)
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+                if smtp_tls:
+                    smtp.starttls()
+                if smtp_user:
+                    smtp.login(smtp_user, smtp_pass)
+                smtp.send_message(message)
+            return True, f"Token enviado para {to_email}."
+        except Exception:
+            return False, "Falha no envio por SMTP. Token retornado no payload para uso em desenvolvimento."
 
     def _send_json(self, status: HTTPStatus, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")

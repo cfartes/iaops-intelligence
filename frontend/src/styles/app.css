@@ -113,6 +113,13 @@ select {
   gap: 8px;
 }
 
+.setup-status-summary {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .setup-mini-checklist-wrap {
   max-height: 240px;
   opacity: 1;
