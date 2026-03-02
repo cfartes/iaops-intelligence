@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -920,7 +923,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _execute_nl_chat_query(self, context: dict, question_text: str) -> dict:
         rag = self._build_rag_context(context)
-        planned = self._plan_sql_from_question(question_text, rag)
+        planned = self._plan_sql_from_question(context, question_text, rag)
         sql_text = planned.get("sql_text")
         if not sql_text:
             return {
@@ -946,6 +949,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "question_text": question_text,
                 "planned_sql": sql_text,
                 "planning_mode": planned.get("mode", "rules"),
+                "llm_provider": planned.get("llm_provider"),
                 "rag": rag,
                 "result": query_data,
             },
@@ -981,8 +985,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             columns_by_table[key] = (column_result.get("data") or {}).get("columns") or []
         return {"tables": tables, "columns": columns_by_table}
 
+    def _plan_sql_from_question(self, context: dict, question_text: str, rag: dict) -> dict:
+        llm_plan = self._plan_sql_with_llm(context, question_text, rag)
+        if llm_plan.get("sql_text"):
+            return llm_plan
+        return self._plan_sql_with_rules(question_text, rag)
+
     @staticmethod
-    def _plan_sql_from_question(question_text: str, rag: dict) -> dict:
+    def _plan_sql_with_rules(question_text: str, rag: dict) -> dict:
         q = question_text.lower()
         if "incidente" in q and ("aberto" in q or "abertos" in q):
             return {
@@ -1008,6 +1018,161 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 return {"mode": "rules", "sql_text": f"SELECT COUNT(*) AS total FROM {schema_name}.{table_name}"}
             return {"mode": "rules", "sql_text": f"SELECT * FROM {schema_name}.{table_name} LIMIT 20"}
         return {"mode": "rules", "sql_text": None}
+
+    def _plan_sql_with_llm(self, context: dict, question_text: str, rag: dict) -> dict:
+        cfg_result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "tenant_llm.get_config",
+                "input": {},
+            }
+        )
+        if cfg_result.get("status") != "success":
+            return {"mode": "llm_unavailable", "sql_text": None}
+        cfg = (cfg_result.get("data") or {}).get("config") or {}
+        provider_name = str(cfg.get("provider_name") or "").strip().lower()
+        model_code = str(cfg.get("model_code") or "").strip()
+        endpoint_url = str(cfg.get("endpoint_url") or "").strip()
+        secret_value = self._resolve_secret_value(cfg.get("secret_ref"))
+        if not provider_name or not model_code or not endpoint_url or not secret_value:
+            return {"mode": "llm_unavailable", "sql_text": None}
+
+        prompt_payload = {
+            "instruction": (
+                "Converta a pergunta do usuario para SQL SELECT seguro. "
+                "Responda SOMENTE com JSON no formato: {\"sql_text\":\"...\"}. "
+                "Nao use DDL/DML. Sem ponto e virgula."
+            ),
+            "question": question_text,
+            "tables": rag.get("tables") or [],
+            "columns": rag.get("columns") or {},
+            "allowed_schemas_hint": ["public", "analytics", "iaops_gov"],
+        }
+        llm_output = self._invoke_llm_json(
+            provider_name=provider_name,
+            model_code=model_code,
+            endpoint_url=endpoint_url,
+            api_key=secret_value,
+            prompt_payload=prompt_payload,
+        )
+        sql_text = str((llm_output or {}).get("sql_text") or "").strip()
+        if not sql_text:
+            return {"mode": "llm_empty", "sql_text": None}
+        if ";" in sql_text or not sql_text.lower().startswith("select"):
+            return {"mode": "llm_rejected", "sql_text": None}
+        return {"mode": "llm", "sql_text": sql_text, "llm_provider": provider_name}
+
+    def _resolve_secret_value(self, secret_ref: str | None) -> str | None:
+        ref = str(secret_ref or "").strip()
+        if not ref:
+            return None
+        if ref.startswith("plain://"):
+            return ref.removeprefix("plain://").strip() or None
+        if ref.startswith("env://"):
+            env_name = ref.removeprefix("env://").strip()
+            return os.getenv(env_name)
+        if ref in os.environ:
+            return os.environ.get(ref)
+        normalized = re.sub(r"[^A-Za-z0-9_]+", "_", ref).strip("_").upper()
+        if normalized:
+            return os.getenv(f"IAOPS_SECRET_{normalized}")
+        return None
+
+    def _invoke_llm_json(
+        self,
+        *,
+        provider_name: str,
+        model_code: str,
+        endpoint_url: str,
+        api_key: str,
+        prompt_payload: dict,
+    ) -> dict | None:
+        try:
+            content = json.dumps(prompt_payload, ensure_ascii=True)
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a SQL planner. Return only JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ]
+            base = endpoint_url.rstrip("/")
+            if provider_name in {"openai", "azure_openai", "groq", "mistral", "ollama"}:
+                url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+                payload = {"model": model_code, "messages": messages, "temperature": 0}
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                if provider_name == "azure_openai":
+                    headers["api-key"] = api_key
+                text = self._http_post_json(url, headers, payload)
+                data = json.loads(text)
+                content_text = (
+                    (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+                ).strip()
+                return self._extract_json_object(content_text)
+            if provider_name == "anthropic":
+                url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
+                payload = {
+                    "model": model_code,
+                    "max_tokens": 300,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": content}],
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+                text = self._http_post_json(url, headers, payload)
+                data = json.loads(text)
+                parts = data.get("content") or []
+                joined = " ".join(str(item.get("text") or "") for item in parts if isinstance(item, dict))
+                return self._extract_json_object(joined)
+            if provider_name == "google_gemini":
+                url = f"{base}/models/{model_code}:generateContent?key={api_key}"
+                payload = {"contents": [{"parts": [{"text": content}]}]}
+                headers = {"Content-Type": "application/json"}
+                text = self._http_post_json(url, headers, payload)
+                data = json.loads(text)
+                candidates = data.get("candidates") or []
+                parts = (((candidates[0] if candidates else {}).get("content") or {}).get("parts") or [])
+                joined = " ".join(str(item.get("text") or "") for item in parts if isinstance(item, dict))
+                return self._extract_json_object(joined)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _http_post_json(url: str, headers: dict, payload: dict) -> str:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8")
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict | None:
+        if not text:
+            return None
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end < 0 or end <= start:
+            return None
+        snippet = raw[start : end + 1]
+        try:
+            parsed = json.loads(snippet)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
 
     @staticmethod
     def _rank_tables_for_question(question_text: str, tables: list[dict]) -> list[dict]:
@@ -1039,7 +1204,6 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         tables = rag.get("tables") or []
         if tables:
             lines.append(f"Contexto RAG: {len(tables)} tabela(s) monitorada(s) analisadas.")
-        lines.append(f"Consulta gerada internamente: {sql_text}")
         return "\n".join(lines)
 
     def _handle_security_sql_policy_update(self) -> None:

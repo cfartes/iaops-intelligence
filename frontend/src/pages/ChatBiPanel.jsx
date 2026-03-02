@@ -72,7 +72,6 @@ export default function ChatBiPanel({ onSystemMessage }) {
       {result && !loading && (
         <div className="chat-result">
           <p className="chat-summary">{summarizeResult(rows)}</p>
-          <p className="muted">Consulta gerada internamente: {result.planned_sql}</p>
 
           {columns.length > 0 && rows.length > 0 && (
             <div className="table-wrap">
