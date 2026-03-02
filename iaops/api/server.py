@@ -739,6 +739,38 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "data": result["data"],
             }
 
+        if kind == "sql_query":
+            runtime = self._resolve_channel_runtime_context(
+                context=context,
+                channel_type=channel_type,
+                external_user_key=external_user_key,
+                conversation_key=conversation_key,
+            )
+            if runtime.get("error"):
+                return runtime["error"]
+            query_result = self._call_mcp(
+                {
+                    "context": runtime["context"],
+                    "tool": "query.execute_safe_sql",
+                    "input": {
+                        "sql_text": command["sql_text"],
+                        "explain": False,
+                    },
+                }
+            )
+            if query_result["status"] != "success":
+                return self._channel_error_response(query_result)
+            data = query_result["data"]
+            return {
+                "ok": True,
+                "command": "sql_query",
+                "reply_text": self._reply_sql_result(command["sql_text"], data),
+                "data": {
+                    "active_tenant": runtime["active"],
+                    "query": data,
+                },
+            }
+
         return {
             "ok": True,
             "command": "help",
@@ -746,9 +778,61 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "data": {},
         }
 
+    def _resolve_channel_runtime_context(
+        self,
+        *,
+        context: dict,
+        channel_type: str,
+        external_user_key: str,
+        conversation_key: str,
+    ) -> dict:
+        active = self._call_mcp(
+            {
+                "context": context,
+                "tool": "channel.get_active_tenant",
+                "input": {
+                    "channel_type": channel_type,
+                    "conversation_key": conversation_key,
+                    "external_user_key": external_user_key,
+                },
+            }
+        )
+        if active["status"] != "success":
+            return {"error": self._channel_error_response(active)}
+        active_data = active["data"]
+        active_tenant_id = active_data.get("active_tenant_id")
+        user = active_data.get("user") or {}
+        active_user_id = user.get("user_id")
+        if active_tenant_id is None:
+            return {
+                "error": {
+                    "ok": False,
+                    "command": "error",
+                    "reply_text": "Nenhum tenant ativo na conversa. Use: tenant list e tenant select <id>.",
+                    "data": {"active": active_data},
+                }
+            }
+        if active_user_id is None:
+            return {
+                "error": {
+                    "ok": False,
+                    "command": "error",
+                    "reply_text": "Usuario do canal nao identificado.",
+                    "data": {"active": active_data},
+                }
+            }
+        runtime_context = {
+            "client_id": int(context["client_id"]),
+            "tenant_id": int(active_tenant_id),
+            "user_id": int(active_user_id),
+            "correlation_id": str(uuid.uuid4()),
+        }
+        return {"context": runtime_context, "active": active_data}
+
     @staticmethod
     def _parse_channel_command(message_text: str) -> dict:
-        normalized = " ".join(message_text.lower().strip().split())
+        raw = message_text.strip()
+        normalized = " ".join(raw.lower().split())
         if not normalized:
             return {"kind": "help"}
         if normalized in {"tenant", "/tenant", "tenant list", "/tenant list", "tenants"}:
@@ -758,6 +842,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         selected = re.match(r"^/?tenant\s+select\s+(\d+)$", normalized)
         if selected:
             return {"kind": "tenant_select", "tenant_id": int(selected.group(1))}
+        sql_match = re.match(r"^/?sql\s+(.+)$", raw, flags=re.IGNORECASE | re.DOTALL)
+        if sql_match:
+            sql_text = sql_match.group(1).strip()
+            if not sql_text:
+                return {"kind": "help"}
+            return {"kind": "sql_query", "sql_text": sql_text}
         return {"kind": "help"}
 
     @staticmethod
@@ -809,8 +899,27 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             f"{prefix}Comandos disponiveis:\n"
             "tenant list\n"
             "tenant select <id>\n"
-            "tenant active"
+            "tenant active\n"
+            "sql <select ...>"
         )
+
+    @staticmethod
+    def _reply_sql_result(sql_text: str, data: dict) -> str:
+        rows = data.get("rows") or []
+        columns = data.get("columns") or []
+        lines = []
+        lines.append(f"SQL executada com sucesso. Linhas: {len(rows)}")
+        if columns:
+            lines.append(f"Colunas: {', '.join(str(item) for item in columns)}")
+        preview = rows[:5]
+        if preview:
+            lines.append("Preview:")
+            for index, row in enumerate(preview, start=1):
+                lines.append(f"{index}. {json.dumps(row, ensure_ascii=True)}")
+        else:
+            lines.append("Consulta sem retorno de linhas.")
+        lines.append(f"Comando: sql {sql_text}")
+        return "\n".join(lines)
 
     def _handle_security_sql_policy_update(self) -> None:
         body = self._read_json_body()
