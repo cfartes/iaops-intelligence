@@ -689,6 +689,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         command: dict,
         message_text: str,
     ) -> dict:
+        language_code = self._resolve_language_code(context)
         kind = command["kind"]
         if kind == "tenant_list":
             result = self._call_mcp(
@@ -702,12 +703,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             if result["status"] != "success":
-                return self._channel_error_response(result)
+                return self._channel_error_response(result, language_code)
             data = result["data"]
             return {
                 "ok": True,
                 "command": "tenant_list",
-                "reply_text": self._reply_tenant_list(data),
+                "reply_text": self._reply_tenant_list(data, language_code),
                 "data": data,
             }
 
@@ -725,7 +726,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             if result["status"] != "success":
-                return self._channel_error_response(result)
+                return self._channel_error_response(result, language_code)
             active = self._call_mcp(
                 {
                     "context": context,
@@ -738,10 +739,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             active_data = active["data"] if active["status"] == "success" else {}
+            active_lang = self._resolve_language_code_from_active(context, active_data, language_code)
             return {
                 "ok": True,
                 "command": "tenant_select",
-                "reply_text": self._reply_active_tenant(active_data),
+                "reply_text": self._reply_active_tenant(active_data, active_lang),
                 "data": {
                     "selection": result["data"].get("selection"),
                     "active": active_data,
@@ -761,11 +763,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             if result["status"] != "success":
-                return self._channel_error_response(result)
+                return self._channel_error_response(result, language_code)
+            active_lang = self._resolve_language_code_from_active(context, result["data"], language_code)
             return {
                 "ok": True,
                 "command": "tenant_active",
-                "reply_text": self._reply_active_tenant(result["data"]),
+                "reply_text": self._reply_active_tenant(result["data"], active_lang),
                 "data": result["data"],
             }
 
@@ -773,7 +776,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {
                 "ok": False,
                 "command": "error",
-                "reply_text": "Comando SQL nao e aceito. Envie a pergunta em linguagem natural.",
+                "reply_text": self._t(language_code, "sql_not_allowed"),
                 "data": {},
             }
 
@@ -783,10 +786,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 channel_type=channel_type,
                 external_user_key=external_user_key,
                 conversation_key=conversation_key,
+                language_code=language_code,
             )
             if runtime.get("error"):
                 return runtime["error"]
-            nl_response = self._execute_nl_chat_query(runtime["context"], command["question_text"])
+            runtime_language = self._resolve_language_code(runtime["context"])
+            nl_response = self._execute_nl_chat_query(runtime["context"], command["question_text"], runtime_language)
             if not nl_response["ok"]:
                 return nl_response
             return {
@@ -802,7 +807,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return {
             "ok": True,
             "command": "help",
-            "reply_text": self._reply_help(message_text),
+            "reply_text": self._reply_help(message_text, language_code),
             "data": {},
         }
 
@@ -813,6 +818,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         channel_type: str,
         external_user_key: str,
         conversation_key: str,
+        language_code: str = "pt-BR",
     ) -> dict:
         active = self._call_mcp(
             {
@@ -826,7 +832,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             }
         )
         if active["status"] != "success":
-            return {"error": self._channel_error_response(active)}
+            return {"error": self._channel_error_response(active, language_code)}
         active_data = active["data"]
         active_tenant_id = active_data.get("active_tenant_id")
         user = active_data.get("user") or {}
@@ -836,7 +842,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error": {
                     "ok": False,
                     "command": "error",
-                    "reply_text": "Nenhum tenant ativo na conversa. Use: tenant list e tenant select <id>.",
+                    "reply_text": self._t(language_code, "no_active_tenant_conversation"),
                     "data": {"active": active_data},
                 }
             }
@@ -845,7 +851,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error": {
                     "ok": False,
                     "command": "error",
-                    "reply_text": "Usuario do canal nao identificado.",
+                    "reply_text": self._t(language_code, "channel_user_not_identified"),
                     "data": {"active": active_data},
                 }
             }
@@ -876,58 +882,60 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"kind": "sql_query"}
         return {"kind": "nl_query", "question_text": raw}
 
-    @staticmethod
-    def _channel_error_response(result: dict) -> dict:
+    def _channel_error_response(self, result: dict, language_code: str = "pt-BR") -> dict:
         message = (
             result.get("error", {}).get("message")
-            or "Nao foi possivel processar o comando no canal."
+            or self._t(language_code, "channel_command_failed")
         )
         return {
             "ok": False,
             "command": "error",
-            "reply_text": f"Erro: {message}",
+            "reply_text": self._t(language_code, "error_prefix", message=message),
             "data": {"mcp": result},
         }
 
-    @staticmethod
-    def _reply_tenant_list(data: dict) -> str:
+    def _reply_tenant_list(self, data: dict, language_code: str) -> str:
         tenants = data.get("tenants") or []
         user = data.get("user") or {}
         lines = []
-        lines.append(f"Usuario: {user.get('full_name') or user.get('email') or 'n/a'}")
-        lines.append("Tenants disponiveis:")
+        lines.append(self._t(language_code, "user_label", value=(user.get("full_name") or user.get("email") or "n/a")))
+        lines.append(self._t(language_code, "available_tenants"))
         for item in tenants:
             lines.append(
                 f"- {item.get('tenant_id')}: {item.get('name')} ({item.get('status')}, role={item.get('role')})"
             )
-        lines.append("Use: tenant select <id>")
-        lines.append("Use: tenant active")
+        lines.append(self._t(language_code, "hint_tenant_select"))
+        lines.append(self._t(language_code, "hint_tenant_active"))
         return "\n".join(lines)
 
-    @staticmethod
-    def _reply_active_tenant(data: dict) -> str:
+    def _reply_active_tenant(self, data: dict, language_code: str) -> str:
         active_tenant_id = data.get("active_tenant_id")
         tenants = data.get("tenants") or []
         if active_tenant_id is None:
-            return "Nenhum tenant ativo para esta conversa. Use: tenant list"
+            return self._t(language_code, "no_active_tenant")
         selected = next(
             (item for item in tenants if int(item.get("tenant_id", -1)) == int(active_tenant_id)),
             None,
         )
         if not selected:
-            return f"Tenant ativo: {active_tenant_id}"
-        return f"Tenant ativo: {selected.get('tenant_id')} - {selected.get('name')} ({selected.get('status')})"
+            return self._t(language_code, "active_tenant_id_only", tenant_id=active_tenant_id)
+        return self._t(
+            language_code,
+            "active_tenant_full",
+            tenant_id=selected.get("tenant_id"),
+            tenant_name=selected.get("name"),
+            tenant_status=selected.get("status"),
+        )
 
-    @staticmethod
-    def _reply_help(message_text: str) -> str:
-        prefix = f"Comando nao reconhecido: '{message_text}'.\n" if message_text else ""
+    def _reply_help(self, message_text: str, language_code: str) -> str:
+        prefix = self._t(language_code, "unknown_command", value=message_text) if message_text else ""
         return (
             f"{prefix}Comandos disponiveis:\n"
             "tenant list\n"
             "tenant select <id>\n"
             "tenant active\n"
-            "ajuda\n"
-            "Ou envie a pergunta em linguagem natural."
+            f"{self._t(language_code, 'help_keyword')}\n"
+            f"{self._t(language_code, 'ask_natural_language')}"
         )
 
     @staticmethod
@@ -948,7 +956,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lines.append(f"Comando: sql {sql_text}")
         return "\n".join(lines)
 
-    def _execute_nl_chat_query(self, context: dict, question_text: str) -> dict:
+    def _execute_nl_chat_query(self, context: dict, question_text: str, language_code: str | None = None) -> dict:
+        resolved_language = language_code or self._resolve_language_code(context)
         response_mode = self._resolve_chat_response_mode(context)
         rag = self._build_rag_context(context)
         planned = self._plan_sql_from_question(context, question_text, rag)
@@ -957,7 +966,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {
                 "ok": False,
                 "command": "error",
-                "reply_text": "Nao consegui interpretar sua pergunta com as tabelas monitoradas.",
+                "reply_text": self._t(resolved_language, "could_not_interpret_question"),
                 "data": {"rag": rag},
             }
         query_result = self._call_mcp(
@@ -968,16 +977,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             }
         )
         if query_result["status"] != "success":
-            return self._channel_error_response(query_result)
+            return self._channel_error_response(query_result, resolved_language)
         query_data = query_result["data"]
         return {
             "ok": True,
-            "reply_text": self._reply_nl_result(question_text, sql_text, query_data, rag, response_mode),
+            "reply_text": self._reply_nl_result(
+                question_text, sql_text, query_data, rag, response_mode, resolved_language
+            ),
             "data": {
                 "question_text": question_text,
                 "planned_sql": sql_text,
                 "planning_mode": planned.get("mode", "rules"),
                 "llm_provider": planned.get("llm_provider"),
+                "language_code": resolved_language,
                 "chat_response_mode": response_mode,
                 "rag": rag,
                 "result": query_data,
@@ -997,6 +1009,38 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         pref = (result.get("data") or {}).get("preference") or {}
         mode = str(pref.get("chat_response_mode") or "executive").strip().lower()
         return mode if mode in {"executive", "detailed"} else "executive"
+
+    def _resolve_language_code(self, context: dict) -> str:
+        result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "pref.get_user_tenant",
+                "input": {},
+            }
+        )
+        if result.get("status") != "success":
+            return "pt-BR"
+        pref = (result.get("data") or {}).get("preference") or {}
+        lang = str(pref.get("language_code") or "pt-BR").strip()
+        return lang or "pt-BR"
+
+    def _resolve_language_code_from_active(
+        self,
+        base_context: dict,
+        active_data: dict,
+        fallback_language: str = "pt-BR",
+    ) -> str:
+        user = active_data.get("user") or {}
+        active_tenant_id = active_data.get("active_tenant_id")
+        if active_tenant_id is None or user.get("user_id") is None:
+            return fallback_language
+        runtime_context = {
+            "client_id": int(base_context["client_id"]),
+            "tenant_id": int(active_tenant_id),
+            "user_id": int(user["user_id"]),
+            "correlation_id": str(uuid.uuid4()),
+        }
+        return self._resolve_language_code(runtime_context)
 
     def _build_rag_context(self, context: dict) -> dict:
         table_result = self._call_mcp(
@@ -1297,25 +1341,120 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [item for _, item in scored]
 
-    @staticmethod
-    def _reply_nl_result(question_text: str, sql_text: str, query_data: dict, rag: dict, response_mode: str) -> str:
+    def _reply_nl_result(
+        self,
+        question_text: str,
+        sql_text: str,
+        query_data: dict,
+        rag: dict,
+        response_mode: str,
+        language_code: str,
+    ) -> str:
         rows = query_data.get("rows") or []
         columns = query_data.get("columns") or []
         lines = []
-        lines.append(f"Pergunta: {question_text}")
-        lines.append(f"Encontrei {len(rows)} registro(s).")
+        lines.append(self._t(language_code, "question_label", value=question_text))
+        lines.append(self._t(language_code, "found_records", total=len(rows)))
         if rows and "total" in columns and isinstance(rows[0], dict) and "total" in rows[0]:
-            lines.append(f"Total: {rows[0]['total']}")
+            lines.append(self._t(language_code, "total_label", value=rows[0]["total"]))
         if rows and response_mode == "detailed":
-            lines.append("Preview:")
+            lines.append(self._t(language_code, "preview_label"))
             for idx, row in enumerate(rows[:5], start=1):
                 lines.append(f"{idx}. {json.dumps(row, ensure_ascii=True)}")
         elif rows:
-            lines.append("Resumo executivo: dados encontrados e prontos para detalhamento.")
+            lines.append(self._t(language_code, "executive_summary"))
         tables = rag.get("tables") or []
         if tables and response_mode == "detailed":
-            lines.append(f"Contexto RAG: {len(tables)} tabela(s) monitorada(s) analisadas.")
+            lines.append(self._t(language_code, "rag_context_tables", total=len(tables)))
         return "\n".join(lines)
+
+    @staticmethod
+    def _t(language_code: str, key: str, **kwargs: object) -> str:
+        lang = str(language_code or "pt-BR").lower()
+        bucket = "pt"
+        if lang.startswith("en"):
+            bucket = "en"
+        elif lang.startswith("es"):
+            bucket = "es"
+        texts = {
+            "pt": {
+                "sql_not_allowed": "Comando SQL nao e aceito. Envie a pergunta em linguagem natural.",
+                "no_active_tenant_conversation": "Nenhum tenant ativo na conversa. Use: tenant list e tenant select <id>.",
+                "channel_user_not_identified": "Usuario do canal nao identificado.",
+                "channel_command_failed": "Nao foi possivel processar o comando no canal.",
+                "error_prefix": "Erro: {message}",
+                "user_label": "Usuario: {value}",
+                "available_tenants": "Tenants disponiveis:",
+                "hint_tenant_select": "Use: tenant select <id>",
+                "hint_tenant_active": "Use: tenant active",
+                "no_active_tenant": "Nenhum tenant ativo para esta conversa. Use: tenant list",
+                "active_tenant_id_only": "Tenant ativo: {tenant_id}",
+                "active_tenant_full": "Tenant ativo: {tenant_id} - {tenant_name} ({tenant_status})",
+                "unknown_command": "Comando nao reconhecido: '{value}'.\n",
+                "help_keyword": "ajuda",
+                "ask_natural_language": "Ou envie a pergunta em linguagem natural.",
+                "chat_question_required": "question_text obrigatorio",
+                "could_not_interpret_question": "Nao consegui interpretar sua pergunta com as tabelas monitoradas.",
+                "question_label": "Pergunta: {value}",
+                "found_records": "Encontrei {total} registro(s).",
+                "total_label": "Total: {value}",
+                "preview_label": "Preview:",
+                "executive_summary": "Resumo executivo: dados encontrados e prontos para detalhamento.",
+                "rag_context_tables": "Contexto RAG: {total} tabela(s) monitorada(s) analisadas.",
+            },
+            "en": {
+                "sql_not_allowed": "SQL command is not accepted. Send your question in natural language.",
+                "no_active_tenant_conversation": "No active tenant in this conversation. Use: tenant list and tenant select <id>.",
+                "channel_user_not_identified": "Channel user not identified.",
+                "channel_command_failed": "Could not process channel command.",
+                "error_prefix": "Error: {message}",
+                "user_label": "User: {value}",
+                "available_tenants": "Available tenants:",
+                "hint_tenant_select": "Use: tenant select <id>",
+                "hint_tenant_active": "Use: tenant active",
+                "no_active_tenant": "No active tenant for this conversation. Use: tenant list",
+                "active_tenant_id_only": "Active tenant: {tenant_id}",
+                "active_tenant_full": "Active tenant: {tenant_id} - {tenant_name} ({tenant_status})",
+                "unknown_command": "Unknown command: '{value}'.\n",
+                "help_keyword": "help",
+                "ask_natural_language": "Or send your question in natural language.",
+                "chat_question_required": "question_text is required",
+                "could_not_interpret_question": "I could not interpret your question using monitored tables.",
+                "question_label": "Question: {value}",
+                "found_records": "I found {total} record(s).",
+                "total_label": "Total: {value}",
+                "preview_label": "Preview:",
+                "executive_summary": "Executive summary: data found and ready for drill-down.",
+                "rag_context_tables": "RAG context: {total} monitored table(s) analyzed.",
+            },
+            "es": {
+                "sql_not_allowed": "No se acepta comando SQL. Envie su pregunta en lenguaje natural.",
+                "no_active_tenant_conversation": "No hay tenant activo en esta conversacion. Use: tenant list y tenant select <id>.",
+                "channel_user_not_identified": "Usuario del canal no identificado.",
+                "channel_command_failed": "No fue posible procesar el comando del canal.",
+                "error_prefix": "Error: {message}",
+                "user_label": "Usuario: {value}",
+                "available_tenants": "Tenants disponibles:",
+                "hint_tenant_select": "Use: tenant select <id>",
+                "hint_tenant_active": "Use: tenant active",
+                "no_active_tenant": "No hay tenant activo para esta conversacion. Use: tenant list",
+                "active_tenant_id_only": "Tenant activo: {tenant_id}",
+                "active_tenant_full": "Tenant activo: {tenant_id} - {tenant_name} ({tenant_status})",
+                "unknown_command": "Comando no reconocido: '{value}'.\n",
+                "help_keyword": "ayuda",
+                "ask_natural_language": "O envie su pregunta en lenguaje natural.",
+                "chat_question_required": "question_text es obligatorio",
+                "could_not_interpret_question": "No pude interpretar su pregunta con las tablas monitoreadas.",
+                "question_label": "Pregunta: {value}",
+                "found_records": "Encontre {total} registro(s).",
+                "total_label": "Total: {value}",
+                "preview_label": "Vista previa:",
+                "executive_summary": "Resumen ejecutivo: datos encontrados y listos para detalle.",
+                "rag_context_tables": "Contexto RAG: {total} tabla(s) monitoreada(s) analizadas.",
+            },
+        }
+        template = texts.get(bucket, texts["pt"]).get(key, texts["pt"].get(key, key))
+        return template.format(**kwargs)
 
     def _handle_security_sql_policy_update(self) -> None:
         body = self._read_json_body()
@@ -1333,6 +1472,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_bi_query(self) -> None:
         body = self._read_json_body()
+        request_context = self._request_context()
+        language_code = self._resolve_language_code(request_context)
         question_text = str(body.get("question_text") or body.get("question") or "").strip()
         if not question_text:
             self._send_json(
@@ -1342,11 +1483,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "tool": "chat-bi.query",
                     "correlation_id": None,
                     "data": {},
-                    "error": {"code": "invalid_input", "message": "question_text obrigatorio"},
+                    "error": {"code": "invalid_input", "message": self._t(language_code, "chat_question_required")},
                 },
             )
             return
-        response = self._execute_nl_chat_query(self._request_context(), question_text)
+        response = self._execute_nl_chat_query(request_context, question_text, language_code)
         if not response["ok"]:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
