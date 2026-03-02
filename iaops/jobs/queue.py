@@ -33,7 +33,7 @@ class JobQueue:
         thread.start()
         return {"job_id": job_id, "status": "queued", "runner": "thread"}
 
-    def list_jobs(self, *, tenant_id: int | None, limit: int = 50) -> list[dict[str, Any]]:
+    def list_jobs(self, *, tenant_id: int | None, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         if not self._db_enabled():
             return []
         sql = f"""
@@ -42,9 +42,17 @@ class JobQueue:
             WHERE (%(tenant_id)s::bigint IS NULL OR tenant_id = %(tenant_id)s)
             ORDER BY id DESC
             LIMIT %(limit)s
+            OFFSET %(offset)s
         """
         with connect(self.dsn) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"tenant_id": tenant_id, "limit": max(1, min(limit, 200))})
+            cur.execute(
+                sql,
+                {
+                    "tenant_id": tenant_id,
+                    "limit": max(1, min(limit, 200)),
+                    "offset": max(0, int(offset or 0)),
+                },
+            )
             rows = cur.fetchall()
         items = []
         for row in rows:
@@ -63,6 +71,36 @@ class JobQueue:
                 }
             )
         return items
+
+    def retry_job(self, *, tenant_id: int | None, job_id: int) -> dict[str, Any]:
+        if not self._db_enabled():
+            raise ValueError("fila de jobs indisponivel")
+        sql = f"""
+            SELECT id, tenant_id, job_kind, payload_json, status
+            FROM {self.schema}.async_job_run
+            WHERE id = %(job_id)s
+              AND (%(tenant_id)s::bigint IS NULL OR tenant_id = %(tenant_id)s)
+            LIMIT 1
+        """
+        with connect(self.dsn) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"job_id": int(job_id), "tenant_id": tenant_id})
+            row = cur.fetchone()
+        if not row:
+            raise ValueError("job nao encontrado")
+        source_status = str(row[4] or "").strip().lower()
+        if source_status not in {"failed", "dead_letter"}:
+            raise ValueError("somente jobs failed/dead_letter podem ser reprocessados")
+        source_tenant_id = int(row[1]) if row[1] is not None else None
+        new_payload = dict(row[3] or {})
+        if source_tenant_id is not None:
+            new_payload.setdefault("tenant_id", source_tenant_id)
+        replay = self.enqueue(
+            tenant_id=source_tenant_id,
+            job_kind=str(row[2]),
+            payload=new_payload,
+        )
+        replay["retried_from_job_id"] = int(job_id)
+        return replay
 
     def _run_sync_job(self, job_id: int, job_kind: str, payload: dict[str, Any]) -> None:
         max_retries = int(os.getenv("IAOPS_SYNC_JOB_MAX_RETRIES") or 3)

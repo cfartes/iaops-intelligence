@@ -69,7 +69,10 @@ async function parseResponse(response) {
   const data = await response.json();
   if (!response.ok || data.status !== "success") {
     const message = data?.error?.message || "Falha na chamada MCP";
-    throw new Error(message);
+    const error = new Error(message);
+    error.code = data?.error?.code || "mcp_error";
+    error.details = data?.data || {};
+    throw error;
   }
   return data.data;
 }
@@ -741,10 +744,22 @@ export async function enqueueRagRebuildJob(payload = {}) {
   return parseResponse(response);
 }
 
-export async function listAsyncJobs(limit = 50) {
-  const response = await fetch(`/api/jobs?limit=${encodeURIComponent(limit)}`, {
+export async function listAsyncJobs(limit = 50, offset = 0) {
+  const response = await fetch(
+    `/api/jobs?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
+    {
     method: "GET",
     headers: buildHeaders(),
+    },
+  );
+  return parseResponse(response);
+}
+
+export async function retryAsyncJob(payload) {
+  const response = await fetch("/api/jobs/retry", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
   });
   return parseResponse(response);
 }

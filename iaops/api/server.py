@@ -312,6 +312,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/jobs/billing-cycle":
             self._handle_jobs_enqueue("billing_cycle")
             return
+        if parsed.path == "/api/jobs/retry":
+            self._handle_jobs_retry()
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _handle_inventory_tables(self, query: str) -> None:
@@ -4005,9 +4008,43 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         context = self._request_context()
         qs = parse_qs(query)
         limit = int(qs.get("limit", ["50"])[0])
+        offset = int(qs.get("offset", ["0"])[0])
         queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
-        rows = queue.list_jobs(tenant_id=int(context.get("tenant_id") or 0), limit=limit)
-        self._send_json(HTTPStatus.OK, {"status": "success", "tool": "jobs.list", "correlation_id": str(uuid.uuid4()), "data": {"jobs": rows}, "error": None})
+        rows = queue.list_jobs(tenant_id=int(context.get("tenant_id") or 0), limit=limit, offset=offset)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "jobs.list",
+                "correlation_id": str(uuid.uuid4()),
+                "data": {"jobs": rows, "limit": limit, "offset": offset},
+                "error": None,
+            },
+        )
+
+    def _handle_jobs_retry(self) -> None:
+        body = self._read_json_body()
+        job_id = body.get("job_id")
+        if job_id in (None, ""):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"status": "denied", "tool": "jobs.retry", "data": {}, "error": {"code": "invalid_input", "message": "job_id obrigatorio"}},
+            )
+            return
+        context = self._request_context()
+        queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
+        try:
+            result = queue.retry_job(tenant_id=int(context.get("tenant_id") or 0), job_id=int(job_id))
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"status": "denied", "tool": "jobs.retry", "data": {}, "error": {"code": "jobs_retry_error", "message": str(exc)}},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"status": "success", "tool": "jobs.retry", "correlation_id": str(uuid.uuid4()), "data": result, "error": None},
+        )
 
     def _handle_observability_metrics(self) -> None:
         context = self._request_context()

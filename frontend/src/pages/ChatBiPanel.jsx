@@ -36,7 +36,17 @@ export default function ChatBiPanel({ onSystemMessage }) {
         setAnswer(`Consulta concluida com ${data?.result?.rows?.length || 0} linha(s).`);
       }
     } catch (error) {
-      onSystemMessage("error", tUi("chat.fail.title", "Falha no Chat BI"), error.message);
+      if (error?.code === "lgpd_blocked") {
+        const blockedFields = error?.details?.blocked_fields || [];
+        const preview = blockedFields.length > 0 ? blockedFields.slice(0, 5).join(", ") : "-";
+        onSystemMessage(
+          "warning",
+          tUi("chat.lgpdBlocked.title", "Resposta bloqueada por LGPD"),
+          `${tUi("chat.lgpdBlocked.message", "Essa pergunta toca em dados protegidos por politica LGPD deste tenant.")} ${tUi("chat.lgpdBlocked.fields", "Campos")} : ${preview}`,
+        );
+      } else {
+        onSystemMessage("error", tUi("chat.fail.title", "Falha no Chat BI"), error.message);
+      }
     } finally {
       setLoading(false);
     }

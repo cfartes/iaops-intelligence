@@ -1,15 +1,25 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   channelGetActiveTenant,
   channelListUserTenants,
   channelSelectTenant,
   channelWebhookTelegram,
+  getAuthContext,
   channelWebhookWhatsapp,
   getOperationHealth,
+  listAsyncJobs,
+  retryAsyncJob,
 } from "../api/mcpApi";
 import { tUi } from "../i18n/uiText";
 
 export default function OperationPanel({ onSystemMessage }) {
+  const authContext = getAuthContext();
+  const jobsViewStateKey = useMemo(() => {
+    const clientId = authContext?.client_id || 0;
+    const tenantId = authContext?.tenant_id || 0;
+    const userId = authContext?.user_id || 0;
+    return `iaops_jobs_view_v1:${clientId}:${tenantId}:${userId}`;
+  }, [authContext?.client_id, authContext?.tenant_id, authContext?.user_id]);
   const [health, setHealth] = useState(null);
   const [channelType, setChannelType] = useState("telegram");
   const [externalUserKey, setExternalUserKey] = useState("tg-owner-demo");
@@ -23,6 +33,17 @@ export default function OperationPanel({ onSystemMessage }) {
   const [isLoadingTenants, setIsLoadingTenants] = useState(false);
   const [isLoadingActive, setIsLoadingActive] = useState(false);
   const [isSelectingTenant, setIsSelectingTenant] = useState(false);
+  const [jobs, setJobs] = useState([]);
+  const [isLoadingJobs, setIsLoadingJobs] = useState(false);
+  const [retryingJobId, setRetryingJobId] = useState(null);
+  const [jobStatusFilter, setJobStatusFilter] = useState("");
+  const [jobKindFilter, setJobKindFilter] = useState("");
+  const [autoRefreshJobs, setAutoRefreshJobs] = useState(true);
+  const [jobsPage, setJobsPage] = useState(0);
+  const [jobsPageSize, setJobsPageSize] = useState(20);
+  const [jobSortBy, setJobSortBy] = useState("id");
+  const [jobSortDir, setJobSortDir] = useState("desc");
+  const [jobsViewLoaded, setJobsViewLoaded] = useState(false);
 
   const baseChannelPayload = () => ({
     channel_type: channelType,
@@ -51,9 +72,123 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const loadJobs = async () => {
+    setIsLoadingJobs(true);
+    try {
+      const data = await listAsyncJobs(jobsPageSize, jobsPage * jobsPageSize);
+      setJobs(data.jobs || []);
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar jobs", error.message);
+    } finally {
+      setIsLoadingJobs(false);
+    }
+  };
+
+  const visibleJobs = useMemo(() => {
+    const filtered = jobs.filter((job) => {
+      const status = String(job.status || "").toLowerCase();
+      const kind = String(job.job_kind || "").toLowerCase();
+      const statusOk = !jobStatusFilter || status === jobStatusFilter;
+      const kindOk = !jobKindFilter || kind === jobKindFilter;
+      return statusOk && kindOk;
+    });
+    const sorted = [...filtered].sort((a, b) => {
+      let av = a?.[jobSortBy];
+      let bv = b?.[jobSortBy];
+      if (jobSortBy === "created_at" || jobSortBy === "finished_at") {
+        av = av ? new Date(av).getTime() : 0;
+        bv = bv ? new Date(bv).getTime() : 0;
+      }
+      if (typeof av === "string") av = av.toLowerCase();
+      if (typeof bv === "string") bv = bv.toLowerCase();
+      if (av === bv) return 0;
+      const base = av > bv ? 1 : -1;
+      return jobSortDir === "asc" ? base : -base;
+    });
+    return sorted;
+  }, [jobs, jobStatusFilter, jobKindFilter, jobSortBy, jobSortDir]);
+
+  const jobKinds = useMemo(() => {
+    return Array.from(new Set(jobs.map((job) => String(job.job_kind || "")).filter(Boolean))).sort();
+  }, [jobs]);
+
   useEffect(() => {
     loadHealth();
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(jobsViewStateKey);
+      if (!raw) {
+        setJobsViewLoaded(true);
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") {
+        setJobsViewLoaded(true);
+        return;
+      }
+      if (typeof parsed.jobStatusFilter === "string") setJobStatusFilter(parsed.jobStatusFilter);
+      if (typeof parsed.jobKindFilter === "string") setJobKindFilter(parsed.jobKindFilter);
+      if (typeof parsed.autoRefreshJobs === "boolean") setAutoRefreshJobs(parsed.autoRefreshJobs);
+      if (typeof parsed.jobsPage === "number") setJobsPage(Math.max(0, Math.floor(parsed.jobsPage)));
+      if ([10, 20, 50].includes(Number(parsed.jobsPageSize))) setJobsPageSize(Number(parsed.jobsPageSize));
+      if (["id", "job_kind", "status", "created_at", "finished_at"].includes(String(parsed.jobSortBy || ""))) {
+        setJobSortBy(String(parsed.jobSortBy));
+      }
+      if (["asc", "desc"].includes(String(parsed.jobSortDir || ""))) setJobSortDir(String(parsed.jobSortDir));
+    } catch (_) {
+      // ignorar estado invalido no localStorage
+    } finally {
+      setJobsViewLoaded(true);
+    }
+  }, [jobsViewStateKey]);
+
+  useEffect(() => {
+    if (!jobsViewLoaded) return;
+    try {
+      window.localStorage.setItem(
+        jobsViewStateKey,
+        JSON.stringify(
+          {
+            jobStatusFilter,
+            jobKindFilter,
+            autoRefreshJobs,
+            jobsPage,
+            jobsPageSize,
+            jobSortBy,
+            jobSortDir,
+          },
+          null,
+          0,
+        ),
+      );
+    } catch (_) {
+      // localStorage pode estar indisponivel
+    }
+  }, [
+    jobsViewStateKey,
+    jobsViewLoaded,
+    jobStatusFilter,
+    jobKindFilter,
+    autoRefreshJobs,
+    jobsPage,
+    jobsPageSize,
+    jobSortBy,
+    jobSortDir,
+  ]);
+
+  useEffect(() => {
+    loadJobs();
+  }, [jobsPage, jobsPageSize]);
+
+  useEffect(() => {
+    if (!autoRefreshJobs) return undefined;
+    const timer = window.setInterval(() => {
+      loadJobs();
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [autoRefreshJobs, jobsPage, jobsPageSize]);
 
   useEffect(() => {
     if (channelType === "telegram") {
@@ -174,6 +309,19 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const retryJob = async (jobId) => {
+    setRetryingJobId(jobId);
+    try {
+      await retryAsyncJob({ job_id: Number(jobId) });
+      onSystemMessage("success", "Job reenfileirado", `Reprocessamento do job ${jobId} iniciado.`);
+      await loadJobs();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao reprocessar job", error.message);
+    } finally {
+      setRetryingJobId(null);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -184,6 +332,16 @@ export default function OperationPanel({ onSystemMessage }) {
       <div className="page-actions">
         <button type="button" className="btn btn-secondary" onClick={loadHealth}>
           {tUi("op.refresh", "Atualizar Saude")}
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={loadJobs}>
+          Atualizar Jobs
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => setAutoRefreshJobs((prev) => !prev)}
+        >
+          {autoRefreshJobs ? "Auto-refresh jobs: ON" : "Auto-refresh jobs: OFF"}
         </button>
       </div>
 
@@ -289,6 +447,144 @@ export default function OperationPanel({ onSystemMessage }) {
           <h4>{tUi("op.tenant.active.title", "Tenant ativo da conversa")}</h4>
           <pre>{activeTenantLabel || tUi("op.tenant.active.none", "Nenhum tenant ativo na conversa.")}</pre>
         </article>
+      </section>
+
+      <section className="catalog-block">
+        <h3>Jobs Assincronos</h3>
+        <p className="muted">Fila de processamento por tenant com status e retry de falhas.</p>
+        <div className="inline-form">
+          <label>
+            Itens por pagina
+            <select
+              value={jobsPageSize}
+              onChange={(event) => {
+                setJobsPage(0);
+                setJobsPageSize(Number(event.target.value));
+              }}
+            >
+              <option value={10}>10</option>
+              <option value={20}>20</option>
+              <option value={50}>50</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setJobsPage(0)}
+            disabled={isLoadingJobs || jobsPage === 0}
+          >
+            Primeira
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setJobsPage((prev) => Math.max(0, prev - 1))}
+            disabled={isLoadingJobs || jobsPage === 0}
+          >
+            Anterior
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setJobsPage((prev) => prev + 1)}
+            disabled={isLoadingJobs || jobs.length < jobsPageSize}
+          >
+            Proxima
+          </button>
+          <span className="chip">Pagina {jobsPage + 1}</span>
+        </div>
+        <div className="inline-form">
+          <select value={jobStatusFilter} onChange={(event) => setJobStatusFilter(event.target.value)}>
+            <option value="">Todos status</option>
+            <option value="queued">queued</option>
+            <option value="running">running</option>
+            <option value="retrying">retrying</option>
+            <option value="done">done</option>
+            <option value="failed">failed</option>
+            <option value="dead_letter">dead_letter</option>
+          </select>
+          <select value={jobKindFilter} onChange={(event) => setJobKindFilter(event.target.value)}>
+            <option value="">Todos tipos</option>
+            {jobKinds.map((kind) => (
+              <option key={kind} value={kind}>
+                {kind}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => {
+              setJobStatusFilter("");
+              setJobKindFilter("");
+            }}
+          >
+            Limpar filtros
+          </button>
+          <select value={jobSortBy} onChange={(event) => setJobSortBy(event.target.value)}>
+            <option value="id">Ordenar por ID</option>
+            <option value="job_kind">Ordenar por tipo</option>
+            <option value="status">Ordenar por status</option>
+            <option value="created_at">Ordenar por criado em</option>
+            <option value="finished_at">Ordenar por finalizado em</option>
+          </select>
+          <select value={jobSortDir} onChange={(event) => setJobSortDir(event.target.value)}>
+            <option value="desc">DESC</option>
+            <option value="asc">ASC</option>
+          </select>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Tipo</th>
+                <th>Status</th>
+                <th>Criado em</th>
+                <th>Fim</th>
+                <th>Acoes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoadingJobs ? (
+                <tr>
+                  <td colSpan={6}>Carregando jobs...</td>
+                </tr>
+              ) : visibleJobs.length === 0 ? (
+                <tr>
+                  <td colSpan={6}>Nenhum job encontrado.</td>
+                </tr>
+              ) : (
+                visibleJobs.map((job) => {
+                  const canRetry = ["failed", "dead_letter"].includes(String(job.status || "").toLowerCase());
+                  return (
+                    <tr key={job.id}>
+                      <td>{job.id}</td>
+                      <td>{job.job_kind}</td>
+                      <td>{job.status}</td>
+                      <td>{job.created_at || "-"}</td>
+                      <td>{job.finished_at || "-"}</td>
+                      <td>
+                        {canRetry ? (
+                          <button
+                            type="button"
+                            className="btn btn-small btn-secondary"
+                            onClick={() => retryJob(job.id)}
+                            disabled={retryingJobId === job.id}
+                          >
+                            {retryingJobId === job.id ? "Reenfileirando..." : "Reprocessar"}
+                          </button>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
     </section>
   );
