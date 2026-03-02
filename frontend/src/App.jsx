@@ -31,6 +31,8 @@ import {
   getSetupProgress,
   signupClient,
   confirmClientSignup,
+  requestPasswordReset,
+  confirmPasswordReset,
   loginClient,
   verifyLoginMfa,
   refreshAuthSession,
@@ -113,6 +115,20 @@ const UI_TEXT = {
       email: "E-mail de acesso",
       password: "Senha",
       login: "Entrar",
+      forgot_password: "Esqueci minha senha",
+      back: "Voltar",
+      reset_intro: "Informe seu e-mail para receber o token de redefinicao.",
+      reset_request: "Enviar token",
+      reset_requesting: "Enviando...",
+      reset_confirm_intro: "Informe o token recebido e a nova senha.",
+      reset_token: "Token de redefinicao",
+      reset_new_password: "Nova senha",
+      reset_confirm: "Redefinir senha",
+      reset_confirming: "Redefinindo...",
+      reset_ok_title: "Senha atualizada",
+      reset_ok_message: "Sua senha foi redefinida com sucesso.",
+      reset_request_ok_title: "Solicitacao enviada",
+      reset_request_ok_message: "Se o e-mail existir, enviaremos instrucoes de redefinicao.",
       logging: "Entrando...",
       mfa_intro: "MFA ativo. Informe o codigo TOTP para concluir o acesso.",
       otp_code: "Codigo TOTP",
@@ -278,6 +294,20 @@ const UI_TEXT = {
       email: "Access e-mail",
       password: "Password",
       login: "Sign in",
+      forgot_password: "Forgot password",
+      back: "Back",
+      reset_intro: "Enter your email to receive a password reset token.",
+      reset_request: "Send token",
+      reset_requesting: "Sending...",
+      reset_confirm_intro: "Enter the token received and your new password.",
+      reset_token: "Reset token",
+      reset_new_password: "New password",
+      reset_confirm: "Reset password",
+      reset_confirming: "Resetting...",
+      reset_ok_title: "Password updated",
+      reset_ok_message: "Your password was reset successfully.",
+      reset_request_ok_title: "Request sent",
+      reset_request_ok_message: "If the email exists, we will send reset instructions.",
       logging: "Signing in...",
       mfa_intro: "MFA enabled. Enter your TOTP code to finish sign in.",
       otp_code: "TOTP code",
@@ -443,6 +473,20 @@ const UI_TEXT = {
       email: "Correo de acceso",
       password: "Contrasena",
       login: "Iniciar sesion",
+      forgot_password: "Olvide mi contrasena",
+      back: "Volver",
+      reset_intro: "Informe su correo para recibir el token de redefinicion.",
+      reset_request: "Enviar token",
+      reset_requesting: "Enviando...",
+      reset_confirm_intro: "Informe el token recibido y su nueva contrasena.",
+      reset_token: "Token de redefinicion",
+      reset_new_password: "Nueva contrasena",
+      reset_confirm: "Redefinir contrasena",
+      reset_confirming: "Redefiniendo...",
+      reset_ok_title: "Contrasena actualizada",
+      reset_ok_message: "Su contrasena fue redefinida con exito.",
+      reset_request_ok_title: "Solicitud enviada",
+      reset_request_ok_message: "Si el correo existe, enviaremos instrucciones de redefinicion.",
       logging: "Iniciando...",
       mfa_intro: "MFA activo. Informe el codigo TOTP para concluir el acceso.",
       otp_code: "Codigo TOTP",
@@ -964,6 +1008,17 @@ export default function App() {
     openSystemMessage("success", uiText.signupModal.ok_confirm_title, uiText.signupModal.ok_confirm_message);
   };
 
+  const handlePasswordResetRequest = async (payload) => {
+    const data = await requestPasswordReset(payload);
+    openSystemMessage("success", uiText.loginModal.reset_request_ok_title, uiText.loginModal.reset_request_ok_message);
+    return data;
+  };
+
+  const handlePasswordResetConfirm = async (payload) => {
+    await confirmPasswordReset(payload);
+    openSystemMessage("success", uiText.loginModal.reset_ok_title, uiText.loginModal.reset_ok_message);
+  };
+
   const handleLoginSubmit = async (payload) => {
     try {
       const data = await loginClient(payload);
@@ -1063,6 +1118,8 @@ export default function App() {
           onVerifyMfa={handleVerifyLoginMfa}
           onSignup={handleClientSignup}
           onConfirm={handleClientSignupConfirm}
+          onPasswordResetRequest={handlePasswordResetRequest}
+          onPasswordResetConfirm={handlePasswordResetConfirm}
         />
         <SystemMessageModal
           state={messageModal}

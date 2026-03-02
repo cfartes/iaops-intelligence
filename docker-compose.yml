@@ -1,0 +1,68 @@
+services:
+  db:
+    image: postgres:16
+    container_name: iaops-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-iaops}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - iaops_db_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iaops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: iaops-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: iaops-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      IAOPS_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-iaops}
+      IAOPS_DB_SCHEMA: ${IAOPS_DB_SCHEMA:-iaops_gov}
+      IAOPS_CRYPTO_KEY: ${IAOPS_CRYPTO_KEY:-}
+      IAOPS_APP_LLM_PRICE_PER_1K_CENTS: ${IAOPS_APP_LLM_PRICE_PER_1K_CENTS:-50}
+      IAOPS_SMTP_HOST: ${IAOPS_SMTP_HOST:-}
+      IAOPS_SMTP_PORT: ${IAOPS_SMTP_PORT:-587}
+      IAOPS_SMTP_USER: ${IAOPS_SMTP_USER:-}
+      IAOPS_SMTP_PASS: ${IAOPS_SMTP_PASS:-}
+      IAOPS_SMTP_FROM: ${IAOPS_SMTP_FROM:-}
+      IAOPS_SMTP_STARTTLS: ${IAOPS_SMTP_STARTTLS:-1}
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: iaops-frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+
+volumes:
+  iaops_db_data:

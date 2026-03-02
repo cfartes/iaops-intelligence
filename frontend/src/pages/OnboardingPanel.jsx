@@ -12,6 +12,7 @@ import {
   registerMonitoredTable,
   updateDataSource,
   updateDataSourceStatus,
+  testDataSourceConnection,
 } from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import DataSourceFormModal from "../components/DataSourceFormModal";
@@ -35,6 +36,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
   const [registering, setRegistering] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingSource, setEditingSource] = useState(null);
+  const [testingSource, setTestingSource] = useState(false);
   const [monitoredTables, setMonitoredTables] = useState([]);
   const [selectedSourceIdForTables, setSelectedSourceIdForTables] = useState("");
   const [tablesLoading, setTablesLoading] = useState(false);
@@ -143,6 +145,22 @@ export default function OnboardingPanel({ onSystemMessage }) {
       onSystemMessage("error", tUi("onboarding.fail.sourceCreate", "Falha no cadastro da fonte"), error.message);
     } finally {
       setRegistering(false);
+    }
+  };
+
+  const handleTestSourceConnection = async (payload) => {
+    setTestingSource(true);
+    try {
+      const data = await testDataSourceConnection(payload);
+      if (data.ok) {
+        onSystemMessage("success", "Conexao validada", data.message || "Conexao testada com sucesso.");
+      } else {
+        onSystemMessage("warning", "Falha na conexao", data.message || "Nao foi possivel validar a conexao.");
+      }
+    } catch (error) {
+      onSystemMessage("error", "Falha na conexao", error.message);
+    } finally {
+      setTestingSource(false);
     }
   };
 
@@ -558,6 +576,8 @@ export default function OnboardingPanel({ onSystemMessage }) {
             : tUi("onboarding.modal.source.new", "Nova fonte de dados do tenant")
         }
         submitLabel={editingSource ? tUi("common.saveChanges", "Salvar alteracoes") : tUi("common.create", "Cadastrar")}
+        testing={testingSource}
+        onTest={handleTestSourceConnection}
         onClose={() => {
           if (!registering) {
             setEditingSource(null);

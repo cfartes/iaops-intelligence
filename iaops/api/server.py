@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import smtplib
 import unicodedata
 import urllib.error
@@ -23,6 +24,18 @@ try:
     from psycopg import connect
 except Exception:  # pragma: no cover - depende de ambiente
     connect = None
+try:
+    import pyodbc
+except Exception:  # pragma: no cover - opcional
+    pyodbc = None
+try:
+    import pymysql
+except Exception:  # pragma: no cover - opcional
+    pymysql = None
+try:
+    import oracledb
+except Exception:  # pragma: no cover - opcional
+    oracledb = None
 
 
 class IAOpsAPIHandler(BaseHTTPRequestHandler):
@@ -41,6 +54,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     signup_tables_ready = False
     pending_signups: dict[str, dict] = {}
     confirmed_signups: dict[str, dict] = {}
+    pending_password_resets: dict[str, dict] = {}
     mfa_login_challenges: dict[str, dict] = {}
     active_sessions: dict[str, dict] = {}
     refresh_sessions: dict[str, str] = {}
@@ -146,6 +160,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/auth/confirm":
             self._handle_auth_confirm()
             return
+        if parsed.path == "/api/auth/password/request":
+            self._handle_auth_password_request()
+            return
+        if parsed.path == "/api/auth/password/reset":
+            self._handle_auth_password_reset()
+            return
         if parsed.path == "/api/mcp/call":
             self._handle_generic_call()
             return
@@ -166,6 +186,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/data-sources/delete":
             self._handle_data_source_delete()
+            return
+        if parsed.path == "/api/data-sources/test-connection":
+            self._handle_data_source_test_connection()
             return
         if parsed.path == "/api/onboarding/monitored-tables":
             self._handle_onboarding_monitored_table_create()
@@ -306,6 +329,51 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
         }
         self._dispatch_mcp(payload)
+
+    def _handle_data_source_test_connection(self) -> None:
+        body = self._read_json_body()
+        source_type = str(body.get("source_type") or "").strip().lower()
+        if not source_type:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.test_connection",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "source_type obrigatorio"},
+                },
+            )
+            return
+        try:
+            profile = self._extract_connection_profile(
+                conn_secret_ref=str(body.get("conn_secret_ref") or ""),
+                secret_payload=body.get("secret_payload"),
+            )
+            test_result = self._run_connection_test(source_type=source_type, profile=profile)
+            self._send_json(
+                HTTPStatus.OK if test_result.get("ok") else HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "success" if test_result.get("ok") else "denied",
+                    "tool": "source.test_connection",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": test_result,
+                    "error": None
+                    if test_result.get("ok")
+                    else {"code": "connection_failed", "message": str(test_result.get("message") or "Falha na conexao")},
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.test_connection",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
 
     def _handle_inventory_columns(self, query: str) -> None:
         qs = parse_qs(query)
@@ -1268,6 +1336,101 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_auth_password_request(self) -> None:
+        body = self._read_json_body()
+        email_access = str(body.get("email_access") or body.get("email") or "").strip().lower()
+        if not email_access:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.password.request",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "email_access obrigatorio"},
+                },
+            )
+            return
+        reset_token: str | None = None
+        user_record = self._find_user_for_password_reset(email_access=email_access)
+        if user_record:
+            reset_token = self._create_password_reset_request(user_record=user_record)
+        delivered = False
+        detail = "Se o e-mail existir, voce recebera instrucoes para redefinir a senha."
+        if user_record and reset_token:
+            delivered, detail = self._send_password_reset_email(
+                to_email=email_access,
+                display_name=str(user_record.get("full_name") or user_record.get("email") or email_access),
+                reset_token=reset_token,
+            )
+        data = {"delivery": detail}
+        if user_record and reset_token and not delivered:
+            data["reset_token"] = reset_token
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.password.request",
+                "correlation_id": str(uuid.uuid4()),
+                "data": data,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_password_reset(self) -> None:
+        body = self._read_json_body()
+        reset_token = str(body.get("reset_token") or "").strip()
+        new_password = str(body.get("new_password") or "").strip()
+        if not reset_token or not new_password:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.password.reset",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "reset_token e new_password obrigatorios"},
+                },
+            )
+            return
+        password_error = self._validate_password_strength(new_password)
+        if password_error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.password.reset",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "weak_password", "message": password_error},
+                },
+            )
+            return
+        consumed = self._consume_password_reset_token(reset_token=reset_token, new_password=new_password)
+        if not consumed:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.password.reset",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_token", "message": "Token de redefinicao invalido ou expirado."},
+                },
+            )
+            return
+        self._revoke_sessions_for_user(user_id=int(consumed["user_id"]))
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.password.reset",
+                "correlation_id": str(uuid.uuid4()),
+                "data": {"email_access": consumed["email_access"], "password_updated": True},
+                "error": None,
+            },
+        )
+
     def _persist_pending_signup_db(self, *, confirm_token: str, signup_data: dict) -> str | None:
         if not self._is_db_enabled():
             if signup_data["email_access"] in self.confirmed_signups:
@@ -1644,6 +1807,230 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
         except Exception:
             return "db_unavailable"
+
+    def _find_user_for_password_reset(self, *, email_access: str) -> dict | None:
+        email = str(email_access or "").strip().lower()
+        if not email:
+            return None
+        if not self._is_db_enabled():
+            for value in self.confirmed_signups.values():
+                if str(value.get("email_access") or "").strip().lower() == email:
+                    return {
+                        "user_id": 0,
+                        "client_id": 1,
+                        "email": email,
+                        "full_name": str(value.get("trade_name") or email),
+                    }
+            return None
+        try:
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT u.id, u.client_id, u.email, COALESCE(u.full_name, u.email) AS full_name
+                    FROM {schema}.app_user u
+                    JOIN {schema}.client c ON c.id = u.client_id
+                    WHERE LOWER(u.email) = %(email)s
+                      AND COALESCE(c.status, '') = 'active'
+                    LIMIT 1
+                    """,
+                    {"email": email},
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "user_id": int(row[0]),
+                "client_id": int(row[1]),
+                "email": str(row[2] or email),
+                "full_name": str(row[3] or row[2] or email),
+            }
+        except Exception:
+            return None
+
+    def _create_password_reset_request(self, *, user_record: dict) -> str | None:
+        user_id = int(user_record.get("user_id") or 0)
+        email = str(user_record.get("email") or "").strip().lower()
+        if not email:
+            return None
+        reset_token = token_hex(16)
+        expires_at_epoch = int(time()) + (30 * 60)
+        if not self._is_db_enabled() or user_id <= 0:
+            self.pending_password_resets[reset_token] = {
+                "email_access": email,
+                "user_id": user_id,
+                "expires_at_epoch": expires_at_epoch,
+            }
+            return reset_token
+        try:
+            self._ensure_signup_tables()
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.user_password_reset
+                       SET status = 'expired'
+                     WHERE user_id = %(user_id)s
+                       AND status = 'pending'
+                    """,
+                    {"user_id": user_id},
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.user_password_reset (
+                        reset_token,
+                        user_id,
+                        email_access,
+                        status,
+                        expires_at
+                    )
+                    VALUES (
+                        %(reset_token)s,
+                        %(user_id)s,
+                        %(email_access)s,
+                        'pending',
+                        NOW() + INTERVAL '30 minutes'
+                    )
+                    """,
+                    {
+                        "reset_token": reset_token,
+                        "user_id": user_id,
+                        "email_access": email,
+                    },
+                )
+                conn.commit()
+            return reset_token
+        except Exception:
+            self.pending_password_resets[reset_token] = {
+                "email_access": email,
+                "user_id": user_id,
+                "expires_at_epoch": expires_at_epoch,
+            }
+            return reset_token
+
+    def _consume_password_reset_token(self, *, reset_token: str, new_password: str) -> dict | None:
+        token = str(reset_token or "").strip()
+        if not token:
+            return None
+        encoded_password = self._encode_password(new_password)
+        if not self._is_db_enabled():
+            payload = self.pending_password_resets.get(token)
+            if not payload:
+                return None
+            if int(payload.get("expires_at_epoch") or 0) < int(time()):
+                self.pending_password_resets.pop(token, None)
+                return None
+            self.pending_password_resets.pop(token, None)
+            return {
+                "user_id": int(payload.get("user_id") or 0),
+                "email_access": str(payload.get("email_access") or ""),
+            }
+        try:
+            self._ensure_signup_tables()
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, user_id, email_access
+                    FROM {schema}.user_password_reset
+                    WHERE reset_token = %(reset_token)s
+                      AND status = 'pending'
+                      AND expires_at > NOW()
+                    LIMIT 1
+                    """,
+                    {"reset_token": token},
+                )
+                row = cur.fetchone()
+                if not row:
+                    conn.rollback()
+                    return None
+                reset_id = int(row[0])
+                user_id = int(row[1])
+                email_access = str(row[2] or "")
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.app_user
+                       SET password_hash = %(password_hash)s
+                     WHERE id = %(user_id)s
+                    """,
+                    {"password_hash": encoded_password, "user_id": user_id},
+                )
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.user_password_reset
+                       SET status = 'used',
+                           consumed_at = NOW()
+                     WHERE id = %(id)s
+                    """,
+                    {"id": reset_id},
+                )
+                conn.commit()
+            return {"user_id": user_id, "email_access": email_access}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _validate_password_strength(password: str) -> str | None:
+        value = str(password or "")
+        if len(value) < 8:
+            return "Senha deve ter no minimo 8 caracteres."
+        if not re.search(r"[A-Z]", value):
+            return "Senha deve conter ao menos uma letra maiuscula."
+        if not re.search(r"[a-z]", value):
+            return "Senha deve conter ao menos uma letra minuscula."
+        if not re.search(r"[0-9]", value):
+            return "Senha deve conter ao menos um numero."
+        if not re.search(r"[^a-zA-Z0-9]", value):
+            return "Senha deve conter ao menos um caractere especial."
+        return None
+
+    @staticmethod
+    def _encode_password(password: str) -> str:
+        salt = token_hex(16)
+        password_hash = pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt.encode("utf-8"), 240000).hex()
+        return f"pbkdf2_sha256$240000${salt}${password_hash}"
+
+    def _revoke_sessions_for_user(self, *, user_id: int) -> None:
+        tokens = [token for token, session in self.active_sessions.items() if int(session.get("user_id") or 0) == int(user_id)]
+        for token in tokens:
+            session = self.active_sessions.pop(token, None) or {}
+            refresh_token = str(session.get("refresh_token") or "")
+            if refresh_token:
+                self.refresh_sessions.pop(refresh_token, None)
+
+    @staticmethod
+    def _send_password_reset_email(*, to_email: str, display_name: str, reset_token: str) -> tuple[bool, str]:
+        smtp_host = os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
+        smtp_user = os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or ""
+        smtp_pass = os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or ""
+        smtp_from = os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or smtp_user
+        smtp_tls = str(os.getenv("IAOPS_SMTP_STARTTLS") or "1").strip() not in {"0", "false", "False"}
+        if not smtp_host or not smtp_from:
+            return False, "SMTP nao configurado no ambiente."
+        subject = "IAOps Governance - Redefinicao de senha"
+        body = (
+            f"Ola, {display_name}.\n\n"
+            "Recebemos uma solicitacao para redefinir sua senha.\n"
+            "Use o token abaixo no app para concluir a redefinicao (validade: 30 minutos):\n\n"
+            f"{reset_token}\n\n"
+            "Se voce nao solicitou, ignore este e-mail."
+        )
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = smtp_from
+        message["To"] = to_email
+        message.set_content(body)
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+                if smtp_tls:
+                    smtp.starttls()
+                if smtp_user:
+                    smtp.login(smtp_user, smtp_pass)
+                smtp.send_message(message)
+            return True, f"Instrucoes de redefinicao enviadas para {to_email}."
+        except Exception:
+            return False, "Falha no envio por SMTP. Token retornado no payload para uso em desenvolvimento."
 
     def _login_user(self, *, email: str, password: str, tenant_id: int | None) -> dict:
         if not self._is_db_enabled():
@@ -2186,6 +2573,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 self.failed_login_attempts_ip[ip] = {"attempts": attempts, "locked_until": locked_until if locked_until > now_epoch else 0}
             else:
                 self.failed_login_attempts_ip.pop(ip, None)
+
+        expired_resets = [
+            token
+            for token, data in self.pending_password_resets.items()
+            if int(data.get("expires_at_epoch") or 0) <= now_epoch
+        ]
+        for token in expired_resets:
+            self.pending_password_resets.pop(token, None)
 
     def _log_auth_event(
         self,
@@ -3484,8 +3879,318 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     ON {schema}.client_signup_pending (cnpj)
                 """
             )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {schema}.user_password_reset (
+                    id BIGSERIAL PRIMARY KEY,
+                    reset_token TEXT NOT NULL UNIQUE,
+                    user_id BIGINT,
+                    email_access TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    consumed_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_user_password_reset_email
+                    ON {schema}.user_password_reset (LOWER(email_access), status)
+                """
+            )
             conn.commit()
         cls.signup_tables_ready = True
+
+    @staticmethod
+    def _extract_connection_profile(*, conn_secret_ref: str, secret_payload: object) -> dict:
+        if isinstance(secret_payload, dict):
+            return secret_payload
+        raw = str(conn_secret_ref or "").strip()
+        if not raw:
+            raise ValueError("conn_secret_ref ou secret_payload obrigatorio")
+        if raw.startswith("json:"):
+            try:
+                parsed = json.loads(raw[5:])
+            except Exception as exc:
+                raise ValueError(f"conn_secret_ref json invalido: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("conn_secret_ref json deve ser objeto")
+            return parsed
+        if raw.startswith("enc:"):
+            try:
+                decrypted = decrypt_text(raw[4:])
+                parsed = json.loads(decrypted)
+            except Exception as exc:
+                raise ValueError(f"conn_secret_ref criptografado invalido: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("segredo descriptografado deve ser objeto json")
+            return parsed
+        if raw.startswith("{") and raw.endswith("}"):
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"conn_secret_ref json invalido: {exc}") from exc
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError("Use secret_payload (objeto JSON) ou conn_secret_ref com prefixo json:/enc:")
+
+    def _run_connection_test(self, *, source_type: str, profile: dict) -> dict:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._test_postgres_connection(profile)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._test_sqlserver_connection(profile)
+        if kind in {"mysql"}:
+            return self._test_mysql_connection(profile)
+        if kind in {"oracle"}:
+            return self._test_oracle_connection(profile)
+        if kind in {"power_bi", "powerbi"}:
+            return self._test_bearer_http_connection(
+                profile=profile,
+                default_url="https://api.powerbi.com/v1.0/myorg/groups?$top=1",
+                label="Power BI",
+            )
+        if kind in {"fabric", "microsoft_fabric"}:
+            return self._test_bearer_http_connection(
+                profile=profile,
+                default_url="https://api.fabric.microsoft.com/v1/workspaces?top=1",
+                label="Microsoft Fabric",
+            )
+        return {
+            "ok": False,
+            "source_type": kind,
+            "message": f"Teste de conexao ainda nao implementado para {kind}.",
+        }
+
+    @staticmethod
+    def _test_postgres_connection(profile: dict) -> dict:
+        if connect is None:
+            return {"ok": False, "source_type": "postgres", "message": "Driver PostgreSQL indisponivel (psycopg)."}
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                return {
+                    "ok": False,
+                    "source_type": "postgres",
+                    "message": "Informe dsn ou host/user/password/dbname no secret_payload.",
+                }
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        try:
+            with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return {"ok": True, "source_type": "postgres", "message": "Conexao PostgreSQL validada com sucesso."}
+        except Exception as exc:
+            return {"ok": False, "source_type": "postgres", "message": f"Falha na conexao PostgreSQL: {exc}"}
+
+    @staticmethod
+    def _test_sqlserver_connection(profile: dict) -> dict:
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if pyodbc is None:
+            tcp = IAOpsAPIHandler._test_tcp_connection(
+                profile={"host": host, "port": port, "timeout_seconds": timeout},
+                default_port=1433,
+                label="SQL Server",
+                source_code="sqlserver",
+            )
+            tcp["message"] = f"Driver pyodbc nao instalado. Fallback TCP: {tcp.get('message')}"
+            return tcp
+        if not host or not user:
+            return {
+                "ok": False,
+                "source_type": "sqlserver",
+                "message": "Informe host, user e password no secret_payload.",
+            }
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            encrypt = str(profile.get("encrypt") or "yes").strip()
+            trust = str(profile.get("trust_server_certificate") or "yes").strip()
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                f"Encrypt={encrypt};TrustServerCertificate={trust};Connection Timeout={timeout};"
+            )
+        try:
+            with pyodbc.connect(conn_str, timeout=timeout) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return {"ok": True, "source_type": "sqlserver", "message": "Conexao SQL Server validada com sucesso."}
+        except Exception as exc:
+            return {"ok": False, "source_type": "sqlserver", "message": f"Falha na conexao SQL Server: {exc}"}
+
+    @staticmethod
+    def _test_mysql_connection(profile: dict) -> dict:
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if pymysql is None:
+            tcp = IAOpsAPIHandler._test_tcp_connection(
+                profile={"host": host, "port": port, "timeout_seconds": timeout},
+                default_port=3306,
+                label="MySQL",
+                source_code="mysql",
+            )
+            tcp["message"] = f"Driver pymysql nao instalado. Fallback TCP: {tcp.get('message')}"
+            return tcp
+        if not host or not user:
+            return {"ok": False, "source_type": "mysql", "message": "Informe host, user e password no secret_payload."}
+        try:
+            with pymysql.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database or None,
+                connect_timeout=timeout,
+                read_timeout=timeout,
+                write_timeout=timeout,
+                charset="utf8mb4",
+            ) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return {"ok": True, "source_type": "mysql", "message": "Conexao MySQL validada com sucesso."}
+        except Exception as exc:
+            return {"ok": False, "source_type": "mysql", "message": f"Falha na conexao MySQL: {exc}"}
+
+    @staticmethod
+    def _test_oracle_connection(profile: dict) -> dict:
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if oracledb is None:
+            tcp = IAOpsAPIHandler._test_tcp_connection(
+                profile={"host": host, "port": port, "timeout_seconds": timeout},
+                default_port=1521,
+                label="Oracle",
+                source_code="oracle",
+            )
+            tcp["message"] = f"Driver oracledb nao instalado. Fallback TCP: {tcp.get('message')}"
+            return tcp
+        if not host or not user:
+            return {
+                "ok": False,
+                "source_type": "oracle",
+                "message": "Informe host, user e password no secret_payload.",
+            }
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        try:
+            with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM dual")
+                    cur.fetchone()
+            return {"ok": True, "source_type": "oracle", "message": "Conexao Oracle validada com sucesso."}
+        except Exception as exc:
+            return {"ok": False, "source_type": "oracle", "message": f"Falha na conexao Oracle: {exc}"}
+
+    @staticmethod
+    def _test_bearer_http_connection(*, profile: dict, default_url: str, label: str) -> dict:
+        api_url = str(profile.get("api_url") or default_url).strip()
+        access_token = str(profile.get("access_token") or "").strip()
+        if not access_token:
+            return {
+                "ok": False,
+                "source_type": label.lower(),
+                "message": f"access_token obrigatorio para validar {label}.",
+            }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "IAOps-Governance/1.0",
+        }
+        req = urllib.request.Request(url=api_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                status = int(resp.getcode() or 0)
+                if 200 <= status < 300:
+                    return {
+                        "ok": True,
+                        "source_type": label.lower(),
+                        "message": f"Conexao {label} validada com sucesso (HTTP {status}).",
+                        "http_status": status,
+                    }
+                return {
+                    "ok": False,
+                    "source_type": label.lower(),
+                    "message": f"Endpoint {label} retornou HTTP {status}.",
+                    "http_status": status,
+                }
+        except urllib.error.HTTPError as exc:
+            return {
+                "ok": False,
+                "source_type": label.lower(),
+                "message": f"Falha HTTP no {label}: {exc.code}",
+                "http_status": int(exc.code or 0),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "source_type": label.lower(),
+                "message": f"Falha na conexao {label}: {exc}",
+            }
+
+    @staticmethod
+    def _test_tcp_connection(*, profile: dict, default_port: int, label: str, source_code: str) -> dict:
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or default_port)
+        timeout = float(profile.get("timeout_seconds") or 8)
+        if not host:
+            return {
+                "ok": False,
+                "source_type": source_code,
+                "message": f"Informe host para validar conexao {label}.",
+            }
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                pass
+            return {
+                "ok": True,
+                "source_type": source_code,
+                "message": f"Porta {host}:{port} acessivel para {label}.",
+                "network": {"host": host, "port": port},
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "source_type": source_code,
+                "message": f"Falha de conectividade {label} em {host}:{port} - {exc}",
+                "network": {"host": host, "port": port},
+            }
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -3537,7 +4242,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-Tenant-Id, X-User-Id, X-Correlation-Id")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-Tenant-Id, X-User-Id, X-Correlation-Id, X-Session-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         if status != HTTPStatus.NO_CONTENT:

@@ -20,13 +20,26 @@ const PLAN_OPTIONS = [
   { value: "enterprise", label: "Enterprise" },
 ];
 
-export default function AuthScreen({ labels, onLogin, onVerifyMfa, onSignup, onConfirm }) {
+export default function AuthScreen({
+  labels,
+  onLogin,
+  onVerifyMfa,
+  onSignup,
+  onConfirm,
+  onPasswordResetRequest,
+  onPasswordResetConfirm,
+}) {
   const [tab, setTab] = useState("signin");
+  const [signinMode, setSigninMode] = useState("login");
   const [busy, setBusy] = useState(false);
   const [challengeToken, setChallengeToken] = useState("");
   const [otpCode, setOtpCode] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetToken, setResetToken] = useState("");
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetHint, setResetHint] = useState("");
   const [signupPhase, setSignupPhase] = useState("signup");
   const [signupForm, setSignupForm] = useState(SIGNUP_TEMPLATE);
   const [confirmToken, setConfirmToken] = useState("");
@@ -34,6 +47,8 @@ export default function AuthScreen({ labels, onLogin, onVerifyMfa, onSignup, onC
 
   const canLogin = useMemo(() => loginEmail.trim() && loginPassword, [loginEmail, loginPassword]);
   const canVerify = useMemo(() => challengeToken && otpCode.trim().length >= 6, [challengeToken, otpCode]);
+  const canResetRequest = useMemo(() => resetEmail.trim().length > 5, [resetEmail]);
+  const canResetConfirm = useMemo(() => resetToken.trim() && resetPassword.trim().length >= 8, [resetToken, resetPassword]);
   const canSignup = useMemo(
     () =>
       signupForm.trade_name &&
@@ -90,6 +105,40 @@ export default function AuthScreen({ labels, onLogin, onVerifyMfa, onSignup, onC
       await onVerifyMfa({ challenge_token: challengeToken, otp_code: otpCode.trim() });
       setChallengeToken("");
       setOtpCode("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitPasswordResetRequest = async (event) => {
+    event.preventDefault();
+    if (!canResetRequest || busy || !onPasswordResetRequest) return;
+    setBusy(true);
+    try {
+      const data = await onPasswordResetRequest({ email_access: resetEmail.trim() });
+      setResetHint(data?.delivery || "");
+      if (data?.reset_token) {
+        setResetToken(data.reset_token);
+      }
+      setSigninMode("forgot_confirm");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitPasswordResetConfirm = async (event) => {
+    event.preventDefault();
+    if (!canResetConfirm || busy || !onPasswordResetConfirm) return;
+    setBusy(true);
+    try {
+      await onPasswordResetConfirm({ reset_token: resetToken.trim(), new_password: resetPassword });
+      setSigninMode("login");
+      setChallengeToken("");
+      setOtpCode("");
+      setLoginPassword("");
+      setResetToken("");
+      setResetPassword("");
+      setResetHint("");
     } finally {
       setBusy(false);
     }
@@ -166,7 +215,44 @@ export default function AuthScreen({ labels, onLogin, onVerifyMfa, onSignup, onC
           {tab === "signin" ? (
             <form className="modal-content form-grid auth-form" onSubmit={challengeToken ? submitVerify : submitLogin}>
               <h3>{labels.login.title}</h3>
-              {!challengeToken ? (
+              {signinMode === "forgot_request" ? (
+                <>
+                  <p className="muted">{labels.login.reset_intro}</p>
+                  <label>
+                    {labels.login.email}
+                    <input type="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} />
+                  </label>
+                  <div className="modal-actions auth-actions">
+                    <button type="button" className="btn btn-secondary" onClick={() => setSigninMode("login")} disabled={busy}>
+                      {labels.login.back}
+                    </button>
+                    <button type="button" className="btn btn-primary" onClick={submitPasswordResetRequest} disabled={!canResetRequest || busy}>
+                      {busy ? labels.login.reset_requesting : labels.login.reset_request}
+                    </button>
+                  </div>
+                </>
+              ) : signinMode === "forgot_confirm" ? (
+                <>
+                  <p className="muted">{labels.login.reset_confirm_intro}</p>
+                  {resetHint ? <p className="muted">{resetHint}</p> : null}
+                  <label>
+                    {labels.login.reset_token}
+                    <input value={resetToken} onChange={(e) => setResetToken(e.target.value)} />
+                  </label>
+                  <label>
+                    {labels.login.reset_new_password}
+                    <input type="password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} />
+                  </label>
+                  <div className="modal-actions auth-actions">
+                    <button type="button" className="btn btn-secondary" onClick={() => setSigninMode("login")} disabled={busy}>
+                      {labels.login.back}
+                    </button>
+                    <button type="button" className="btn btn-primary" onClick={submitPasswordResetConfirm} disabled={!canResetConfirm || busy}>
+                      {busy ? labels.login.reset_confirming : labels.login.reset_confirm}
+                    </button>
+                  </div>
+                </>
+              ) : !challengeToken ? (
                 <>
                   <label>
                     {labels.login.email}
@@ -177,6 +263,17 @@ export default function AuthScreen({ labels, onLogin, onVerifyMfa, onSignup, onC
                     <input type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} />
                   </label>
                   <div className="modal-actions auth-actions">
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => {
+                        setResetEmail(loginEmail || "");
+                        setSigninMode("forgot_request");
+                      }}
+                      disabled={busy}
+                    >
+                      {labels.login.forgot_password}
+                    </button>
                     <button type="submit" className="btn btn-primary" disabled={!canLogin || busy}>
                       {busy ? labels.login.logging : labels.login.login}
                     </button>

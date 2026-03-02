@@ -6,12 +6,27 @@ const INITIAL_FORM = {
   is_active: true,
 };
 
+const SECRET_PLACEHOLDER_BY_TYPE = {
+  postgres: 'json:{"host":"localhost","port":5432,"dbname":"db","user":"postgres","password":"***"}',
+  postgresql: 'json:{"host":"localhost","port":5432,"dbname":"db","user":"postgres","password":"***"}',
+  sqlserver: 'json:{"host":"sqlserver.local","port":1433,"database":"db","user":"sa","password":"***"}',
+  sql_server: 'json:{"host":"sqlserver.local","port":1433,"database":"db","user":"sa","password":"***"}',
+  mssql: 'json:{"host":"sqlserver.local","port":1433,"database":"db","user":"sa","password":"***"}',
+  mysql: 'json:{"host":"mysql.local","port":3306,"database":"db","user":"root","password":"***"}',
+  oracle: 'json:{"host":"oracle.local","port":1521,"service_name":"ORCL","user":"system","password":"***"}',
+  power_bi: 'json:{"access_token":"<token>","api_url":"https://api.powerbi.com/v1.0/myorg/groups?$top=1"}',
+  fabric: 'json:{"access_token":"<token>","api_url":"https://api.fabric.microsoft.com/v1/workspaces?top=1"}',
+};
+
 export default function DataSourceFormModal({
   open,
   sourceCatalog,
   initialData = null,
   title = "Nova fonte de dados do tenant",
   submitLabel = "Cadastrar",
+  testLabel = "Testar conexao",
+  testing = false,
+  onTest,
   onClose,
   onSubmit,
 }) {
@@ -37,6 +52,7 @@ export default function DataSourceFormModal({
     () => form.source_type.trim().length > 0 && form.conn_secret_ref.trim().length > 2,
     [form.source_type, form.conn_secret_ref]
   );
+  const secretPlaceholder = SECRET_PLACEHOLDER_BY_TYPE[form.source_type] || "json:{...} ou enc:<ciphertext>";
 
   if (!open) return null;
 
@@ -76,7 +92,7 @@ export default function DataSourceFormModal({
             <input
               value={form.conn_secret_ref}
               onChange={(e) => setForm((prev) => ({ ...prev, conn_secret_ref: e.target.value }))}
-              placeholder="secret://tenant-10/origem/principal"
+              placeholder={secretPlaceholder}
             />
           </label>
           <label className="checkbox-inline">
@@ -90,6 +106,19 @@ export default function DataSourceFormModal({
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>
               Cancelar
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() =>
+                onTest?.({
+                  source_type: form.source_type,
+                  conn_secret_ref: form.conn_secret_ref.trim(),
+                })
+              }
+              disabled={!canSubmit || testing}
+            >
+              {testing ? "Testando..." : testLabel}
             </button>
             <button type="submit" className="btn btn-primary" disabled={!canSubmit}>
               {submitLabel}

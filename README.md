@@ -143,5 +143,30 @@ npm install
 npm run dev
 ```
 
+## Deploy em Docker (VPS Ubuntu 24.04 LTS)
+Arquivos adicionados:
+- `docker-compose.yml`
+- `docker/backend.Dockerfile`
+- `docker/frontend.Dockerfile`
+- `docker/nginx.conf`
+- `.env.example`
+
+Passos:
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+Servicos:
+- Frontend: `http://SEU_HOST:5173`
+- API: `http://SEU_HOST:8000`
+- PostgreSQL: `SEU_HOST:5432`
+- Redis: `SEU_HOST:6379`
+
+Observacoes de producao:
+- Configure `IAOPS_CRYPTO_KEY` no `.env` (Fernet key valida).
+- Configure SMTP (`IAOPS_SMTP_*`) para confirmacao de cadastro e reset de senha.
+- O backend instala `msodbcsql18`, `pyodbc`, `pymysql` e `oracledb` para testes autenticados de conectores.
+
 ## Objetivo
 Este repositorio inicia com baseline de produto e arquitetura para acelerar implementacao por iteracoes.

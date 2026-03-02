@@ -207,6 +207,15 @@ export async function deleteDataSource(payload) {
   return parseResponse(response);
 }
 
+export async function testDataSourceConnection(payload) {
+  const response = await fetch("/api/data-sources/test-connection", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function createIncident(payload) {
   const response = await fetch("/api/incidents", {
     method: "POST",
@@ -478,6 +487,24 @@ export async function signupClient(payload) {
 
 export async function confirmClientSignup(payload) {
   const response = await fetch("/api/auth/confirm", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function requestPasswordReset(payload) {
+  const response = await fetch("/api/auth/password/request", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function confirmPasswordReset(payload) {
+  const response = await fetch("/api/auth/password/reset", {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),
