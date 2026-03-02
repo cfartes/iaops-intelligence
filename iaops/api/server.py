@@ -740,6 +740,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             }
 
         if kind == "sql_query":
+            return {
+                "ok": False,
+                "command": "error",
+                "reply_text": "Comando SQL nao e aceito. Envie a pergunta em linguagem natural.",
+                "data": {},
+            }
+
+        if kind == "nl_query":
             runtime = self._resolve_channel_runtime_context(
                 context=context,
                 channel_type=channel_type,
@@ -748,26 +756,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             if runtime.get("error"):
                 return runtime["error"]
-            query_result = self._call_mcp(
-                {
-                    "context": runtime["context"],
-                    "tool": "query.execute_safe_sql",
-                    "input": {
-                        "sql_text": command["sql_text"],
-                        "explain": False,
-                    },
-                }
-            )
-            if query_result["status"] != "success":
-                return self._channel_error_response(query_result)
-            data = query_result["data"]
+            nl_response = self._execute_nl_chat_query(runtime["context"], command["question_text"])
+            if not nl_response["ok"]:
+                return nl_response
             return {
                 "ok": True,
-                "command": "sql_query",
-                "reply_text": self._reply_sql_result(command["sql_text"], data),
+                "command": "nl_query",
+                "reply_text": nl_response["reply_text"],
                 "data": {
                     "active_tenant": runtime["active"],
-                    "query": data,
+                    "query": nl_response["data"],
                 },
             }
 
@@ -835,6 +833,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         normalized = " ".join(raw.lower().split())
         if not normalized:
             return {"kind": "help"}
+        if normalized in {"help", "ajuda", "/help"}:
+            return {"kind": "help"}
         if normalized in {"tenant", "/tenant", "tenant list", "/tenant list", "tenants"}:
             return {"kind": "tenant_list"}
         if normalized in {"tenant active", "/tenant active"}:
@@ -842,13 +842,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         selected = re.match(r"^/?tenant\s+select\s+(\d+)$", normalized)
         if selected:
             return {"kind": "tenant_select", "tenant_id": int(selected.group(1))}
-        sql_match = re.match(r"^/?sql\s+(.+)$", raw, flags=re.IGNORECASE | re.DOTALL)
-        if sql_match:
-            sql_text = sql_match.group(1).strip()
-            if not sql_text:
-                return {"kind": "help"}
-            return {"kind": "sql_query", "sql_text": sql_text}
-        return {"kind": "help"}
+        if re.match(r"^/?sql\s+", raw, flags=re.IGNORECASE):
+            return {"kind": "sql_query"}
+        return {"kind": "nl_query", "question_text": raw}
 
     @staticmethod
     def _channel_error_response(result: dict) -> dict:
@@ -900,7 +896,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "tenant list\n"
             "tenant select <id>\n"
             "tenant active\n"
-            "sql <select ...>"
+            "ajuda\n"
+            "Ou envie a pergunta em linguagem natural."
         )
 
     @staticmethod
@@ -921,6 +918,130 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lines.append(f"Comando: sql {sql_text}")
         return "\n".join(lines)
 
+    def _execute_nl_chat_query(self, context: dict, question_text: str) -> dict:
+        rag = self._build_rag_context(context)
+        planned = self._plan_sql_from_question(question_text, rag)
+        sql_text = planned.get("sql_text")
+        if not sql_text:
+            return {
+                "ok": False,
+                "command": "error",
+                "reply_text": "Nao consegui interpretar sua pergunta com as tabelas monitoradas.",
+                "data": {"rag": rag},
+            }
+        query_result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "query.execute_safe_sql",
+                "input": {"sql_text": sql_text, "explain": False},
+            }
+        )
+        if query_result["status"] != "success":
+            return self._channel_error_response(query_result)
+        query_data = query_result["data"]
+        return {
+            "ok": True,
+            "reply_text": self._reply_nl_result(question_text, sql_text, query_data, rag),
+            "data": {
+                "question_text": question_text,
+                "planned_sql": sql_text,
+                "planning_mode": planned.get("mode", "rules"),
+                "rag": rag,
+                "result": query_data,
+            },
+        }
+
+    def _build_rag_context(self, context: dict) -> dict:
+        table_result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "inventory.list_tenant_tables",
+                "input": {},
+            }
+        )
+        if table_result["status"] != "success":
+            return {"tables": [], "columns": {}}
+        tables = (table_result.get("data") or {}).get("tables") or []
+        tables = tables[:12]
+        columns_by_table: dict[str, list[dict]] = {}
+        for table in tables:
+            table_id = table.get("id")
+            if table_id is None:
+                continue
+            column_result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "inventory.list_table_columns",
+                    "input": {"monitored_table_id": table_id},
+                }
+            )
+            if column_result["status"] != "success":
+                continue
+            key = f"{table.get('schema_name')}.{table.get('table_name')}"
+            columns_by_table[key] = (column_result.get("data") or {}).get("columns") or []
+        return {"tables": tables, "columns": columns_by_table}
+
+    @staticmethod
+    def _plan_sql_from_question(question_text: str, rag: dict) -> dict:
+        q = question_text.lower()
+        if "incidente" in q and ("aberto" in q or "abertos" in q):
+            return {
+                "mode": "rules",
+                "sql_text": "SELECT status, COUNT(*) AS total FROM iaops_gov.incident WHERE status IN ('open','ack') GROUP BY status",
+            }
+        if "evento" in q and ("critico" in q or "criticos" in q):
+            return {
+                "mode": "rules",
+                "sql_text": "SELECT severity, COUNT(*) AS total FROM iaops_gov.schema_change_event WHERE severity = 'critical' GROUP BY severity",
+            }
+        if "tabela" in q or "inventario" in q:
+            return {
+                "mode": "rules",
+                "sql_text": "SELECT schema_name, table_name, is_active FROM iaops_gov.monitored_table ORDER BY schema_name, table_name LIMIT 50",
+            }
+        ranked = IAOpsAPIHandler._rank_tables_for_question(question_text, rag.get("tables") or [])
+        if ranked:
+            target = ranked[0]
+            schema_name = str(target.get("schema_name"))
+            table_name = str(target.get("table_name"))
+            if any(term in q for term in ["quantos", "qtd", "total", "count"]):
+                return {"mode": "rules", "sql_text": f"SELECT COUNT(*) AS total FROM {schema_name}.{table_name}"}
+            return {"mode": "rules", "sql_text": f"SELECT * FROM {schema_name}.{table_name} LIMIT 20"}
+        return {"mode": "rules", "sql_text": None}
+
+    @staticmethod
+    def _rank_tables_for_question(question_text: str, tables: list[dict]) -> list[dict]:
+        tokens = [token for token in re.split(r"[^a-zA-Z0-9_]+", question_text.lower()) if len(token) > 2]
+        if not tokens:
+            return []
+        scored: list[tuple[int, dict]] = []
+        for item in tables:
+            haystack = f"{item.get('schema_name', '')} {item.get('table_name', '')}".lower()
+            score = sum(1 for token in tokens if token in haystack)
+            if score > 0:
+                scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in scored]
+
+    @staticmethod
+    def _reply_nl_result(question_text: str, sql_text: str, query_data: dict, rag: dict) -> str:
+        rows = query_data.get("rows") or []
+        columns = query_data.get("columns") or []
+        lines = []
+        lines.append(f"Pergunta: {question_text}")
+        lines.append(f"Encontrei {len(rows)} registro(s).")
+        if rows and "total" in columns and isinstance(rows[0], dict) and "total" in rows[0]:
+            lines.append(f"Total: {rows[0]['total']}")
+        if rows:
+            lines.append("Preview:")
+            for idx, row in enumerate(rows[:5], start=1):
+                lines.append(f"{idx}. {json.dumps(row, ensure_ascii=True)}")
+        tables = rag.get("tables") or []
+        if tables:
+            lines.append(f"Contexto RAG: {len(tables)} tabela(s) monitorada(s) analisadas.")
+        lines.append(f"Consulta gerada internamente: {sql_text}")
+        return "\n".join(lines)
+
     def _handle_security_sql_policy_update(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -937,15 +1058,42 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_bi_query(self) -> None:
         body = self._read_json_body()
-        payload = {
-            "context": self._request_context(),
-            "tool": "query.execute_safe_sql",
-            "input": {
-                "sql_text": body.get("sql_text"),
-                "explain": bool(body.get("explain", False)),
+        question_text = str(body.get("question_text") or body.get("question") or "").strip()
+        if not question_text:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "chat-bi.query",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "question_text obrigatorio"},
+                },
+            )
+            return
+        response = self._execute_nl_chat_query(self._request_context(), question_text)
+        if not response["ok"]:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "chat-bi.query",
+                    "correlation_id": None,
+                    "data": response.get("data", {}),
+                    "error": {"code": "nl_query_failed", "message": response["reply_text"]},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "chat-bi.query",
+                "correlation_id": str(uuid.uuid4()),
+                "data": response["data"],
+                "error": None,
             },
-        }
-        self._dispatch_mcp(payload)
+        )
 
     def _handle_generic_call(self) -> None:
         body = self._read_json_body()

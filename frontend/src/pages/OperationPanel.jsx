@@ -103,7 +103,7 @@ export default function OperationPanel({ onSystemMessage }) {
         <h3>Tester de Canal (Telegram/WhatsApp)</h3>
         <p className="muted">
           Simula entrada de webhook com comandos: <code>tenant list</code>, <code>tenant select &lt;id&gt;</code>,
-          <code>tenant active</code>, <code>sql &lt;select ...&gt;</code>.
+          <code>tenant active</code> e perguntas em linguagem natural.
         </p>
 
         <div className="inline-form">

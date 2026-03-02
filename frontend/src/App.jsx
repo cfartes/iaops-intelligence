@@ -23,7 +23,7 @@ const SUBTITLE_BY_PAGE = {
   onboarding: "Configure cliente, tenant e fonte de dados com fluxo guiado.",
   inventario: "Explore tabelas, colunas e classificacao de metadados por tenant.",
   sugestoes: "Receba recomendacoes de classificacao e descricao para governanca.",
-  "chat-bi": "Perguntas em linguagem natural com SQL assistido e politicas LGPD.",
+  "chat-bi": "Perguntas em linguagem natural com contexto de metadados e politicas LGPD.",
   eventos: "Acompanhe mudancas estruturais detectadas e alertas por severidade.",
   incidentes: "Gerencie ciclo de vida de incidentes com SLA e rastreabilidade.",
   auditoria: "Consulte trilhas de auditoria das operacoes criticas do sistema.",
