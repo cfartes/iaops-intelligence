@@ -44,6 +44,12 @@ export default function ChatBiPanel({ onSystemMessage }) {
           tUi("chat.lgpdBlocked.title", "Resposta bloqueada por LGPD"),
           `${tUi("chat.lgpdBlocked.message", "Essa pergunta toca em dados protegidos por politica LGPD deste tenant.")} ${tUi("chat.lgpdBlocked.fields", "Campos")} : ${preview}`,
         );
+      } else if (error?.code === "tenant_blocked") {
+        onSystemMessage(
+          "warning",
+          "Tenant bloqueado",
+          "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para continuar usando o Chat BI.",
+        );
       } else {
         onSystemMessage("error", tUi("chat.fail.title", "Falha no Chat BI"), error.message);
       }

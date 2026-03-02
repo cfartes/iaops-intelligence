@@ -708,6 +708,17 @@ export async function listBillingInstallments(status) {
   return parseResponse(response);
 }
 
+export async function getBillingLlmUsage(days = 30, tenantId) {
+  const query = new URLSearchParams();
+  query.set("days", String(days));
+  if (tenantId != null && tenantId !== "") query.set("tenant_id", String(tenantId));
+  const response = await fetch(`/api/billing/llm-usage?${query.toString()}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
 export async function generateBillingInstallment(payload) {
   const response = await fetch("/api/billing/installments/generate", {
     method: "POST",

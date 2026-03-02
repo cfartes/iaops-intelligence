@@ -1,15 +1,21 @@
 import { useEffect, useState } from "react";
 import {
   enqueueIngestionJob,
+  getAuthContext,
   enqueueRagRebuildJob,
+  getBillingLlmUsage,
   getBillingSubscription,
   getObservabilityMetrics,
+  listClientTenants,
   listAsyncJobs,
   listBillingPlans,
   upsertBillingSubscription,
 } from "../api/mcpApi";
 
 export default function BillingPanel({ onSystemMessage }) {
+  const auth = getAuthContext();
+  const authRole = String(auth?.role || "").toLowerCase();
+  const canSelectUsageTenant = ["owner", "admin", "superadmin"].includes(authRole);
   const [plans, setPlans] = useState([]);
   const [subscription, setSubscription] = useState({});
   const [jobs, setJobs] = useState([]);
@@ -17,14 +23,31 @@ export default function BillingPanel({ onSystemMessage }) {
   const [showModal, setShowModal] = useState(false);
   const [planCode, setPlanCode] = useState("starter");
   const [toleranceDays, setToleranceDays] = useState("5");
+  const [llmUsageDays, setLlmUsageDays] = useState("30");
+  const [llmUsage, setLlmUsage] = useState({ summary: {}, by_feature: [], recent: [] });
+  const [tenantOptions, setTenantOptions] = useState([]);
+  const [usageTenantId, setUsageTenantId] = useState("");
 
   const loadAll = async () => {
     try {
-      const [p, s, j, m] = await Promise.all([listBillingPlans(), getBillingSubscription(), listAsyncJobs(20), getObservabilityMetrics()]);
+      const [p, s, j, m, u, t] = await Promise.all([
+        listBillingPlans(),
+        getBillingSubscription(),
+        listAsyncJobs(20),
+        getObservabilityMetrics(),
+        getBillingLlmUsage(Number(llmUsageDays) || 30, usageTenantId || undefined),
+        listClientTenants(),
+      ]);
       setPlans(p.plans || []);
       setSubscription(s.subscription || {});
       setJobs(j.jobs || []);
       setMetrics(m || {});
+      setLlmUsage(u || { summary: {}, by_feature: [], recent: [] });
+      const tenants = t.tenants || [];
+      setTenantOptions(tenants);
+      if (!usageTenantId && tenants.length > 0) {
+        setUsageTenantId(String(tenants[0].id));
+      }
     } catch (error) {
       onSystemMessage("error", "Falha faturamento", error.message);
     }
@@ -32,7 +55,7 @@ export default function BillingPanel({ onSystemMessage }) {
 
   useEffect(() => {
     loadAll();
-  }, []);
+  }, [llmUsageDays]);
 
   const saveSubscription = async () => {
     try {
@@ -51,7 +74,11 @@ export default function BillingPanel({ onSystemMessage }) {
       onSystemMessage("success", "Operacao", "Job de ingestao enfileirado.");
       await loadAll();
     } catch (error) {
-      onSystemMessage("error", "Falha job", error.message);
+      if (error?.code === "tenant_blocked") {
+        onSystemMessage("warning", "Tenant bloqueado", "Tenant bloqueado por inadimplencia. Regularize o faturamento para continuar.");
+      } else {
+        onSystemMessage("error", "Falha job", error.message);
+      }
     }
   };
 
@@ -61,7 +88,11 @@ export default function BillingPanel({ onSystemMessage }) {
       onSystemMessage("success", "Operacao", "Job de rebuild RAG enfileirado.");
       await loadAll();
     } catch (error) {
-      onSystemMessage("error", "Falha job", error.message);
+      if (error?.code === "tenant_blocked") {
+        onSystemMessage("warning", "Tenant bloqueado", "Tenant bloqueado por inadimplencia. Regularize o faturamento para continuar.");
+      } else {
+        onSystemMessage("error", "Falha job", error.message);
+      }
     }
   };
 
@@ -133,6 +164,58 @@ export default function BillingPanel({ onSystemMessage }) {
       </section>
 
       <section className="catalog-block">
+        <h3>Consumo LLM do app</h3>
+        <div className="inline-form">
+          <label>
+            Periodo (dias)
+            <select value={llmUsageDays} onChange={(e) => setLlmUsageDays(e.target.value)}>
+              <option value="7">7</option>
+              <option value="30">30</option>
+              <option value="90">90</option>
+            </select>
+          </label>
+          {canSelectUsageTenant ? (
+            <label>
+              Tenant
+              <select value={usageTenantId} onChange={(e) => setUsageTenantId(e.target.value)}>
+                <option value="">Tenant atual</option>
+                {tenantOptions.map((item) => (
+                  <option key={item.id} value={String(item.id)}>
+                    {item.id} - {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <button type="button" className="btn btn-secondary" onClick={loadAll}>
+            Atualizar Consumo
+          </button>
+        </div>
+        <div className="chip-row">
+          <span className="chip">Chamadas: {llmUsage?.summary?.calls || 0}</span>
+          <span className="chip">Input tokens: {llmUsage?.summary?.input_tokens || 0}</span>
+          <span className="chip">Output tokens: {llmUsage?.summary?.output_tokens || 0}</span>
+          <span className="chip">Total tokens: {llmUsage?.summary?.total_tokens || 0}</span>
+          <span className="chip">Custo: {(((llmUsage?.summary?.amount_cents || 0) / 100).toFixed(2))}</span>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead><tr><th>Funcionalidade</th><th>Chamadas</th><th>Tokens</th><th>Custo (cent)</th></tr></thead>
+            <tbody>
+              {(llmUsage?.by_feature || []).map((item) => (
+                <tr key={item.feature_code}>
+                  <td>{item.feature_code}</td>
+                  <td>{item.calls}</td>
+                  <td>{item.total_tokens}</td>
+                  <td>{item.amount_cents}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="catalog-block">
         <h3>Ultimos jobs assinc</h3>
         <div className="table-wrap">
           <table className="data-table">
@@ -173,4 +256,3 @@ export default function BillingPanel({ onSystemMessage }) {
     </section>
   );
 }
-

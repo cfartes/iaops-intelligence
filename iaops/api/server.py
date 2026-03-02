@@ -155,6 +155,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/billing/installments":
             self._handle_billing_installments_list(parsed.query)
             return
+        if parsed.path == "/api/billing/llm-usage":
+            self._handle_billing_llm_usage(parsed.query)
+            return
         if parsed.path == "/api/jobs":
             self._handle_jobs_list(parsed.query)
             return
@@ -3867,6 +3870,26 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_chat_bi_query(self) -> None:
         body = self._read_json_body()
         request_context = self._request_context()
+        if self._is_db_enabled():
+            allowed = self._is_tenant_operational_db(
+                client_id=int(request_context.get("client_id") or 0),
+                tenant_id=int(request_context.get("tenant_id") or 0),
+            )
+            if not allowed:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "denied",
+                        "tool": "chat-bi.query",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {
+                            "code": "tenant_blocked",
+                            "message": "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para continuar.",
+                        },
+                    },
+                )
+                return
         language_code = self._resolve_language_code(request_context)
         question_text = str(body.get("question_text") or body.get("question") or "").strip()
         if not question_text:
@@ -4044,6 +4067,50 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.list", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
 
+    def _handle_billing_llm_usage(self, query: str) -> None:
+        context = self._request_context()
+        qs = parse_qs(query)
+        days = int(qs.get("days", ["30"])[0])
+        tenant_qs = qs.get("tenant_id", [None])[0]
+        tenant_id = int(tenant_qs) if tenant_qs not in (None, "") else int(context["tenant_id"])
+        if not self._can_access_tenant_billing_usage(
+            user_id=int(context["user_id"]),
+            client_id=int(context["client_id"]),
+            tenant_id=tenant_id,
+        ):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing.llm_usage",
+                    "data": {},
+                    "error": {"code": "insufficient_role", "message": "Sem permissao para consultar consumo deste tenant."},
+                },
+            )
+            return
+        try:
+            usage = self._db_get_llm_usage_report(tenant_id=tenant_id, days=max(1, min(days, 365)))
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing.llm_usage",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": usage,
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing.llm_usage",
+                    "data": {},
+                    "error": {"code": "billing_error", "message": str(exc)},
+                },
+            )
+
     def _handle_billing_installments_generate(self) -> None:
         context = self._request_context()
         body = self._read_json_body()
@@ -4072,6 +4139,25 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_jobs_enqueue(self, job_kind: str) -> None:
         body = self._read_json_body()
         context = self._request_context()
+        if self._is_db_enabled():
+            allowed = self._is_tenant_operational_db(
+                client_id=int(context.get("client_id") or 0),
+                tenant_id=int(context.get("tenant_id") or 0),
+            )
+            if not allowed:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "denied",
+                        "tool": f"jobs.{job_kind}",
+                        "data": {},
+                        "error": {
+                            "code": "tenant_blocked",
+                            "message": "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para enfileirar jobs.",
+                        },
+                    },
+                )
+                return
         queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
         payload = dict(body) if isinstance(body, dict) else {}
         payload.setdefault("tenant_id", int(context.get("tenant_id") or 0))
@@ -5056,6 +5142,211 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "paid_at": row[5].isoformat() if row[5] else None,
             "created_at": row[6].isoformat() if row[6] else None,
         }
+
+    def _db_get_llm_usage_report(self, *, tenant_id: int, days: int) -> dict:
+        if not self._is_db_enabled():
+            return {"summary": {}, "by_feature": [], "recent": []}
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS calls,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(amount_cents), 0) AS amount_cents
+                FROM {schema}.llm_usage_meter
+                WHERE tenant_id = %(tenant_id)s
+                  AND created_at >= NOW() - (%(days)s::text || ' days')::interval
+                """,
+                {"tenant_id": tenant_id, "days": days},
+            )
+            summary_row = cur.fetchone() or [0, 0, 0, 0, 0]
+            cur.execute(
+                f"""
+                SELECT
+                    feature_code,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(amount_cents), 0) AS amount_cents,
+                    COUNT(*) AS calls
+                FROM {schema}.llm_usage_meter
+                WHERE tenant_id = %(tenant_id)s
+                  AND created_at >= NOW() - (%(days)s::text || ' days')::interval
+                GROUP BY feature_code
+                ORDER BY total_tokens DESC, amount_cents DESC
+                """,
+                {"tenant_id": tenant_id, "days": days},
+            )
+            by_feature_rows = cur.fetchall()
+            cur.execute(
+                f"""
+                SELECT
+                    feature_code,
+                    provider_name,
+                    model_code,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    amount_cents,
+                    created_at
+                FROM {schema}.llm_usage_meter
+                WHERE tenant_id = %(tenant_id)s
+                  AND created_at >= NOW() - (%(days)s::text || ' days')::interval
+                ORDER BY created_at DESC
+                LIMIT 20
+                """,
+                {"tenant_id": tenant_id, "days": days},
+            )
+            recent_rows = cur.fetchall()
+        return {
+            "summary": {
+                "days": int(days),
+                "calls": int(summary_row[0] or 0),
+                "input_tokens": int(summary_row[1] or 0),
+                "output_tokens": int(summary_row[2] or 0),
+                "total_tokens": int(summary_row[3] or 0),
+                "amount_cents": int(summary_row[4] or 0),
+            },
+            "by_feature": [
+                {
+                    "feature_code": str(row[0] or ""),
+                    "total_tokens": int(row[1] or 0),
+                    "amount_cents": int(row[2] or 0),
+                    "calls": int(row[3] or 0),
+                }
+                for row in by_feature_rows
+            ],
+            "recent": [
+                {
+                    "feature_code": str(row[0] or ""),
+                    "provider_name": str(row[1] or ""),
+                    "model_code": str(row[2] or ""),
+                    "input_tokens": int(row[3] or 0),
+                    "output_tokens": int(row[4] or 0),
+                    "total_tokens": int(row[5] or 0),
+                    "amount_cents": int(row[6] or 0),
+                    "created_at": row[7].isoformat() if row[7] else None,
+                }
+                for row in recent_rows
+            ],
+        }
+
+    def _can_access_tenant_billing_usage(self, *, user_id: int, client_id: int, tenant_id: int) -> bool:
+        if tenant_id <= 0:
+            return False
+        if not self._is_db_enabled():
+            return tenant_id == 10
+        if self._is_superadmin_user(user_id=user_id):
+            return True
+        schema = self.signup_schema
+        try:
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {schema}.tenant t
+                    JOIN {schema}.tenant_user_role tur ON tur.tenant_id = t.id
+                    WHERE t.id = %(tenant_id)s
+                      AND t.client_id = %(client_id)s
+                      AND tur.user_id = %(user_id)s
+                      AND tur.role IN ('owner', 'admin')
+                    LIMIT 1
+                    """,
+                    {"tenant_id": tenant_id, "client_id": client_id, "user_id": user_id},
+                )
+                row = cur.fetchone()
+            return bool(row)
+        except Exception:
+            return False
+
+    def _is_superadmin_user(self, *, user_id: int) -> bool:
+        if user_id <= 0:
+            return False
+        if not self._is_db_enabled():
+            return int(user_id) == 100
+        schema = self.signup_schema
+        try:
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COALESCE(is_superadmin, FALSE) FROM {schema}.app_user WHERE id = %(user_id)s LIMIT 1",
+                    {"user_id": user_id},
+                )
+                row = cur.fetchone()
+            return bool(row and row[0])
+        except Exception:
+            return False
+
+    def _is_tenant_operational_db(self, *, client_id: int, tenant_id: int) -> bool:
+        if client_id <= 0 or tenant_id <= 0:
+            return False
+        if not self._is_db_enabled():
+            return True
+        schema = self.signup_schema
+        sql = f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.tenant t
+                JOIN {schema}.client c ON c.id = t.client_id
+                WHERE t.id = %(tenant_id)s
+                  AND t.client_id = %(client_id)s
+                  AND t.status = 'active'
+                  AND c.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.installment inst
+                      JOIN {schema}.invoice inv ON inv.id = inst.invoice_id
+                      LEFT JOIN {schema}.subscription sub
+                        ON sub.client_id = t.client_id
+                       AND sub.status = 'active'
+                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
+                      LEFT JOIN {schema}.plan p ON p.id = sub.plan_id
+                      WHERE inv.client_id = t.client_id
+                        AND inst.status IN ('open', 'overdue')
+                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.billing_installment bi
+                      JOIN {schema}.billing_subscription bs ON bs.id = bi.subscription_id
+                      WHERE bs.client_id = t.client_id
+                        AND bs.status = 'active'
+                        AND bi.status IN ('open', 'overdue')
+                        AND bi.due_date < CURRENT_DATE - COALESCE(bs.tolerance_days, 5)
+                  )
+            ) AS ok
+        """
+        fallback_sql = f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.tenant t
+                JOIN {schema}.client c ON c.id = t.client_id
+                WHERE t.id = %(tenant_id)s
+                  AND t.client_id = %(client_id)s
+                  AND t.status = 'active'
+                  AND c.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.installment inst
+                      JOIN {schema}.invoice inv ON inv.id = inst.invoice_id
+                      LEFT JOIN {schema}.subscription sub
+                        ON sub.client_id = t.client_id
+                       AND sub.status = 'active'
+                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
+                      LEFT JOIN {schema}.plan p ON p.id = sub.plan_id
+                      WHERE inv.client_id = t.client_id
+                        AND inst.status IN ('open', 'overdue')
+                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
+                  )
+            ) AS ok
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            try:
+                cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
+            except Exception:
+                cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
+            row = cur.fetchone()
+        return bool(row and row[0])
 
     def _db_collect_observability_metrics(self, *, tenant_id: int) -> dict:
         schema = self.signup_schema
