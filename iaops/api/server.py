@@ -843,6 +843,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         confirm_token = token_hex(16)
         expires_at = int(time()) + (24 * 60 * 60)
         password = str(body.get("password") or "")
+        password_error = self._validate_password_strength(password)
+        if password_error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.signup",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "weak_password", "message": password_error},
+                },
+            )
+            return
         salt = token_hex(16)
         password_hash = pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240000).hex()
         encoded_password = f"pbkdf2_sha256$240000${salt}${password_hash}"
@@ -3462,6 +3475,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if cfg_result.get("status") != "success":
             return {"mode": "llm_unavailable", "sql_text": None}
         cfg = (cfg_result.get("data") or {}).get("config") or {}
+        use_app_default_llm = bool(cfg.get("use_app_default_llm"))
         provider_name = str(cfg.get("provider_name") or "").strip().lower()
         model_code = str(cfg.get("model_code") or "").strip()
         endpoint_url = str(cfg.get("endpoint_url") or "").strip()
@@ -3496,12 +3510,72 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             api_key=secret_value,
             prompt_payload=prompt_payload,
         )
+        if use_app_default_llm:
+            try:
+                self._record_app_llm_usage(
+                    tenant_id=int(context.get("tenant_id") or 0),
+                    feature_code="chat_bi_planner",
+                    provider_name=provider_name,
+                    model_code=model_code,
+                    prompt_payload=prompt_payload,
+                    llm_output=llm_output,
+                )
+            except Exception:
+                pass
         sql_text = str((llm_output or {}).get("sql_text") or "").strip()
         if not sql_text:
             return {"mode": "llm_empty", "sql_text": None}
         if not self._is_planned_sql_allowed(sql_text):
             return {"mode": "llm_rejected", "sql_text": None}
         return {"mode": "llm", "sql_text": sql_text, "llm_provider": provider_name}
+
+    def _record_app_llm_usage(
+        self,
+        *,
+        tenant_id: int,
+        feature_code: str,
+        provider_name: str,
+        model_code: str,
+        prompt_payload: dict,
+        llm_output: dict | None,
+    ) -> None:
+        if tenant_id <= 0 or not self._is_db_enabled():
+            return
+        input_tokens = self._estimate_tokens(json.dumps(prompt_payload or {}, ensure_ascii=True))
+        output_tokens = self._estimate_tokens(json.dumps(llm_output or {}, ensure_ascii=True))
+        total_tokens = int(input_tokens + output_tokens)
+        price_per_1k = int(os.getenv("IAOPS_APP_LLM_PRICE_PER_1K_CENTS") or "50")
+        amount_cents = int((total_tokens * price_per_1k + 999) // 1000)
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.llm_usage_meter (
+                    tenant_id, feature_code, model_code, provider_name,
+                    input_tokens, output_tokens, total_tokens, amount_cents
+                )
+                VALUES (
+                    %(tenant_id)s, %(feature_code)s, %(model_code)s, %(provider_name)s,
+                    %(input_tokens)s, %(output_tokens)s, %(total_tokens)s, %(amount_cents)s
+                )
+                """,
+                {
+                    "tenant_id": tenant_id,
+                    "feature_code": feature_code,
+                    "model_code": model_code or None,
+                    "provider_name": provider_name or None,
+                    "input_tokens": int(max(1, input_tokens)),
+                    "output_tokens": int(max(1, output_tokens)),
+                    "total_tokens": int(max(1, total_tokens)),
+                    "amount_cents": int(max(0, amount_cents)),
+                },
+            )
+            conn.commit()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        size = len(str(text or ""))
+        return max(1, size // 4)
 
     @staticmethod
     def _is_planned_sql_allowed(sql_text: str) -> bool:
@@ -4999,7 +5073,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             cur.execute(
                 f"""
                 SELECT COUNT(*)
-                FROM {schema}.event
+                FROM {schema}.schema_change_event
                 WHERE tenant_id = %(tenant_id)s
                   AND severity = 'critical'
                 """,
@@ -5010,18 +5084,48 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 f"""
                 SELECT
                     COUNT(*) FILTER (WHERE status IN ('queued','running')) AS jobs_inflight,
-                    COUNT(*) FILTER (WHERE status = 'failed') AS jobs_failed
+                    COUNT(*) FILTER (WHERE status = 'failed') AS jobs_failed,
+                    COUNT(*) FILTER (WHERE status = 'retrying') AS jobs_retrying,
+                    COUNT(*) FILTER (WHERE status = 'dead_letter') AS jobs_dead_letter
                 FROM {schema}.async_job_run
                 WHERE tenant_id = %(tenant_id)s
                 """,
                 {"tenant_id": tenant_id},
             )
             jobs = cur.fetchone()
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema}.mcp_call_log
+                WHERE tenant_id = %(tenant_id)s
+                  AND error_code = 'lgpd_blocked'
+                  AND requested_at >= NOW() - INTERVAL '24 hours'
+                """,
+                {"tenant_id": tenant_id},
+            )
+            lgpd_blocked_24h = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens_24h,
+                    COALESCE(SUM(amount_cents), 0) AS amount_cents_24h
+                FROM {schema}.llm_usage_meter
+                WHERE tenant_id = %(tenant_id)s
+                  AND created_at >= NOW() - INTERVAL '24 hours'
+                """,
+                {"tenant_id": tenant_id},
+            )
+            llm_row = cur.fetchone()
         return {
             "open_incidents": open_incidents,
             "critical_events": critical_events,
             "jobs_inflight": int((jobs[0] or 0) if jobs else 0),
             "jobs_failed": int((jobs[1] or 0) if jobs else 0),
+            "jobs_retrying": int((jobs[2] or 0) if jobs else 0),
+            "jobs_dead_letter": int((jobs[3] or 0) if jobs else 0),
+            "lgpd_blocked_24h": lgpd_blocked_24h,
+            "llm_tokens_24h": int((llm_row[0] or 0) if llm_row else 0),
+            "llm_amount_cents_24h": int((llm_row[1] or 0) if llm_row else 0),
         }
 
     def _read_json_body(self) -> dict:

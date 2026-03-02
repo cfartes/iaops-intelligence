@@ -145,6 +145,11 @@ npm install
 npm run dev
 ```
 
+Testes automatizados (backend):
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
 ## Deploy em Docker (VPS Ubuntu 24.04 LTS)
 Arquivos adicionados:
 - `docker-compose.yml`

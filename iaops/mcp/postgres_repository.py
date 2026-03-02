@@ -95,10 +95,46 @@ class PostgresMCPRepository(MCPRepository):
                         AND inst.status IN ('open', 'overdue')
                         AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {self.schema}.billing_installment bi
+                      JOIN {self.schema}.billing_subscription bs ON bs.id = bi.subscription_id
+                      WHERE bs.client_id = t.client_id
+                        AND bs.status = 'active'
+                        AND bi.status IN ('open', 'overdue')
+                        AND bi.due_date < CURRENT_DATE - COALESCE(bs.tolerance_days, 5)
+                  )
+            ) AS ok
+        """
+        fallback_sql = f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {self.schema}.tenant t
+                JOIN {self.schema}.client c ON c.id = t.client_id
+                WHERE t.id = %(tenant_id)s
+                  AND t.client_id = %(client_id)s
+                  AND t.status = 'active'
+                  AND c.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {self.schema}.installment inst
+                      JOIN {self.schema}.invoice inv ON inv.id = inst.invoice_id
+                      LEFT JOIN {self.schema}.subscription sub
+                        ON sub.client_id = t.client_id
+                       AND sub.status = 'active'
+                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
+                      LEFT JOIN {self.schema}.plan p ON p.id = sub.plan_id
+                      WHERE inv.client_id = t.client_id
+                        AND inst.status IN ('open', 'overdue')
+                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
+                  )
             ) AS ok
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
+            try:
+                cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
+            except Exception:
+                cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
             row = cur.fetchone()
         return bool(row and row["ok"])
 

@@ -1007,20 +1007,6 @@ class MCPGateway:
             error_message=result.error_message,
             latency_ms=latency_ms,
         )
-        if result.status == "success":
-            try:
-                request_len = len(str(request_payload.get("input", {})))
-                response_len = len(str(response.get("data", {})))
-                input_tokens = max(1, request_len // 4)
-                output_tokens = max(1, response_len // 4)
-                self.repository.track_app_llm_usage(
-                    tenant_id=context.tenant_id,
-                    feature_code=tool_name,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-            except Exception:
-                pass
         return response
 
     @staticmethod

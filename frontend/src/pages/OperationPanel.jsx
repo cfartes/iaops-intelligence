@@ -6,6 +6,7 @@ import {
   channelWebhookTelegram,
   getAuthContext,
   channelWebhookWhatsapp,
+  getObservabilityMetrics,
   getOperationHealth,
   listAsyncJobs,
   retryAsyncJob,
@@ -21,6 +22,7 @@ export default function OperationPanel({ onSystemMessage }) {
     return `iaops_jobs_view_v1:${clientId}:${tenantId}:${userId}`;
   }, [authContext?.client_id, authContext?.tenant_id, authContext?.user_id]);
   const [health, setHealth] = useState(null);
+  const [observability, setObservability] = useState(null);
   const [channelType, setChannelType] = useState("telegram");
   const [externalUserKey, setExternalUserKey] = useState("tg-owner-demo");
   const [conversationKey, setConversationKey] = useState("chat-owner-demo");
@@ -72,6 +74,15 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const loadObservability = async () => {
+    try {
+      const data = await getObservabilityMetrics();
+      setObservability(data);
+    } catch (error) {
+      onSystemMessage("error", "Erro ao carregar observabilidade", error.message);
+    }
+  };
+
   const loadJobs = async () => {
     setIsLoadingJobs(true);
     try {
@@ -114,6 +125,7 @@ export default function OperationPanel({ onSystemMessage }) {
 
   useEffect(() => {
     loadHealth();
+    loadObservability();
   }, []);
 
   useEffect(() => {
@@ -333,6 +345,9 @@ export default function OperationPanel({ onSystemMessage }) {
         <button type="button" className="btn btn-secondary" onClick={loadHealth}>
           {tUi("op.refresh", "Atualizar Saude")}
         </button>
+        <button type="button" className="btn btn-secondary" onClick={loadObservability}>
+          Atualizar Observabilidade
+        </button>
         <button type="button" className="btn btn-secondary" onClick={loadJobs}>
           Atualizar Jobs
         </button>
@@ -370,6 +385,34 @@ export default function OperationPanel({ onSystemMessage }) {
             </div>
           </article>
         </div>
+      )}
+
+      {observability && (
+        <section className="catalog-block">
+          <h3>Observabilidade</h3>
+          <div className="metric-grid">
+            <article className="metric-card">
+              <h4>Jobs retrying</h4>
+              <strong>{observability.jobs_retrying ?? 0}</strong>
+            </article>
+            <article className="metric-card">
+              <h4>Jobs dead-letter</h4>
+              <strong>{observability.jobs_dead_letter ?? 0}</strong>
+            </article>
+            <article className="metric-card">
+              <h4>Bloqueios LGPD (24h)</h4>
+              <strong>{observability.lgpd_blocked_24h ?? 0}</strong>
+            </article>
+            <article className="metric-card">
+              <h4>LLM tokens (24h)</h4>
+              <strong>{observability.llm_tokens_24h ?? 0}</strong>
+            </article>
+            <article className="metric-card">
+              <h4>Custo LLM (24h)</h4>
+              <strong>{((observability.llm_amount_cents_24h ?? 0) / 100).toFixed(2)}</strong>
+            </article>
+          </div>
+        </section>
       )}
 
       <section className="catalog-block channel-tester">
