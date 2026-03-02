@@ -6,6 +6,7 @@ import {
   channelWebhookTelegram,
   getAuthContext,
   channelWebhookWhatsapp,
+  enqueueHousekeepingJob,
   getObservabilityMetrics,
   getOperationHealth,
   listAsyncJobs,
@@ -334,6 +335,16 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const runHousekeeping = async () => {
+    try {
+      await enqueueHousekeepingJob({ retention_days: 90 });
+      onSystemMessage("success", "Housekeeping", "Job de limpeza enfileirado.");
+      await loadJobs();
+    } catch (error) {
+      onSystemMessage("error", "Falha housekeeping", error.message);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -350,6 +361,9 @@ export default function OperationPanel({ onSystemMessage }) {
         </button>
         <button type="button" className="btn btn-secondary" onClick={loadJobs}>
           Atualizar Jobs
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={runHousekeeping}>
+          Rodar Housekeeping
         </button>
         <button
           type="button"
@@ -390,6 +404,16 @@ export default function OperationPanel({ onSystemMessage }) {
       {observability && (
         <section className="catalog-block">
           <h3>Observabilidade</h3>
+          {(Number(observability.jobs_dead_letter || 0) > 0 || Number(observability.lgpd_blocked_24h || 0) > 50) ? (
+            <div className="chip-row">
+              {Number(observability.jobs_dead_letter || 0) > 0 ? (
+                <span className="chip">Alerta: ha jobs em dead-letter.</span>
+              ) : null}
+              {Number(observability.lgpd_blocked_24h || 0) > 50 ? (
+                <span className="chip">Alerta: bloqueios LGPD acima do padrao em 24h.</span>
+              ) : null}
+            </div>
+          ) : null}
           <div className="metric-grid">
             <article className="metric-card">
               <h4>Jobs retrying</h4>

@@ -15,6 +15,7 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - [Flag de superadmin](sql/007_superadmin_user.sql)
 - [Contexto de tenant por canal](sql/008_channel_tenant_context.sql)
 - [Extensoes de plataforma (LGPD/Billing/RAG/Jobs)](sql/011_platform_ops.sql)
+- [Consistencia de billing (view unificada)](sql/012_billing_consistency.sql)
 - [Seed MCP baseline](sql/003_mcp_seed.sql)
 - [Dados demo locais](sql/004_demo_data.sql)
 - [Bootstrap dev unico](sql/000_bootstrap_dev.sql)
@@ -117,6 +118,7 @@ Ou aplicar scripts SQL manualmente:
 \i sql/007_superadmin_user.sql
 \i sql/008_channel_tenant_context.sql
 \i sql/011_platform_ops.sql
+\i sql/012_billing_consistency.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql
 ```
@@ -143,6 +145,14 @@ Frontend (porta 5173):
 cd frontend
 npm install
 npm run dev
+```
+
+Testes E2E (Playwright):
+```powershell
+cd frontend
+npm install
+npx playwright install
+npm run e2e
 ```
 
 Testes automatizados (backend):
@@ -180,6 +190,7 @@ Observacoes de producao:
   - `POST /api/jobs/rag-rebuild`
   - `POST /api/jobs/monitor-scan`
   - `POST /api/jobs/billing-cycle`
+  - `POST /api/jobs/housekeeping`
   - `GET /api/jobs`
 
 ## Objetivo

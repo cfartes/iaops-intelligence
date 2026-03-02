@@ -11,5 +11,6 @@
 \i sql/009_user_tenant_chat_mode.sql
 \i sql/010_client_signup.sql
 \i sql/011_platform_ops.sql
+\i sql/012_billing_consistency.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql

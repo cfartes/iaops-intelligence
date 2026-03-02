@@ -78,6 +78,19 @@ class PostgresMCPRepository(MCPRepository):
                 SELECT 1
                 FROM {self.schema}.tenant t
                 JOIN {self.schema}.client c ON c.id = t.client_id
+                LEFT JOIN {self.schema}.v_client_billing_delinquency d ON d.client_id = t.client_id
+                WHERE t.id = %(tenant_id)s
+                  AND t.client_id = %(client_id)s
+                  AND t.status = 'active'
+                  AND c.status = 'active'
+                  AND d.client_id IS NULL
+            ) AS ok
+        """
+        fallback_sql = f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {self.schema}.tenant t
+                JOIN {self.schema}.client c ON c.id = t.client_id
                 WHERE t.id = %(tenant_id)s
                   AND t.client_id = %(client_id)s
                   AND t.status = 'active'
@@ -103,30 +116,6 @@ class PostgresMCPRepository(MCPRepository):
                         AND bs.status = 'active'
                         AND bi.status IN ('open', 'overdue')
                         AND bi.due_date < CURRENT_DATE - COALESCE(bs.tolerance_days, 5)
-                  )
-            ) AS ok
-        """
-        fallback_sql = f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {self.schema}.tenant t
-                JOIN {self.schema}.client c ON c.id = t.client_id
-                WHERE t.id = %(tenant_id)s
-                  AND t.client_id = %(client_id)s
-                  AND t.status = 'active'
-                  AND c.status = 'active'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {self.schema}.installment inst
-                      JOIN {self.schema}.invoice inv ON inv.id = inst.invoice_id
-                      LEFT JOIN {self.schema}.subscription sub
-                        ON sub.client_id = t.client_id
-                       AND sub.status = 'active'
-                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
-                      LEFT JOIN {self.schema}.plan p ON p.id = sub.plan_id
-                      WHERE inv.client_id = t.client_id
-                        AND inst.status IN ('open', 'overdue')
-                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
                   )
             ) AS ok
         """

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import csv
+import io
 import socket
 import smtplib
 import unicodedata
@@ -62,6 +64,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     refresh_sessions: dict[str, str] = {}
     failed_login_attempts: dict[str, dict] = {}
     failed_login_attempts_ip: dict[str, dict] = {}
+    route_rate_limits: dict[str, dict] = {}
+    chat_rate_limit_window_seconds = 60
+    chat_rate_limit_max_calls = 20
+    chat_rate_limit_lock_seconds = 60
+    jobs_rate_limit_window_seconds = 60
+    jobs_rate_limit_max_calls = 15
+    jobs_rate_limit_lock_seconds = 60
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json(HTTPStatus.NO_CONTENT, {})
@@ -157,6 +166,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/billing/llm-usage":
             self._handle_billing_llm_usage(parsed.query)
+            return
+        if parsed.path == "/api/billing/llm-usage.csv":
+            self._handle_billing_llm_usage_export_csv(parsed.query)
             return
         if parsed.path == "/api/jobs":
             self._handle_jobs_list(parsed.query)
@@ -314,6 +326,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/jobs/billing-cycle":
             self._handle_jobs_enqueue("billing_cycle")
+            return
+        if parsed.path == "/api/jobs/housekeeping":
+            self._handle_jobs_enqueue("housekeeping")
             return
         if parsed.path == "/api/jobs/retry":
             self._handle_jobs_retry()
@@ -2614,6 +2629,31 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             self.failed_login_attempts_ip.pop(client_ip, None)
         return None
 
+    def _check_route_rate_limit(
+        self,
+        *,
+        route_key: str,
+        actor_key: str,
+        max_calls: int,
+        window_seconds: int,
+        lock_seconds: int,
+    ) -> dict | None:
+        now_epoch = int(time())
+        key = f"{route_key}|{actor_key}"
+        state = self.route_rate_limits.get(key) or {"attempts": [], "locked_until": 0}
+        locked_until = int(state.get("locked_until") or 0)
+        if locked_until > now_epoch:
+            return {"blocked_remaining_seconds": locked_until - now_epoch}
+        attempts = [
+            ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(max(1, window_seconds))
+        ]
+        attempts.append(now_epoch)
+        if len(attempts) > int(max(1, max_calls)):
+            self.route_rate_limits[key] = {"attempts": [], "locked_until": now_epoch + int(max(1, lock_seconds))}
+            return {"blocked_remaining_seconds": int(max(1, lock_seconds))}
+        self.route_rate_limits[key] = {"attempts": attempts, "locked_until": 0}
+        return None
+
     @staticmethod
     def _login_throttle_key(*, email: str, client_ip: str) -> str:
         return f"{str(email or '').strip().lower()}|{str(client_ip or '').strip()}"
@@ -2651,6 +2691,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 self.failed_login_attempts_ip[ip] = {"attempts": attempts, "locked_until": locked_until if locked_until > now_epoch else 0}
             else:
                 self.failed_login_attempts_ip.pop(ip, None)
+
+        for route_key, state in list(self.route_rate_limits.items()):
+            locked_until = int(state.get("locked_until") or 0)
+            attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - 3600]
+            if locked_until > now_epoch or attempts:
+                self.route_rate_limits[route_key] = {
+                    "attempts": attempts,
+                    "locked_until": locked_until if locked_until > now_epoch else 0,
+                }
+            else:
+                self.route_rate_limits.pop(route_key, None)
 
         expired_resets = [
             token
@@ -3870,6 +3921,28 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_chat_bi_query(self) -> None:
         body = self._read_json_body()
         request_context = self._request_context()
+        throttle = self._check_route_rate_limit(
+            route_key="chat_bi_query",
+            actor_key=f"{request_context.get('tenant_id')}:{request_context.get('user_id')}:{self._request_ip()}",
+            max_calls=int(self.chat_rate_limit_max_calls),
+            window_seconds=int(self.chat_rate_limit_window_seconds),
+            lock_seconds=int(self.chat_rate_limit_lock_seconds),
+        )
+        if throttle:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {
+                    "status": "denied",
+                    "tool": "chat-bi.query",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {
+                        "code": "rate_limited",
+                        "message": f"Muitas requisicoes ao Chat BI. Tente novamente em {throttle['blocked_remaining_seconds']}s.",
+                    },
+                },
+            )
+            return
         if self._is_db_enabled():
             allowed = self._is_tenant_operational_db(
                 client_id=int(request_context.get("client_id") or 0),
@@ -4111,6 +4184,93 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
 
+    def _handle_billing_llm_usage_export_csv(self, query: str) -> None:
+        context = self._request_context()
+        qs = parse_qs(query)
+        days = int(qs.get("days", ["30"])[0])
+        tenant_qs = qs.get("tenant_id", [None])[0]
+        tenant_id = int(tenant_qs) if tenant_qs not in (None, "") else int(context["tenant_id"])
+        if not self._can_access_tenant_billing_usage(
+            user_id=int(context["user_id"]),
+            client_id=int(context["client_id"]),
+            tenant_id=tenant_id,
+        ):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing.llm_usage.csv",
+                    "data": {},
+                    "error": {"code": "insufficient_role", "message": "Sem permissao para exportar consumo deste tenant."},
+                },
+            )
+            return
+        usage = self._db_get_llm_usage_report(tenant_id=tenant_id, days=max(1, min(days, 365)))
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["section", "feature_code", "provider_name", "model_code", "calls", "input_tokens", "output_tokens", "total_tokens", "amount_cents", "created_at"])
+        summary = usage.get("summary") or {}
+        writer.writerow(
+            [
+                "summary",
+                "",
+                "",
+                "",
+                summary.get("calls", 0),
+                summary.get("input_tokens", 0),
+                summary.get("output_tokens", 0),
+                summary.get("total_tokens", 0),
+                summary.get("amount_cents", 0),
+                "",
+            ]
+        )
+        for row in usage.get("by_feature") or []:
+            writer.writerow(
+                [
+                    "by_feature",
+                    row.get("feature_code", ""),
+                    "",
+                    "",
+                    row.get("calls", 0),
+                    "",
+                    "",
+                    row.get("total_tokens", 0),
+                    row.get("amount_cents", 0),
+                    "",
+                ]
+            )
+        for row in usage.get("recent") or []:
+            writer.writerow(
+                [
+                    "recent",
+                    row.get("feature_code", ""),
+                    row.get("provider_name", ""),
+                    row.get("model_code", ""),
+                    "",
+                    row.get("input_tokens", 0),
+                    row.get("output_tokens", 0),
+                    row.get("total_tokens", 0),
+                    row.get("amount_cents", 0),
+                    row.get("created_at", ""),
+                ]
+            )
+        payload = output.getvalue().encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="llm-usage-tenant-{tenant_id}-{days}d.csv"',
+        )
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, X-Client-Id, X-Tenant-Id, X-User-Id, X-Correlation-Id, X-Session-Token",
+        )
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _handle_billing_installments_generate(self) -> None:
         context = self._request_context()
         body = self._read_json_body()
@@ -4139,6 +4299,27 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_jobs_enqueue(self, job_kind: str) -> None:
         body = self._read_json_body()
         context = self._request_context()
+        throttle = self._check_route_rate_limit(
+            route_key=f"jobs_enqueue:{job_kind}",
+            actor_key=f"{context.get('tenant_id')}:{context.get('user_id')}:{self._request_ip()}",
+            max_calls=int(self.jobs_rate_limit_max_calls),
+            window_seconds=int(self.jobs_rate_limit_window_seconds),
+            lock_seconds=int(self.jobs_rate_limit_lock_seconds),
+        )
+        if throttle:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {
+                    "status": "denied",
+                    "tool": f"jobs.{job_kind}",
+                    "data": {},
+                    "error": {
+                        "code": "rate_limited",
+                        "message": f"Muitas requisicoes de jobs. Tente novamente em {throttle['blocked_remaining_seconds']}s.",
+                    },
+                },
+            )
+            return
         if self._is_db_enabled():
             allowed = self._is_tenant_operational_db(
                 client_id=int(context.get("client_id") or 0),
@@ -5288,32 +5469,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 SELECT 1
                 FROM {schema}.tenant t
                 JOIN {schema}.client c ON c.id = t.client_id
+                LEFT JOIN {schema}.v_client_billing_delinquency d ON d.client_id = t.client_id
                 WHERE t.id = %(tenant_id)s
                   AND t.client_id = %(client_id)s
                   AND t.status = 'active'
                   AND c.status = 'active'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.installment inst
-                      JOIN {schema}.invoice inv ON inv.id = inst.invoice_id
-                      LEFT JOIN {schema}.subscription sub
-                        ON sub.client_id = t.client_id
-                       AND sub.status = 'active'
-                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
-                      LEFT JOIN {schema}.plan p ON p.id = sub.plan_id
-                      WHERE inv.client_id = t.client_id
-                        AND inst.status IN ('open', 'overdue')
-                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.billing_installment bi
-                      JOIN {schema}.billing_subscription bs ON bs.id = bi.subscription_id
-                      WHERE bs.client_id = t.client_id
-                        AND bs.status = 'active'
-                        AND bi.status IN ('open', 'overdue')
-                        AND bi.due_date < CURRENT_DATE - COALESCE(bs.tolerance_days, 5)
-                  )
+                  AND d.client_id IS NULL
             ) AS ok
         """
         fallback_sql = f"""

@@ -168,6 +168,34 @@ def run_billing_cycle(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "installments_created": created}
 
 
+def run_housekeeping(payload: dict[str, Any]) -> dict[str, Any]:
+    if connect is None:
+        return {"status": "error", "message": "psycopg indisponivel"}
+    dsn = os.getenv("IAOPS_DB_DSN")
+    schema = os.getenv("IAOPS_DB_SCHEMA") or "iaops_gov"
+    if not dsn:
+        return {"status": "error", "message": "IAOPS_DB_DSN nao configurado"}
+    retention_days = int(payload.get("retention_days") or 90)
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"DELETE FROM {schema}.mcp_call_log WHERE requested_at < NOW() - (%(days)s::text || ' days')::interval",
+            {"days": retention_days},
+        )
+        deleted_calls = int(cur.rowcount or 0)
+        cur.execute(
+            f"""
+            DELETE FROM {schema}.async_job_run
+            WHERE finished_at IS NOT NULL
+              AND finished_at < NOW() - (%(days)s::text || ' days')::interval
+              AND status IN ('done', 'failed', 'dead_letter')
+            """,
+            {"days": retention_days},
+        )
+        deleted_jobs = int(cur.rowcount or 0)
+        conn.commit()
+    return {"status": "ok", "retention_days": retention_days, "deleted_calls": deleted_calls, "deleted_jobs": deleted_jobs}
+
+
 def search_rag_documents(*, tenant_id: int, query_text: str, limit: int = 8) -> list[dict[str, Any]]:
     if connect is None:
         return []

@@ -719,6 +719,30 @@ export async function getBillingLlmUsage(days = 30, tenantId) {
   return parseResponse(response);
 }
 
+export async function downloadBillingLlmUsageCsv(days = 30, tenantId) {
+  const query = new URLSearchParams();
+  query.set("days", String(days));
+  if (tenantId != null && tenantId !== "") query.set("tenant_id", String(tenantId));
+  const response = await fetch(`/api/billing/llm-usage.csv?${query.toString()}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  if (!response.ok) {
+    let message = "Falha ao exportar CSV";
+    try {
+      const data = await response.json();
+      message = data?.error?.message || message;
+    } catch (_) {
+      // ignore
+    }
+    const error = new Error(message);
+    error.code = "csv_export_error";
+    throw error;
+  }
+  const blob = await response.blob();
+  return blob;
+}
+
 export async function generateBillingInstallment(payload) {
   const response = await fetch("/api/billing/installments/generate", {
     method: "POST",
@@ -768,6 +792,15 @@ export async function listAsyncJobs(limit = 50, offset = 0) {
 
 export async function retryAsyncJob(payload) {
   const response = await fetch("/api/jobs/retry", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function enqueueHousekeepingJob(payload = {}) {
+  const response = await fetch("/api/jobs/housekeeping", {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),

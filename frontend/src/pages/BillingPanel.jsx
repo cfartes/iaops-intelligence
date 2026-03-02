@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  downloadBillingLlmUsageCsv,
   enqueueIngestionJob,
   getAuthContext,
   enqueueRagRebuildJob,
@@ -96,6 +97,23 @@ export default function BillingPanel({ onSystemMessage }) {
     }
   };
 
+  const exportLlmCsv = async () => {
+    try {
+      const blob = await downloadBillingLlmUsageCsv(Number(llmUsageDays) || 30, usageTenantId || undefined);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `llm-usage-${usageTenantId || "tenant-atual"}-${llmUsageDays}d.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      onSystemMessage("success", "Exportacao", "CSV de consumo LLM gerado com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha exportacao", error.message);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -189,6 +207,9 @@ export default function BillingPanel({ onSystemMessage }) {
           ) : null}
           <button type="button" className="btn btn-secondary" onClick={loadAll}>
             Atualizar Consumo
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={exportLlmCsv}>
+            Exportar CSV
           </button>
         </div>
         <div className="chip-row">
