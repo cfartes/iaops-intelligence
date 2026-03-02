@@ -5,9 +5,11 @@ import {
   enableMfa,
   getAdminLlmConfig,
   getMfaStatus,
+  getUserTenantPreference,
   getTenantLlmConfig,
   listAdminLlmProviders,
   listTenantLlmProviders,
+  updateUserTenantPreference,
   updateTenantLlmConfig,
   updateAdminLlmConfig,
 } from "../api/mcpApi";
@@ -28,6 +30,8 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
   const [tenantLlmProviders, setTenantLlmProviders] = useState([]);
   const [tenantLlmConfig, setTenantLlmConfig] = useState(null);
   const [tenantLlmModalOpen, setTenantLlmModalOpen] = useState(false);
+  const [userPref, setUserPref] = useState(null);
+  const [chatResponseModeDraft, setChatResponseModeDraft] = useState("executive");
 
   const loadStatus = async () => {
     setLoading(true);
@@ -45,6 +49,7 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
     loadStatus();
     loadLlmAdmin();
     loadTenantLlmConfig();
+    loadUserPreference();
   }, []);
 
   const loadLlmAdmin = async () => {
@@ -65,6 +70,17 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
       setTenantLlmConfig(cfgData.config || null);
     } catch (error) {
       onSystemMessage("error", "Falha ao carregar LLM do tenant", error.message);
+    }
+  };
+
+  const loadUserPreference = async () => {
+    try {
+      const data = await getUserTenantPreference();
+      const pref = data.preference || null;
+      setUserPref(pref);
+      setChatResponseModeDraft(pref?.chat_response_mode || "executive");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar preferencias", error.message);
     }
   };
 
@@ -139,6 +155,19 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
     }
   };
 
+  const saveChatResponseMode = async () => {
+    setSubmitting(true);
+    try {
+      const data = await updateUserTenantPreference({ chat_response_mode: chatResponseModeDraft });
+      setUserPref(data.preference || null);
+      onSystemMessage("success", "Preferencia salva", "Modo de resposta do Chat BI atualizado.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar preferencia", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -178,6 +207,34 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
           </div>
         </>
       )}
+
+      <section className="catalog-block">
+        <header>
+          <h3>Preferencias Usuario + Tenant</h3>
+        </header>
+        <div className="table-wrap">
+          <table className="data-table">
+            <tbody>
+              <tr>
+                <th>Modo atual (Chat BI)</th>
+                <td>{userPref?.chat_response_mode || "-"}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div className="inline-form">
+          <select value={chatResponseModeDraft} onChange={(event) => setChatResponseModeDraft(event.target.value)}>
+            <option value="executive">Executiva</option>
+            <option value="detailed">Detalhada</option>
+          </select>
+          <button type="button" className="btn btn-primary" onClick={saveChatResponseMode} disabled={submitting}>
+            Salvar Modo
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadUserPreference} disabled={submitting}>
+            Atualizar Preferencia
+          </button>
+        </div>
+      </section>
 
       <section className="catalog-block">
         <header>

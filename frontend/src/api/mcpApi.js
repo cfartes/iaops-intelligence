@@ -371,6 +371,23 @@ export async function updateTenantLlmConfig(payload) {
   return parseResponse(response);
 }
 
+export async function getUserTenantPreference() {
+  const response = await fetch("/api/preferences/user-tenant", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function updateUserTenantPreference(payload) {
+  const response = await fetch("/api/preferences/user-tenant", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function channelListUserTenants(payload) {
   const response = await fetch("/api/channel/tenants/list", {
     method: "POST",

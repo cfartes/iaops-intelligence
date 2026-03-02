@@ -63,6 +63,22 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_user_tenant_preference(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_user_tenant_preference(
+        self,
+        tenant_id: int,
+        user_id: int,
+        *,
+        language_code: str | None = None,
+        theme_code: str | None = None,
+        chat_response_mode: str | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
     def get_tenant_llm_config(self, client_id: int, tenant_id: int) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -364,6 +380,8 @@ class InMemoryMCPRepository(MCPRepository):
             (10, "security.mfa.enable"): ToolPolicy("security.mfa.enable", "viewer", True, None, 30, True, None),
             (10, "security.mfa.disable_self"): ToolPolicy("security.mfa.disable_self", "viewer", True, None, 30, True, None),
             (10, "security.mfa.admin_reset"): ToolPolicy("security.mfa.admin_reset", "admin", True, None, 60, True, None),
+            (10, "pref.get_user_tenant"): ToolPolicy("pref.get_user_tenant", "viewer", True, None, 120, True, None),
+            (10, "pref.update_user_tenant"): ToolPolicy("pref.update_user_tenant", "viewer", True, None, 60, True, None),
             (10, "tenant_llm.get_config"): ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
             (10, "tenant_llm.update_config"): ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
             (10, "tenant_llm.list_providers"): ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
@@ -484,6 +502,11 @@ class InMemoryMCPRepository(MCPRepository):
         }
         self._mfa_config: dict[int, dict[str, Any]] = {}
         self._mfa_pending: dict[int, dict[str, Any]] = {}
+        self._user_tenant_preferences: dict[tuple[int, int], dict[str, Any]] = {
+            (10, 100): {"language_code": "pt-BR", "theme_code": "light", "chat_response_mode": "executive"},
+            (10, 101): {"language_code": "pt-BR", "theme_code": "light", "chat_response_mode": "detailed"},
+            (10, 102): {"language_code": "pt-BR", "theme_code": "light", "chat_response_mode": "executive"},
+        }
         self._supported_llm_providers = [
             {"code": "openai", "name": "OpenAI"},
             {"code": "azure_openai", "name": "Azure OpenAI"},
@@ -681,6 +704,52 @@ class InMemoryMCPRepository(MCPRepository):
         }
         self._mfa_pending.pop(target_user_id, None)
         return {"target_user_id": target_user_id, "enabled": False, "reset_at": reset_at}
+
+    def get_user_tenant_preference(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        pref = self._user_tenant_preferences.get((tenant_id, user_id)) or {}
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "language_code": pref.get("language_code", "pt-BR"),
+            "theme_code": pref.get("theme_code", "light"),
+            "chat_response_mode": pref.get("chat_response_mode", "executive"),
+        }
+
+    def upsert_user_tenant_preference(
+        self,
+        tenant_id: int,
+        user_id: int,
+        *,
+        language_code: str | None = None,
+        theme_code: str | None = None,
+        chat_response_mode: str | None = None,
+    ) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        current = self._user_tenant_preferences.get((tenant_id, user_id)) or {
+            "language_code": "pt-BR",
+            "theme_code": "light",
+            "chat_response_mode": "executive",
+        }
+        if language_code is not None:
+            current["language_code"] = language_code
+        if theme_code is not None:
+            current["theme_code"] = theme_code
+        if chat_response_mode is not None:
+            mode = str(chat_response_mode).strip().lower()
+            if mode not in {"executive", "detailed"}:
+                raise ValueError("chat_response_mode invalido")
+            current["chat_response_mode"] = mode
+        self._user_tenant_preferences[(tenant_id, user_id)] = current
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "language_code": current["language_code"],
+            "theme_code": current["theme_code"],
+            "chat_response_mode": current["chat_response_mode"],
+        }
 
     def list_supported_llm_providers(self) -> list[dict[str, Any]]:
         return [*self._supported_llm_providers]

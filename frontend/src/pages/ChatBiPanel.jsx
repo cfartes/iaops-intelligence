@@ -15,6 +15,7 @@ export default function ChatBiPanel({ onSystemMessage }) {
   const resultData = useMemo(() => result?.result || {}, [result]);
   const columns = useMemo(() => resultData?.columns || [], [resultData]);
   const rows = useMemo(() => resultData?.rows || [], [resultData]);
+  const responseMode = useMemo(() => result?.chat_response_mode || "executive", [result]);
 
   const askQuestion = async () => {
     if (!question.trim()) {
@@ -71,9 +72,9 @@ export default function ChatBiPanel({ onSystemMessage }) {
 
       {result && !loading && (
         <div className="chat-result">
-          <p className="chat-summary">{summarizeResult(rows)}</p>
+          <p className="chat-summary">{summarizeResult(rows)} Modo: {responseMode === "detailed" ? "Detalhada" : "Executiva"}.</p>
 
-          {columns.length > 0 && rows.length > 0 && (
+          {responseMode === "detailed" && columns.length > 0 && rows.length > 0 && (
             <div className="table-wrap">
               <table className="data-table">
                 <thead>

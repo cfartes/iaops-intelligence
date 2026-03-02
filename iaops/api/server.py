@@ -81,6 +81,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tenant-llm/config":
             self._handle_tenant_llm_config_get()
             return
+        if parsed.path == "/api/preferences/user-tenant":
+            self._handle_user_tenant_preference_get()
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -147,6 +150,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tenant-llm/config":
             self._handle_tenant_llm_config_update()
+            return
+        if parsed.path == "/api/preferences/user-tenant":
+            self._handle_user_tenant_preference_update()
             return
         if parsed.path == "/api/channel/tenants/list":
             self._handle_channel_list_tenants()
@@ -573,6 +579,27 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_user_tenant_preference_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "pref.get_user_tenant",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_user_tenant_preference_update(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "pref.update_user_tenant",
+            "input": {
+                "language_code": body.get("language_code"),
+                "theme_code": body.get("theme_code"),
+                "chat_response_mode": body.get("chat_response_mode"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_channel_list_tenants(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -922,6 +949,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return "\n".join(lines)
 
     def _execute_nl_chat_query(self, context: dict, question_text: str) -> dict:
+        response_mode = self._resolve_chat_response_mode(context)
         rag = self._build_rag_context(context)
         planned = self._plan_sql_from_question(context, question_text, rag)
         sql_text = planned.get("sql_text")
@@ -944,16 +972,31 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         query_data = query_result["data"]
         return {
             "ok": True,
-            "reply_text": self._reply_nl_result(question_text, sql_text, query_data, rag),
+            "reply_text": self._reply_nl_result(question_text, sql_text, query_data, rag, response_mode),
             "data": {
                 "question_text": question_text,
                 "planned_sql": sql_text,
                 "planning_mode": planned.get("mode", "rules"),
                 "llm_provider": planned.get("llm_provider"),
+                "chat_response_mode": response_mode,
                 "rag": rag,
                 "result": query_data,
             },
         }
+
+    def _resolve_chat_response_mode(self, context: dict) -> str:
+        result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "pref.get_user_tenant",
+                "input": {},
+            }
+        )
+        if result.get("status") != "success":
+            return "executive"
+        pref = (result.get("data") or {}).get("preference") or {}
+        mode = str(pref.get("chat_response_mode") or "executive").strip().lower()
+        return mode if mode in {"executive", "detailed"} else "executive"
 
     def _build_rag_context(self, context: dict) -> dict:
         table_result = self._call_mcp(
@@ -1255,7 +1298,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return [item for _, item in scored]
 
     @staticmethod
-    def _reply_nl_result(question_text: str, sql_text: str, query_data: dict, rag: dict) -> str:
+    def _reply_nl_result(question_text: str, sql_text: str, query_data: dict, rag: dict, response_mode: str) -> str:
         rows = query_data.get("rows") or []
         columns = query_data.get("columns") or []
         lines = []
@@ -1263,12 +1306,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lines.append(f"Encontrei {len(rows)} registro(s).")
         if rows and "total" in columns and isinstance(rows[0], dict) and "total" in rows[0]:
             lines.append(f"Total: {rows[0]['total']}")
-        if rows:
+        if rows and response_mode == "detailed":
             lines.append("Preview:")
             for idx, row in enumerate(rows[:5], start=1):
                 lines.append(f"{idx}. {json.dumps(row, ensure_ascii=True)}")
+        elif rows:
+            lines.append("Resumo executivo: dados encontrados e prontos para detalhamento.")
         tables = rag.get("tables") or []
-        if tables:
+        if tables and response_mode == "detailed":
             lines.append(f"Contexto RAG: {len(tables)} tabela(s) monitorada(s) analisadas.")
         return "\n".join(lines)
 

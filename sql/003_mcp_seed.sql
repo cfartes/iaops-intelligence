@@ -227,6 +227,22 @@ BEGIN
                 '{"type":"object","properties":{"mfa":{"type":"object"}}}'
             ),
             (
+                'pref.get_user_tenant',
+                'viewer',
+                'low',
+                5000,
+                '{"type":"object","properties":{}}',
+                '{"type":"object","properties":{"preference":{"type":"object"}}}'
+            ),
+            (
+                'pref.update_user_tenant',
+                'viewer',
+                'low',
+                5000,
+                '{"type":"object","properties":{"language_code":{"type":["string","null"]},"theme_code":{"type":["string","null"]},"chat_response_mode":{"type":["string","null"]}}}',
+                '{"type":"object","properties":{"preference":{"type":"object"}}}'
+            ),
+            (
                 'inventory.list_tenant_tables',
                 'viewer',
                 'low',

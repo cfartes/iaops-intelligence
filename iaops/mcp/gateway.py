@@ -54,6 +54,8 @@ class MCPGateway:
             "security.mfa.enable": self._handle_mfa_enable,
             "security.mfa.disable_self": self._handle_mfa_disable_self,
             "security.mfa.admin_reset": self._handle_mfa_admin_reset,
+            "pref.get_user_tenant": self._handle_pref_get_user_tenant,
+            "pref.update_user_tenant": self._handle_pref_update_user_tenant,
             "source.list_catalog": self._handle_source_list_catalog,
             "source.list_tenant": self._handle_source_list_tenant,
             "source.register": self._handle_source_register,
@@ -430,6 +432,36 @@ class MCPGateway:
             reset_by_user_id=context.user_id,
         )
         return {"mfa": result}
+
+    def _handle_pref_get_user_tenant(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        pref = self.repository.get_user_tenant_preference(context.tenant_id, context.user_id)
+        return {"preference": pref}
+
+    def _handle_pref_update_user_tenant(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        pref = self.repository.upsert_user_tenant_preference(
+            context.tenant_id,
+            context.user_id,
+            language_code=(str(tool_input.get("language_code")).strip() if tool_input.get("language_code") is not None else None),
+            theme_code=(str(tool_input.get("theme_code")).strip() if tool_input.get("theme_code") is not None else None),
+            chat_response_mode=(
+                str(tool_input.get("chat_response_mode")).strip().lower()
+                if tool_input.get("chat_response_mode") is not None
+                else None
+            ),
+        )
+        return {"preference": pref}
 
     def _handle_list_columns(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
         schema_name = str(tool_input.get("schema_name", ""))

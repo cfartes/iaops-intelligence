@@ -28,6 +28,8 @@ DEFAULT_TOOL_POLICIES = {
     "security.mfa.enable": ToolPolicy("security.mfa.enable", "viewer", True, None, 30, True, None),
     "security.mfa.disable_self": ToolPolicy("security.mfa.disable_self", "viewer", True, None, 30, True, None),
     "security.mfa.admin_reset": ToolPolicy("security.mfa.admin_reset", "admin", True, None, 60, True, None),
+    "pref.get_user_tenant": ToolPolicy("pref.get_user_tenant", "viewer", True, None, 120, True, None),
+    "pref.update_user_tenant": ToolPolicy("pref.update_user_tenant", "viewer", True, None, 60, True, None),
     "tenant_llm.get_config": ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
     "tenant_llm.update_config": ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
     "tenant_llm.list_providers": ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
@@ -500,6 +502,79 @@ class PostgresMCPRepository(MCPRepository):
             "enabled": False,
             "reset_at": row["last_reset_at"].isoformat(),
         }
+
+    def get_user_tenant_preference(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        sql = f"""
+            SELECT language_code, theme_code, chat_response_mode
+            FROM {self.schema}.user_tenant_preference
+            WHERE tenant_id = %(tenant_id)s
+              AND user_id = %(user_id)s
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id, "user_id": user_id})
+            row = cur.fetchone()
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "language_code": row["language_code"] if row else "pt-BR",
+            "theme_code": row["theme_code"] if row else "light",
+            "chat_response_mode": row["chat_response_mode"] if row else "executive",
+        }
+
+    def upsert_user_tenant_preference(
+        self,
+        tenant_id: int,
+        user_id: int,
+        *,
+        language_code: str | None = None,
+        theme_code: str | None = None,
+        chat_response_mode: str | None = None,
+    ) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        current = self.get_user_tenant_preference(tenant_id, user_id)
+        mode = str(chat_response_mode or current["chat_response_mode"]).strip().lower()
+        if mode not in {"executive", "detailed"}:
+            raise ValueError("chat_response_mode invalido")
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.user_tenant_preference (
+                tenant_id,
+                user_id,
+                language_code,
+                theme_code,
+                chat_response_mode,
+                created_at
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(user_id)s,
+                %(language_code)s,
+                %(theme_code)s,
+                %(chat_response_mode)s,
+                NOW()
+            )
+            ON CONFLICT (tenant_id, user_id)
+            DO UPDATE SET
+                language_code = EXCLUDED.language_code,
+                theme_code = EXCLUDED.theme_code,
+                chat_response_mode = EXCLUDED.chat_response_mode
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                upsert_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "language_code": str(language_code or current["language_code"]).strip() or "pt-BR",
+                    "theme_code": str(theme_code or current["theme_code"]).strip() or "light",
+                    "chat_response_mode": mode,
+                },
+            )
+            conn.commit()
+        return self.get_user_tenant_preference(tenant_id, user_id)
 
     def list_supported_llm_providers(self) -> list[dict[str, Any]]:
         return [
