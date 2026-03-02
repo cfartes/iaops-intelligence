@@ -26,6 +26,11 @@ class MCPGateway:
         "llm_admin.get_app_config",
         "llm_admin.update_app_config",
     }
+    _CHANNEL_TOOLS = {
+        "channel.list_user_tenants",
+        "channel.set_active_tenant",
+        "channel.get_active_tenant",
+    }
 
     def __init__(self, repository: MCPRepository) -> None:
         self.repository = repository
@@ -101,26 +106,29 @@ class MCPGateway:
             result = ToolExecutionResult("denied", {}, "tenant_blocked", "Tenant inativo, bloqueado ou inadimplente")
             return self._finalize_log(context, tool_name, payload, result, start)
 
-        policy = self.repository.get_tool_policy(context.tenant_id, tool_name)
-        if policy is None or not policy.is_enabled:
-            result = ToolExecutionResult("denied", {}, "tool_disabled", "Tool nao habilitada para o tenant")
-            return self._finalize_log(context, tool_name, payload, result, start)
+        max_rows: int | None = None
+        if tool_name not in self._CHANNEL_TOOLS:
+            policy = self.repository.get_tool_policy(context.tenant_id, tool_name)
+            if policy is None or not policy.is_enabled:
+                result = ToolExecutionResult("denied", {}, "tool_disabled", "Tool nao habilitada para o tenant")
+                return self._finalize_log(context, tool_name, payload, result, start)
+            max_rows = policy.max_rows
 
-        role = self.repository.get_user_role(context.tenant_id, context.user_id)
-        if role is None:
-            result = ToolExecutionResult("denied", {}, "user_not_scoped", "Usuario sem escopo no tenant")
-            return self._finalize_log(context, tool_name, payload, result, start)
+            role = self.repository.get_user_role(context.tenant_id, context.user_id)
+            if role is None:
+                result = ToolExecutionResult("denied", {}, "user_not_scoped", "Usuario sem escopo no tenant")
+                return self._finalize_log(context, tool_name, payload, result, start)
 
-        if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
-            result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
-            return self._finalize_log(context, tool_name, payload, result, start)
+            if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
+                result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
+                return self._finalize_log(context, tool_name, payload, result, start)
 
         if tool_name in self._SUPERADMIN_TOOLS and not self.repository.is_superadmin(context.user_id):
             result = ToolExecutionResult("denied", {}, "superadmin_required", "Acesso restrito a superadmin")
             return self._finalize_log(context, tool_name, payload, result, start)
 
         try:
-            data = self._handlers[tool_name](context, tool_input, policy.max_rows)
+            data = self._handlers[tool_name](context, tool_input, max_rows)
             result = ToolExecutionResult("success", data)
         except ValueError as exc:
             result = ToolExecutionResult("denied", {}, "invalid_input", str(exc))

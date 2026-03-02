@@ -14,6 +14,15 @@ async function parseResponse(response) {
   return data.data;
 }
 
+async function parseWebhookResponse(response) {
+  const data = await response.json();
+  if (!response.ok || data.ok !== true) {
+    const message = data?.error || data?.reply_text || "Falha no webhook de canal";
+    throw new Error(message);
+  }
+  return data;
+}
+
 export async function listTables(schemaName) {
   const query = schemaName ? `?schema_name=${encodeURIComponent(schemaName)}` : "";
   const response = await fetch(`/api/inventory/tables${query}`, {
@@ -387,4 +396,22 @@ export async function channelGetActiveTenant(payload) {
     body: JSON.stringify(payload),
   });
   return parseResponse(response);
+}
+
+export async function channelWebhookTelegram(payload) {
+  const response = await fetch("/api/channel/webhook/telegram", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseWebhookResponse(response);
+}
+
+export async function channelWebhookWhatsapp(payload) {
+  const response = await fetch("/api/channel/webhook/whatsapp", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseWebhookResponse(response);
 }

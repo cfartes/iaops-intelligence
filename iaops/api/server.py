@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -152,6 +153,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channel/tenant/active":
             self._handle_channel_get_active_tenant()
+            return
+        if parsed.path == "/api/channel/webhook/telegram":
+            self._handle_channel_webhook("telegram")
+            return
+        if parsed.path == "/api/channel/webhook/whatsapp":
+            self._handle_channel_webhook("whatsapp")
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -602,6 +609,209 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_channel_webhook(self, channel_type: str) -> None:
+        body = self._read_json_body()
+        external_user_key = str(
+            body.get("external_user_key")
+            or body.get("from")
+            or body.get("user_id")
+            or ""
+        ).strip()
+        conversation_key = str(
+            body.get("conversation_key")
+            or body.get("chat_id")
+            or external_user_key
+            or ""
+        ).strip()
+        message_text = str(body.get("text") or body.get("message") or "").strip()
+        if not external_user_key:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "external_user_key obrigatorio"},
+            )
+            return
+        if not conversation_key:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "conversation_key obrigatorio"},
+            )
+            return
+
+        context = self._request_context()
+        command = self._parse_channel_command(message_text)
+        response_data = self._execute_channel_command(
+            context=context,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+            conversation_key=conversation_key,
+            command=command,
+            message_text=message_text,
+        )
+        self._send_json(HTTPStatus.OK, response_data)
+
+    def _execute_channel_command(
+        self,
+        *,
+        context: dict,
+        channel_type: str,
+        external_user_key: str,
+        conversation_key: str,
+        command: dict,
+        message_text: str,
+    ) -> dict:
+        kind = command["kind"]
+        if kind == "tenant_list":
+            result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.list_user_tenants",
+                    "input": {
+                        "channel_type": channel_type,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            if result["status"] != "success":
+                return self._channel_error_response(result)
+            data = result["data"]
+            return {
+                "ok": True,
+                "command": "tenant_list",
+                "reply_text": self._reply_tenant_list(data),
+                "data": data,
+            }
+
+        if kind == "tenant_select":
+            result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.set_active_tenant",
+                    "input": {
+                        "channel_type": channel_type,
+                        "conversation_key": conversation_key,
+                        "external_user_key": external_user_key,
+                        "tenant_id": command["tenant_id"],
+                    },
+                }
+            )
+            if result["status"] != "success":
+                return self._channel_error_response(result)
+            active = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.get_active_tenant",
+                    "input": {
+                        "channel_type": channel_type,
+                        "conversation_key": conversation_key,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            active_data = active["data"] if active["status"] == "success" else {}
+            return {
+                "ok": True,
+                "command": "tenant_select",
+                "reply_text": self._reply_active_tenant(active_data),
+                "data": {
+                    "selection": result["data"].get("selection"),
+                    "active": active_data,
+                },
+            }
+
+        if kind == "tenant_active":
+            result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.get_active_tenant",
+                    "input": {
+                        "channel_type": channel_type,
+                        "conversation_key": conversation_key,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            if result["status"] != "success":
+                return self._channel_error_response(result)
+            return {
+                "ok": True,
+                "command": "tenant_active",
+                "reply_text": self._reply_active_tenant(result["data"]),
+                "data": result["data"],
+            }
+
+        return {
+            "ok": True,
+            "command": "help",
+            "reply_text": self._reply_help(message_text),
+            "data": {},
+        }
+
+    @staticmethod
+    def _parse_channel_command(message_text: str) -> dict:
+        normalized = " ".join(message_text.lower().strip().split())
+        if not normalized:
+            return {"kind": "help"}
+        if normalized in {"tenant", "/tenant", "tenant list", "/tenant list", "tenants"}:
+            return {"kind": "tenant_list"}
+        if normalized in {"tenant active", "/tenant active"}:
+            return {"kind": "tenant_active"}
+        selected = re.match(r"^/?tenant\s+select\s+(\d+)$", normalized)
+        if selected:
+            return {"kind": "tenant_select", "tenant_id": int(selected.group(1))}
+        return {"kind": "help"}
+
+    @staticmethod
+    def _channel_error_response(result: dict) -> dict:
+        message = (
+            result.get("error", {}).get("message")
+            or "Nao foi possivel processar o comando no canal."
+        )
+        return {
+            "ok": False,
+            "command": "error",
+            "reply_text": f"Erro: {message}",
+            "data": {"mcp": result},
+        }
+
+    @staticmethod
+    def _reply_tenant_list(data: dict) -> str:
+        tenants = data.get("tenants") or []
+        user = data.get("user") or {}
+        lines = []
+        lines.append(f"Usuario: {user.get('full_name') or user.get('email') or 'n/a'}")
+        lines.append("Tenants disponiveis:")
+        for item in tenants:
+            lines.append(
+                f"- {item.get('tenant_id')}: {item.get('name')} ({item.get('status')}, role={item.get('role')})"
+            )
+        lines.append("Use: tenant select <id>")
+        lines.append("Use: tenant active")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _reply_active_tenant(data: dict) -> str:
+        active_tenant_id = data.get("active_tenant_id")
+        tenants = data.get("tenants") or []
+        if active_tenant_id is None:
+            return "Nenhum tenant ativo para esta conversa. Use: tenant list"
+        selected = next(
+            (item for item in tenants if int(item.get("tenant_id", -1)) == int(active_tenant_id)),
+            None,
+        )
+        if not selected:
+            return f"Tenant ativo: {active_tenant_id}"
+        return f"Tenant ativo: {selected.get('tenant_id')} - {selected.get('name')} ({selected.get('status')})"
+
+    @staticmethod
+    def _reply_help(message_text: str) -> str:
+        prefix = f"Comando nao reconhecido: '{message_text}'.\n" if message_text else ""
+        return (
+            f"{prefix}Comandos disponiveis:\n"
+            "tenant list\n"
+            "tenant select <id>\n"
+            "tenant active"
+        )
+
     def _handle_security_sql_policy_update(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -639,7 +849,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         self._dispatch_mcp(payload)
 
     def _dispatch_mcp(self, payload: dict) -> None:
-        result = handle_request(payload)
+        result = self._call_mcp(payload)
         if result["status"] == "success":
             self._send_json(HTTPStatus.OK, result)
             return
@@ -647,6 +857,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, result)
             return
         self._send_json(HTTPStatus.BAD_REQUEST, result)
+
+    @staticmethod
+    def _call_mcp(payload: dict) -> dict:
+        return handle_request(payload)
 
     def _request_context(self) -> dict:
         return {

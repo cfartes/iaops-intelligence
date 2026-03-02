@@ -275,6 +275,29 @@ select {
   font-size: 15px;
 }
 
+.channel-tester {
+  margin-top: 18px;
+}
+
+.channel-tester .inline-form input {
+  min-width: 200px;
+}
+
+.webhook-output {
+  margin-top: 12px;
+}
+
+.webhook-output pre {
+  margin: 0;
+  white-space: pre-wrap;
+  background: #f4f8fc;
+  border: 1px solid #d8e4ee;
+  border-radius: 8px;
+  padding: 10px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
