@@ -1,8 +1,23 @@
 :root {
   font-family: "Manrope", "Segoe UI", sans-serif;
   color: #14202a;
-  background: radial-gradient(circle at top right, #f4f8ff 0%, #eef4eb 45%, #e8eeff 100%);
+  --app-bg: radial-gradient(circle at top right, #f4f8ff 0%, #eef4eb 45%, #e8eeff 100%);
+  --side-start: #0f2d46;
+  --side-end: #173e57;
+  --side-fg: #f6fbff;
+  --panel-bg: #ffffffc8;
+  --panel-border: #d6e3ee;
+  background: var(--app-bg);
   line-height: 1.4;
+}
+
+[data-theme="ocean"] {
+  --app-bg: radial-gradient(circle at top left, #eef8ff 0%, #dff0ff 35%, #eaf7f2 100%);
+  --side-start: #0c3a4f;
+  --side-end: #13626b;
+  --side-fg: #f5feff;
+  --panel-bg: #f8ffffcc;
+  --panel-border: #c5dfe9;
 }
 
 * {
@@ -30,8 +45,8 @@ select {
 }
 
 .side-menu {
-  background: linear-gradient(180deg, #0f2d46 0%, #173e57 100%);
-  color: #f6fbff;
+  background: linear-gradient(180deg, var(--side-start) 0%, var(--side-end) 100%);
+  color: var(--side-fg);
   padding: 24px 16px;
   position: sticky;
   top: 0;
@@ -57,7 +72,7 @@ select {
   border: 0;
   border-radius: 10px;
   background: transparent;
-  color: #f6fbff;
+  color: var(--side-fg);
   cursor: pointer;
 }
 
@@ -72,8 +87,8 @@ select {
 }
 
 .page-panel {
-  background: #ffffffc8;
-  border: 1px solid #d6e3ee;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
   border-radius: 16px;
   padding: 24px;
   backdrop-filter: blur(3px);

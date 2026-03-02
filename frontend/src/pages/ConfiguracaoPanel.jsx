@@ -17,7 +17,7 @@ import AppLlmConfigModal from "../components/AppLlmConfigModal";
 import MfaCodeModal from "../components/MfaCodeModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
 
-export default function ConfiguracaoPanel({ onSystemMessage }) {
+export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied }) {
   const [mfa, setMfa] = useState(null);
   const [loading, setLoading] = useState(false);
   const [setupInfo, setSetupInfo] = useState(null);
@@ -31,6 +31,8 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
   const [tenantLlmConfig, setTenantLlmConfig] = useState(null);
   const [tenantLlmModalOpen, setTenantLlmModalOpen] = useState(false);
   const [userPref, setUserPref] = useState(null);
+  const [languageDraft, setLanguageDraft] = useState("pt-BR");
+  const [themeDraft, setThemeDraft] = useState("light");
   const [chatResponseModeDraft, setChatResponseModeDraft] = useState("executive");
 
   const loadStatus = async () => {
@@ -78,6 +80,8 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
       const data = await getUserTenantPreference();
       const pref = data.preference || null;
       setUserPref(pref);
+      setLanguageDraft(pref?.language_code || "pt-BR");
+      setThemeDraft(pref?.theme_code || "light");
       setChatResponseModeDraft(pref?.chat_response_mode || "executive");
     } catch (error) {
       onSystemMessage("error", "Falha ao carregar preferencias", error.message);
@@ -155,12 +159,18 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
     }
   };
 
-  const saveChatResponseMode = async () => {
+  const saveUserPreference = async () => {
     setSubmitting(true);
     try {
-      const data = await updateUserTenantPreference({ chat_response_mode: chatResponseModeDraft });
-      setUserPref(data.preference || null);
-      onSystemMessage("success", "Preferencia salva", "Modo de resposta do Chat BI atualizado.");
+      const data = await updateUserTenantPreference({
+        language_code: languageDraft,
+        theme_code: themeDraft,
+        chat_response_mode: chatResponseModeDraft,
+      });
+      const pref = data.preference || null;
+      setUserPref(pref);
+      onPreferenceApplied?.(pref);
+      onSystemMessage("success", "Preferencias salvas", "Idioma, tema e modo de resposta foram atualizados.");
     } catch (error) {
       onSystemMessage("error", "Falha ao salvar preferencia", error.message);
     } finally {
@@ -219,16 +229,33 @@ export default function ConfiguracaoPanel({ onSystemMessage }) {
                 <th>Modo atual (Chat BI)</th>
                 <td>{userPref?.chat_response_mode || "-"}</td>
               </tr>
+              <tr>
+                <th>Idioma atual</th>
+                <td>{userPref?.language_code || "-"}</td>
+              </tr>
+              <tr>
+                <th>Tema atual</th>
+                <td>{userPref?.theme_code || "-"}</td>
+              </tr>
             </tbody>
           </table>
         </div>
         <div className="inline-form">
+          <select value={languageDraft} onChange={(event) => setLanguageDraft(event.target.value)}>
+            <option value="pt-BR">Portugues (Brasil)</option>
+            <option value="en-US">English (US)</option>
+            <option value="es-ES">Espanol</option>
+          </select>
+          <select value={themeDraft} onChange={(event) => setThemeDraft(event.target.value)}>
+            <option value="light">Light</option>
+            <option value="ocean">Ocean</option>
+          </select>
           <select value={chatResponseModeDraft} onChange={(event) => setChatResponseModeDraft(event.target.value)}>
             <option value="executive">Executiva</option>
             <option value="detailed">Detalhada</option>
           </select>
-          <button type="button" className="btn btn-primary" onClick={saveChatResponseMode} disabled={submitting}>
-            Salvar Modo
+          <button type="button" className="btn btn-primary" onClick={saveUserPreference} disabled={submitting}>
+            Salvar Preferencias
           </button>
           <button type="button" className="btn btn-secondary" onClick={loadUserPreference} disabled={submitting}>
             Atualizar Preferencia

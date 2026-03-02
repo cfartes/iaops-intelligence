@@ -17,7 +17,7 @@ import ChatBiPanel from "./pages/ChatBiPanel";
 import AccessPanel from "./pages/AccessPanel";
 import ConfiguracaoPanel from "./pages/ConfiguracaoPanel";
 import { NAV_ITEMS } from "./state/nav";
-import { createIncident, updateIncidentStatus } from "./api/mcpApi";
+import { createIncident, getUserTenantPreference, updateIncidentStatus } from "./api/mcpApi";
 
 const SUBTITLE_BY_PAGE = {
   onboarding: "Configure cliente, tenant e fonte de dados com fluxo guiado.",
@@ -38,6 +38,8 @@ const SUBTITLE_BY_PAGE = {
 
 export default function App() {
   const [activePage, setActivePage] = useState("onboarding");
+  const [userTheme, setUserTheme] = useState("light");
+  const [uiLanguage, setUiLanguage] = useState("pt-BR");
   const [isSetupAssistantOpen, setIsSetupAssistantOpen] = useState(false);
   const [isEntityModalOpen, setIsEntityModalOpen] = useState(false);
   const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
@@ -65,7 +67,27 @@ export default function App() {
     if (!dismissed) {
       setIsSetupAssistantOpen(true);
     }
+    loadUserPreference();
   }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("lang", uiLanguage || "pt-BR");
+  }, [uiLanguage]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = userTheme || "light";
+  }, [userTheme]);
+
+  const loadUserPreference = async () => {
+    try {
+      const data = await getUserTenantPreference();
+      const preference = data.preference || {};
+      setUiLanguage(preference.language_code || "pt-BR");
+      setUserTheme(preference.theme_code || "light");
+    } catch (error) {
+      openSystemMessage("warning", "Preferencias padrao", "Nao foi possivel carregar preferencias do usuario+tenant.");
+    }
+  };
 
   const dismissAssistant = () => {
     window.localStorage.setItem("iaops_setup_assistant_dismissed", "1");
@@ -150,7 +172,13 @@ export default function App() {
         ) : activePage === "acesso" ? (
           <AccessPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "configuracao" ? (
-          <ConfiguracaoPanel onSystemMessage={openSystemMessage} />
+          <ConfiguracaoPanel
+            onSystemMessage={openSystemMessage}
+            onPreferenceApplied={(preference) => {
+              setUiLanguage(preference?.language_code || "pt-BR");
+              setUserTheme(preference?.theme_code || "light");
+            }}
+          />
         ) : activePage === "incidentes" ? (
           <IncidentPanel
             onOpenCreate={() => setIsIncidentModalOpen(true)}
