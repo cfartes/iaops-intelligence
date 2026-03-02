@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import SideMenu from "./components/SideMenu";
 import EntityFormModal from "./components/EntityFormModal";
 import SystemMessageModal from "./components/SystemMessageModal";
 import IncidentFormModal from "./components/IncidentFormModal";
 import IncidentStatusModal from "./components/IncidentStatusModal";
+import SetupAssistantModal from "./components/SetupAssistantModal";
 import PagePanel from "./pages/PagePanel";
 import OnboardingPanel from "./pages/OnboardingPanel";
 import InventoryPanel from "./pages/InventoryPanel";
@@ -13,6 +14,8 @@ import OperationPanel from "./pages/OperationPanel";
 import AuditPanel from "./pages/AuditPanel";
 import SqlSecurityPanel from "./pages/SqlSecurityPanel";
 import ChatBiPanel from "./pages/ChatBiPanel";
+import AccessPanel from "./pages/AccessPanel";
+import ConfiguracaoPanel from "./pages/ConfiguracaoPanel";
 import { NAV_ITEMS } from "./state/nav";
 import { createIncident, updateIncidentStatus } from "./api/mcpApi";
 
@@ -35,6 +38,7 @@ const SUBTITLE_BY_PAGE = {
 
 export default function App() {
   const [activePage, setActivePage] = useState("onboarding");
+  const [isSetupAssistantOpen, setIsSetupAssistantOpen] = useState(false);
   const [isEntityModalOpen, setIsEntityModalOpen] = useState(false);
   const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
   const [isIncidentStatusModalOpen, setIsIncidentStatusModalOpen] = useState(false);
@@ -54,6 +58,18 @@ export default function App() {
 
   const openSystemMessage = (tone, title, message) => {
     setMessageModal({ open: true, tone, title, message });
+  };
+
+  useEffect(() => {
+    const dismissed = window.localStorage.getItem("iaops_setup_assistant_dismissed");
+    if (!dismissed) {
+      setIsSetupAssistantOpen(true);
+    }
+  }, []);
+
+  const dismissAssistant = () => {
+    window.localStorage.setItem("iaops_setup_assistant_dismissed", "1");
+    setIsSetupAssistantOpen(false);
   };
 
   const handleEntityFormSubmit = (payload) => {
@@ -111,6 +127,12 @@ export default function App() {
       <SideMenu items={NAV_ITEMS} activeKey={activePage} onSelect={setActivePage} />
 
       <main className="content-area">
+        <div className="page-actions">
+          <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSetupAssistantOpen(true)}>
+            Assistente Inicial
+          </button>
+        </div>
+
         {activePage === "onboarding" ? (
           <OnboardingPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "inventario" ? (
@@ -125,6 +147,10 @@ export default function App() {
           <AuditPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "seguranca-sql" ? (
           <SqlSecurityPanel onSystemMessage={openSystemMessage} />
+        ) : activePage === "acesso" ? (
+          <AccessPanel onSystemMessage={openSystemMessage} />
+        ) : activePage === "configuracao" ? (
+          <ConfiguracaoPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "incidentes" ? (
           <IncidentPanel
             onOpenCreate={() => setIsIncidentModalOpen(true)}
@@ -178,6 +204,16 @@ export default function App() {
       <SystemMessageModal
         state={messageModal}
         onClose={() => setMessageModal((prev) => ({ ...prev, open: false }))}
+      />
+
+      <SetupAssistantModal
+        open={isSetupAssistantOpen}
+        onClose={() => setIsSetupAssistantOpen(false)}
+        onSkipAll={dismissAssistant}
+        onGoToStep={(pageKey) => {
+          setActivePage(pageKey);
+          setIsSetupAssistantOpen(false);
+        }}
       />
     </div>
   );

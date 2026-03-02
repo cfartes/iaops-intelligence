@@ -11,6 +11,9 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - [DDL inicial PostgreSQL](sql/001_initial_governance_schema.sql)
 - [DDL base MCP](sql/002_mcp_foundation.sql)
 - [Catalogo de fontes](sql/005_data_source_catalog.sql)
+- [MFA por usuario (TOTP)](sql/006_user_mfa.sql)
+- [Flag de superadmin](sql/007_superadmin_user.sql)
+- [Contexto de tenant por canal](sql/008_channel_tenant_context.sql)
 - [Seed MCP baseline](sql/003_mcp_seed.sql)
 - [Dados demo locais](sql/004_demo_data.sql)
 - [Bootstrap dev unico](sql/000_bootstrap_dev.sql)
@@ -38,6 +41,25 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - Repositorio PostgreSQL: `iaops/mcp/postgres_repository.py`
 
 ### Tools stub publicadas
+- `access.list_users`
+- `security.mfa.get_status`
+- `security.mfa.begin_setup`
+- `security.mfa.enable`
+- `security.mfa.disable_self`
+- `security.mfa.admin_reset`
+- `tenant.list_client`
+- `tenant.get_limits`
+- `tenant.create`
+- `tenant.update_status`
+- `tenant_llm.list_providers`
+- `tenant_llm.get_config`
+- `tenant_llm.update_config`
+- `llm_admin.list_providers`
+- `llm_admin.get_app_config`
+- `llm_admin.update_app_config`
+- `channel.list_user_tenants`
+- `channel.set_active_tenant`
+- `channel.get_active_tenant`
 - `source.list_catalog`
 - `source.list_tenant`
 - `source.register`
@@ -49,6 +71,9 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - `inventory.list_tenant_tables`
 - `inventory.register_table`
 - `inventory.delete_table`
+- `inventory.list_table_columns`
+- `inventory.register_column`
+- `inventory.delete_column`
 - `query.execute_safe_sql`
 - `security_sql.get_policy`
 - `security_sql.update_policy`
@@ -87,11 +112,24 @@ Ou aplicar scripts SQL manualmente:
 \i sql/001_initial_governance_schema.sql
 \i sql/002_mcp_foundation.sql
 \i sql/005_data_source_catalog.sql
+\i sql/006_user_mfa.sql
+\i sql/007_superadmin_user.sql
+\i sql/008_channel_tenant_context.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql
 ```
 
 Se voce ja havia rodado o seed antes, execute novamente `003_mcp_seed.sql` para incluir as tools novas (catalogo, auditoria, seguranca SQL e afins).
+
+Para criptografia de segredos (incluindo MFA) em producao:
+```powershell
+$env:IAOPS_CRYPTO_KEY="<fernet_key_urlsafe_base64>"
+```
+
+Preco por 1k token ao usar LLM padrao do app (fallback):
+```powershell
+$env:IAOPS_APP_LLM_PRICE_PER_1K_CENTS="50"
+```
 
 Backend API (porta 8000):
 ```powershell

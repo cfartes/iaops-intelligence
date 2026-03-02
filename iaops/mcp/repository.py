@@ -4,6 +4,8 @@ import datetime as dt
 from abc import ABC, abstractmethod
 from typing import Any
 
+from iaops.security.totp import generate_base32_secret, provisioning_uri, verify_totp
+
 from .models import ToolPolicy
 
 
@@ -14,6 +16,131 @@ class MCPRepository(ABC):
 
     @abstractmethod
     def get_user_role(self, tenant_id: int, user_id: int) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def is_superadmin(self, user_id: int) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_client_tenants(self, client_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_tenant(self, client_id: int, *, name: str, slug: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_tenant_status(self, client_id: int, tenant_id: int, status: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_tenant_users(self, tenant_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_user_mfa_status(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def begin_user_mfa_setup(self, tenant_id: int, user_id: int, issuer: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def enable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def disable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def admin_reset_user_mfa(self, tenant_id: int, target_user_id: int, reset_by_user_id: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_tenant_llm_config(self, client_id: int, tenant_id: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_tenant_llm_config(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        use_app_default_llm: bool,
+        provider_name: str | None,
+        model_code: str | None,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_supported_llm_providers(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_app_default_llm_config(self) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_app_default_llm_config(
+        self,
+        *,
+        provider_name: str,
+        model_code: str,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve_channel_user_tenants(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+        tenant_id: int,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def track_app_llm_usage(
+        self,
+        *,
+        tenant_id: int,
+        feature_code: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> dict[str, Any] | None:
         raise NotImplementedError
 
     @abstractmethod
@@ -107,6 +234,35 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_monitored_columns_by_table(
+        self,
+        tenant_id: int,
+        monitored_table_id: int,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_monitored_column(
+        self,
+        tenant_id: int,
+        *,
+        monitored_table_id: int,
+        column_name: str,
+        data_type: str | None = None,
+        classification: str | None = None,
+        description_text: str | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_monitored_column(
+        self,
+        tenant_id: int,
+        monitored_column_id: int,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
     def execute_safe_sql(self, tenant_id: int, sql_text: str, max_rows: int | None) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -188,12 +344,41 @@ class InMemoryMCPRepository(MCPRepository):
     def __init__(self) -> None:
         self._tenant_state = {(1, 10): True}
         self._roles = {(10, 100): "owner", (10, 101): "admin", (10, 102): "viewer"}
+        self._client_tenants: dict[int, list[dict[str, Any]]] = {
+            1: [
+                {"id": 10, "client_id": 1, "name": "Tenant Demo", "slug": "tenant-demo", "status": "active"},
+            ]
+        }
+        self._client_plan_limits = {1: {"max_tenants": 5}}
+        self._tenant_seq = 11
         self._tool_policies = {
+            (10, "tenant.list_client"): ToolPolicy("tenant.list_client", "viewer", True, 1000, 120, True, None),
+            (10, "tenant.get_limits"): ToolPolicy("tenant.get_limits", "viewer", True, None, 120, True, None),
+            (10, "tenant.create"): ToolPolicy("tenant.create", "owner", True, None, 60, True, None),
+            (10, "tenant.update_status"): ToolPolicy("tenant.update_status", "owner", True, None, 120, True, None),
             (10, "inventory.list_tables"): ToolPolicy("inventory.list_tables", "viewer", True, 1000, 120, True, None),
             (10, "inventory.list_columns"): ToolPolicy("inventory.list_columns", "viewer", True, 1000, 120, True, None),
+            (10, "access.list_users"): ToolPolicy("access.list_users", "admin", True, 1000, 120, True, None),
+            (10, "security.mfa.get_status"): ToolPolicy("security.mfa.get_status", "viewer", True, None, 120, True, None),
+            (10, "security.mfa.begin_setup"): ToolPolicy("security.mfa.begin_setup", "viewer", True, None, 30, True, None),
+            (10, "security.mfa.enable"): ToolPolicy("security.mfa.enable", "viewer", True, None, 30, True, None),
+            (10, "security.mfa.disable_self"): ToolPolicy("security.mfa.disable_self", "viewer", True, None, 30, True, None),
+            (10, "security.mfa.admin_reset"): ToolPolicy("security.mfa.admin_reset", "admin", True, None, 60, True, None),
+            (10, "tenant_llm.get_config"): ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
+            (10, "tenant_llm.update_config"): ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
+            (10, "tenant_llm.list_providers"): ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
+            (10, "llm_admin.list_providers"): ToolPolicy("llm_admin.list_providers", "owner", True, 200, 120, True, None),
+            (10, "llm_admin.get_app_config"): ToolPolicy("llm_admin.get_app_config", "owner", True, None, 120, True, None),
+            (10, "llm_admin.update_app_config"): ToolPolicy("llm_admin.update_app_config", "owner", True, None, 60, True, None),
+            (10, "channel.list_user_tenants"): ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
+            (10, "channel.set_active_tenant"): ToolPolicy("channel.set_active_tenant", "viewer", True, None, 120, True, None),
+            (10, "channel.get_active_tenant"): ToolPolicy("channel.get_active_tenant", "viewer", True, None, 120, True, None),
             (10, "inventory.list_tenant_tables"): ToolPolicy("inventory.list_tenant_tables", "viewer", True, 1000, 120, True, None),
             (10, "inventory.register_table"): ToolPolicy("inventory.register_table", "admin", True, None, 120, True, None),
             (10, "inventory.delete_table"): ToolPolicy("inventory.delete_table", "admin", True, None, 120, True, None),
+            (10, "inventory.list_table_columns"): ToolPolicy("inventory.list_table_columns", "viewer", True, 1000, 120, True, None),
+            (10, "inventory.register_column"): ToolPolicy("inventory.register_column", "admin", True, None, 120, True, None),
+            (10, "inventory.delete_column"): ToolPolicy("inventory.delete_column", "admin", True, None, 120, True, None),
             (10, "source.list_catalog"): ToolPolicy("source.list_catalog", "viewer", True, 1000, 120, True, None),
             (10, "source.list_tenant"): ToolPolicy("source.list_tenant", "viewer", True, 1000, 120, True, None),
             (10, "source.register"): ToolPolicy("source.register", "admin", True, None, 60, True, None),
@@ -239,16 +424,36 @@ class InMemoryMCPRepository(MCPRepository):
         self._data_source_seq = 1002
         self._columns = {
             (10, "public", "orders"): [
-                {"column_name": "id", "data_type": "bigint", "classification": "identifier", "description_text": "PK"},
                 {
+                    "id": 7001,
+                    "monitored_table_id": 501,
+                    "column_name": "id",
+                    "data_type": "bigint",
+                    "classification": "identifier",
+                    "description_text": "PK",
+                },
+                {
+                    "id": 7002,
+                    "monitored_table_id": 501,
                     "column_name": "customer_cpf",
                     "data_type": "text",
                     "classification": "sensitive",
                     "description_text": "Documento do titular",
                 },
-                {"column_name": "total_amount", "data_type": "numeric", "classification": "financial", "description_text": "Valor"},
+                {
+                    "id": 7003,
+                    "monitored_table_id": 501,
+                    "column_name": "total_amount",
+                    "data_type": "numeric",
+                    "classification": "financial",
+                    "description_text": "Valor",
+                },
             ]
         }
+        self._columns_by_table: dict[tuple[int, int], list[dict[str, Any]]] = {
+            (10, 501): [*self._columns[(10, "public", "orders")]],
+        }
+        self._monitored_column_seq = 7004
         self._incident_seq = 1
         self._incidents: list[dict[str, Any]] = []
         self._events = [
@@ -272,12 +477,382 @@ class InMemoryMCPRepository(MCPRepository):
             },
         ]
         self._call_logs: list[dict[str, Any]] = []
+        self._users = {
+            100: {"id": 100, "email": "owner@iaops.demo", "full_name": "Owner Demo", "is_active": True, "is_superadmin": True},
+            101: {"id": 101, "email": "admin@iaops.demo", "full_name": "Admin Demo", "is_active": True},
+            102: {"id": 102, "email": "viewer@iaops.demo", "full_name": "Viewer Demo", "is_active": True},
+        }
+        self._mfa_config: dict[int, dict[str, Any]] = {}
+        self._mfa_pending: dict[int, dict[str, Any]] = {}
+        self._supported_llm_providers = [
+            {"code": "openai", "name": "OpenAI"},
+            {"code": "azure_openai", "name": "Azure OpenAI"},
+            {"code": "anthropic", "name": "Anthropic"},
+            {"code": "google_gemini", "name": "Google Gemini"},
+            {"code": "mistral", "name": "Mistral"},
+            {"code": "groq", "name": "Groq"},
+            {"code": "ollama", "name": "Ollama (Local)"},
+        ]
+        self._app_llm_config: dict[str, Any] | None = {
+            "provider_name": "openai",
+            "model_code": "gpt-4.1-mini",
+            "endpoint_url": "https://api.openai.com/v1",
+            "secret_ref": "secret://app/llm/openai",
+            "is_global_default": True,
+        }
+        self._tenant_llm_cfg: dict[int, dict[str, Any]] = {
+            10: {
+                "use_app_default_llm": False,
+                "billing_mode": "tenant_provider",
+                "provider_name": "openai",
+                "model_code": "gpt-4.1-mini",
+                "endpoint_url": "https://api.openai.com/v1",
+                "secret_ref": "secret://tenant-10/llm/openai",
+            }
+        }
+        self._channel_bindings = {
+            ("telegram", "tg-owner-demo"): {"client_id": 1, "user_id": 100},
+            ("whatsapp", "wa-owner-demo"): {"client_id": 1, "user_id": 100},
+        }
+        self._channel_context: dict[tuple[str, str], dict[str, Any]] = {}
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         return self._tenant_state.get((client_id, tenant_id), False)
 
     def get_user_role(self, tenant_id: int, user_id: int) -> str | None:
         return self._roles.get((tenant_id, user_id))
+
+    def is_superadmin(self, user_id: int) -> bool:
+        user = self._users.get(user_id) or {}
+        return bool(user.get("is_superadmin", False))
+
+    def list_client_tenants(self, client_id: int) -> list[dict[str, Any]]:
+        rows = self._client_tenants.get(client_id, [])
+        return sorted(rows, key=lambda item: item["id"])
+
+    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
+        rows = self._client_tenants.get(client_id, [])
+        active_count = sum(1 for item in rows if item["status"] == "active")
+        max_tenants = int(self._client_plan_limits.get(client_id, {}).get("max_tenants", 1))
+        return {
+            "active_tenants": active_count,
+            "max_tenants": max_tenants,
+            "can_create": active_count < max_tenants,
+        }
+
+    def create_tenant(self, client_id: int, *, name: str, slug: str) -> dict[str, Any]:
+        limits = self.get_client_tenant_limits(client_id)
+        if not limits["can_create"]:
+            raise ValueError("limite de tenants ativos do plano foi atingido")
+        rows = self._client_tenants.setdefault(client_id, [])
+        if any(item["slug"] == slug for item in rows):
+            raise ValueError("slug ja utilizado para este cliente")
+        tenant = {
+            "id": self._tenant_seq,
+            "client_id": client_id,
+            "name": name,
+            "slug": slug,
+            "status": "active",
+        }
+        self._tenant_seq += 1
+        rows.append(tenant)
+        return tenant
+
+    def update_tenant_status(self, client_id: int, tenant_id: int, status: str) -> dict[str, Any]:
+        if status not in {"active", "disabled"}:
+            raise ValueError("status invalido")
+        rows = self._client_tenants.get(client_id, [])
+        for item in rows:
+            if int(item["id"]) == int(tenant_id):
+                if status == "active":
+                    limits = self.get_client_tenant_limits(client_id)
+                    currently_active = item["status"] == "active"
+                    if not currently_active and not limits["can_create"]:
+                        raise ValueError("limite de tenants ativos do plano foi atingido")
+                item["status"] = status
+                self._tenant_state[(client_id, int(tenant_id))] = status == "active"
+                return item
+        raise ValueError("tenant nao encontrado")
+
+    def list_tenant_users(self, tenant_id: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for (row_tenant_id, user_id), role in self._roles.items():
+            if row_tenant_id != tenant_id:
+                continue
+            user = self._users.get(user_id)
+            if not user:
+                continue
+            mfa = self._mfa_config.get(user_id) or {}
+            rows.append(
+                {
+                    "user_id": user["id"],
+                    "email": user["email"],
+                    "full_name": user["full_name"],
+                    "role": role,
+                    "is_active": user["is_active"],
+                    "mfa_enabled": bool(mfa.get("is_enabled", False)),
+                }
+            )
+        return sorted(rows, key=lambda item: (item["role"], item["email"]))
+
+    def get_user_mfa_status(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        cfg = self._mfa_config.get(user_id) or {}
+        pending = self._mfa_pending.get(user_id)
+        return {
+            "enabled": bool(cfg.get("is_enabled", False)),
+            "enabled_at": cfg.get("enabled_at"),
+            "has_pending_setup": pending is not None,
+            "pending_expires_at": pending.get("expires_at") if pending else None,
+        }
+
+    def begin_user_mfa_setup(self, tenant_id: int, user_id: int, issuer: str) -> dict[str, Any]:
+        role = self.get_user_role(tenant_id, user_id)
+        if role is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        user = self._users.get(user_id)
+        if not user:
+            raise ValueError("usuario nao encontrado")
+        secret = generate_base32_secret()
+        expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)).isoformat()
+        self._mfa_pending[user_id] = {"secret": secret, "expires_at": expires_at}
+        return {
+            "secret": secret,
+            "provisioning_uri": provisioning_uri(issuer=issuer, account_name=user["email"], secret=secret),
+            "expires_at": expires_at,
+        }
+
+    def enable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        pending = self._mfa_pending.get(user_id)
+        if not pending:
+            raise ValueError("setup MFA nao iniciado")
+        expires_at = dt.datetime.fromisoformat(str(pending["expires_at"]))
+        now = dt.datetime.now(dt.timezone.utc)
+        if expires_at < now:
+            self._mfa_pending.pop(user_id, None)
+            raise ValueError("setup MFA expirado")
+        if not verify_totp(str(pending["secret"]), otp_code):
+            raise ValueError("codigo TOTP invalido")
+        enabled_at = now.isoformat()
+        self._mfa_config[user_id] = {
+            "is_enabled": True,
+            "secret": pending["secret"],
+            "enabled_at": enabled_at,
+        }
+        self._mfa_pending.pop(user_id, None)
+        return {
+            "enabled": True,
+            "enabled_at": enabled_at,
+        }
+
+    def disable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, user_id) is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        config = self._mfa_config.get(user_id)
+        if not config or not config.get("is_enabled"):
+            raise ValueError("MFA nao esta habilitado")
+        if not verify_totp(str(config.get("secret", "")), otp_code):
+            raise ValueError("codigo TOTP invalido")
+        disabled_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._mfa_config[user_id] = {
+            "is_enabled": False,
+            "secret": None,
+            "enabled_at": None,
+            "disabled_at": disabled_at,
+        }
+        self._mfa_pending.pop(user_id, None)
+        return {"enabled": False, "disabled_at": disabled_at}
+
+    def admin_reset_user_mfa(self, tenant_id: int, target_user_id: int, reset_by_user_id: int) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, target_user_id) is None:
+            raise ValueError("usuario alvo fora do escopo do tenant")
+        if self.get_user_role(tenant_id, reset_by_user_id) is None:
+            raise ValueError("usuario executor fora do escopo do tenant")
+        reset_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._mfa_config[target_user_id] = {
+            "is_enabled": False,
+            "secret": None,
+            "enabled_at": None,
+            "disabled_at": reset_at,
+            "reset_by_user_id": reset_by_user_id,
+        }
+        self._mfa_pending.pop(target_user_id, None)
+        return {"target_user_id": target_user_id, "enabled": False, "reset_at": reset_at}
+
+    def list_supported_llm_providers(self) -> list[dict[str, Any]]:
+        return [*self._supported_llm_providers]
+
+    def get_app_default_llm_config(self) -> dict[str, Any] | None:
+        return dict(self._app_llm_config) if self._app_llm_config else None
+
+    def upsert_app_default_llm_config(
+        self,
+        *,
+        provider_name: str,
+        model_code: str,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        self._app_llm_config = {
+            "provider_name": provider_name,
+            "model_code": model_code,
+            "endpoint_url": endpoint_url,
+            "secret_ref": secret_ref,
+            "is_global_default": True,
+        }
+        return dict(self._app_llm_config)
+
+    def get_tenant_llm_config(self, client_id: int, tenant_id: int) -> dict[str, Any]:
+        cfg = self._tenant_llm_cfg.get(tenant_id)
+        if cfg:
+            return dict(cfg)
+        return {
+            "use_app_default_llm": True,
+            "billing_mode": "app_default_token",
+            "provider_name": self._app_llm_config.get("provider_name") if self._app_llm_config else None,
+            "model_code": self._app_llm_config.get("model_code") if self._app_llm_config else None,
+            "endpoint_url": self._app_llm_config.get("endpoint_url") if self._app_llm_config else None,
+            "secret_ref": self._app_llm_config.get("secret_ref") if self._app_llm_config else None,
+        }
+
+    def update_tenant_llm_config(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        use_app_default_llm: bool,
+        provider_name: str | None,
+        model_code: str | None,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        _ = client_id
+        if use_app_default_llm:
+            self._tenant_llm_cfg[tenant_id] = {
+                "use_app_default_llm": True,
+                "billing_mode": "app_default_token",
+                "provider_name": self._app_llm_config.get("provider_name") if self._app_llm_config else None,
+                "model_code": self._app_llm_config.get("model_code") if self._app_llm_config else None,
+                "endpoint_url": self._app_llm_config.get("endpoint_url") if self._app_llm_config else None,
+                "secret_ref": self._app_llm_config.get("secret_ref") if self._app_llm_config else None,
+            }
+            return dict(self._tenant_llm_cfg[tenant_id])
+        if not provider_name or not model_code:
+            raise ValueError("provider_name e model_code sao obrigatorios")
+        self._tenant_llm_cfg[tenant_id] = {
+            "use_app_default_llm": False,
+            "billing_mode": "tenant_provider",
+            "provider_name": provider_name,
+            "model_code": model_code,
+            "endpoint_url": endpoint_url,
+            "secret_ref": secret_ref,
+        }
+        return dict(self._tenant_llm_cfg[tenant_id])
+
+    def resolve_channel_user_tenants(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        binding = self._channel_bindings.get((channel_type, external_user_key))
+        if not binding or int(binding["client_id"]) != int(client_id):
+            raise ValueError("identidade do canal nao vinculada a usuario")
+        user_id = int(binding["user_id"])
+        user = self._users.get(user_id)
+        if not user:
+            raise ValueError("usuario nao encontrado")
+        tenants = []
+        for item in self._client_tenants.get(client_id, []):
+            role = self._roles.get((int(item["id"]), user_id))
+            if role:
+                tenants.append(
+                    {
+                        "tenant_id": item["id"],
+                        "name": item["name"],
+                        "slug": item["slug"],
+                        "status": item["status"],
+                        "role": role,
+                    }
+                )
+        if not tenants:
+            raise ValueError("usuario sem tenants vinculados")
+        return {
+            "user": {"user_id": user["id"], "email": user["email"], "full_name": user["full_name"]},
+            "tenants": tenants,
+        }
+
+    def set_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+        tenant_id: int,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_channel_user_tenants(
+            client_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+        )
+        allowed = [int(item["tenant_id"]) for item in resolved["tenants"]]
+        if int(tenant_id) not in allowed:
+            raise ValueError("tenant nao permitido para este usuario/canal")
+        self._channel_context[(channel_type, conversation_key)] = {
+            "client_id": client_id,
+            "user_id": resolved["user"]["user_id"],
+            "active_tenant_id": int(tenant_id),
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        return {
+            "active_tenant_id": int(tenant_id),
+            "conversation_key": conversation_key,
+        }
+
+    def get_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_channel_user_tenants(
+            client_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+        )
+        context = self._channel_context.get((channel_type, conversation_key))
+        return {
+            "active_tenant_id": context.get("active_tenant_id") if context else None,
+            "conversation_key": conversation_key,
+            "tenants": resolved["tenants"],
+            "user": resolved["user"],
+        }
+
+    def track_app_llm_usage(
+        self,
+        *,
+        tenant_id: int,
+        feature_code: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> dict[str, Any] | None:
+        cfg = self._tenant_llm_cfg.get(tenant_id)
+        if not cfg or not cfg.get("use_app_default_llm"):
+            return None
+        return {
+            "tenant_id": tenant_id,
+            "feature_code": feature_code,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "billing_mode": "app_default_token",
+        }
 
     def get_tool_policy(self, tenant_id: int, tool_name: str) -> ToolPolicy | None:
         return self._tool_policies.get((tenant_id, tool_name))
@@ -491,6 +1066,64 @@ class InMemoryMCPRepository(MCPRepository):
 
     def list_monitored_columns(self, tenant_id: int, schema_name: str, table_name: str) -> list[dict[str, Any]]:
         return self._columns.get((tenant_id, schema_name, table_name), [])
+
+    def list_monitored_columns_by_table(
+        self,
+        tenant_id: int,
+        monitored_table_id: int,
+    ) -> list[dict[str, Any]]:
+        rows = self._columns_by_table.get((tenant_id, monitored_table_id), [])
+        return sorted(rows, key=lambda item: item["column_name"])
+
+    def create_monitored_column(
+        self,
+        tenant_id: int,
+        *,
+        monitored_table_id: int,
+        column_name: str,
+        data_type: str | None = None,
+        classification: str | None = None,
+        description_text: str | None = None,
+    ) -> dict[str, Any]:
+        tables = self._tables.get(tenant_id, [])
+        table_exists = any(int(item["id"]) == int(monitored_table_id) for item in tables)
+        if not table_exists:
+            raise ValueError("monitored_table_id nao encontrado para o tenant")
+        rows = self._columns_by_table.setdefault((tenant_id, monitored_table_id), [])
+        duplicated = any(item["column_name"] == column_name for item in rows)
+        if duplicated:
+            raise ValueError("coluna ja cadastrada para a tabela")
+        row = {
+            "id": self._monitored_column_seq,
+            "monitored_table_id": int(monitored_table_id),
+            "column_name": column_name,
+            "data_type": data_type,
+            "classification": classification,
+            "description_text": description_text,
+        }
+        self._monitored_column_seq += 1
+        rows.append(row)
+        return row
+
+    def delete_monitored_column(
+        self,
+        tenant_id: int,
+        monitored_column_id: int,
+    ) -> dict[str, Any]:
+        for key, rows in self._columns_by_table.items():
+            key_tenant_id, monitored_table_id = key
+            if int(key_tenant_id) != int(tenant_id):
+                continue
+            for idx, row in enumerate(rows):
+                if int(row["id"]) == int(monitored_column_id):
+                    removed = rows.pop(idx)
+                    return {
+                        "deleted": True,
+                        "id": removed["id"],
+                        "monitored_table_id": monitored_table_id,
+                        "column_name": removed["column_name"],
+                    }
+        raise ValueError("coluna monitorada nao encontrada")
 
     def execute_safe_sql(self, tenant_id: int, sql_text: str, max_rows: int | None) -> dict[str, Any]:
         _ = tenant_id, sql_text

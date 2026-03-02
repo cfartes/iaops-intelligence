@@ -1,21 +1,48 @@
 from __future__ import annotations
 
+import datetime as dt
+import os
 from typing import Any
 
 from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from iaops.security.crypto import decrypt_text, encrypt_text
+from iaops.security.totp import generate_base32_secret, provisioning_uri, verify_totp
+
 from .models import ToolPolicy
 from .repository import MCPRepository
 
 
 DEFAULT_TOOL_POLICIES = {
+    "tenant.list_client": ToolPolicy("tenant.list_client", "viewer", True, 1000, 120, True, None),
+    "tenant.get_limits": ToolPolicy("tenant.get_limits", "viewer", True, None, 120, True, None),
+    "tenant.create": ToolPolicy("tenant.create", "owner", True, None, 60, True, None),
+    "tenant.update_status": ToolPolicy("tenant.update_status", "owner", True, None, 120, True, None),
     "inventory.list_tables": ToolPolicy("inventory.list_tables", "viewer", True, 1000, 120, True, None),
     "inventory.list_columns": ToolPolicy("inventory.list_columns", "viewer", True, 1000, 120, True, None),
+    "access.list_users": ToolPolicy("access.list_users", "admin", True, 1000, 120, True, None),
+    "security.mfa.get_status": ToolPolicy("security.mfa.get_status", "viewer", True, None, 120, True, None),
+    "security.mfa.begin_setup": ToolPolicy("security.mfa.begin_setup", "viewer", True, None, 30, True, None),
+    "security.mfa.enable": ToolPolicy("security.mfa.enable", "viewer", True, None, 30, True, None),
+    "security.mfa.disable_self": ToolPolicy("security.mfa.disable_self", "viewer", True, None, 30, True, None),
+    "security.mfa.admin_reset": ToolPolicy("security.mfa.admin_reset", "admin", True, None, 60, True, None),
+    "tenant_llm.get_config": ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
+    "tenant_llm.update_config": ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
+    "tenant_llm.list_providers": ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
+    "llm_admin.list_providers": ToolPolicy("llm_admin.list_providers", "owner", True, 200, 120, True, None),
+    "llm_admin.get_app_config": ToolPolicy("llm_admin.get_app_config", "owner", True, None, 120, True, None),
+    "llm_admin.update_app_config": ToolPolicy("llm_admin.update_app_config", "owner", True, None, 60, True, None),
+    "channel.list_user_tenants": ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
+    "channel.set_active_tenant": ToolPolicy("channel.set_active_tenant", "viewer", True, None, 120, True, None),
+    "channel.get_active_tenant": ToolPolicy("channel.get_active_tenant", "viewer", True, None, 120, True, None),
     "inventory.list_tenant_tables": ToolPolicy("inventory.list_tenant_tables", "viewer", True, 1000, 120, True, None),
     "inventory.register_table": ToolPolicy("inventory.register_table", "admin", True, None, 120, True, None),
     "inventory.delete_table": ToolPolicy("inventory.delete_table", "admin", True, None, 120, True, None),
+    "inventory.list_table_columns": ToolPolicy("inventory.list_table_columns", "viewer", True, 1000, 120, True, None),
+    "inventory.register_column": ToolPolicy("inventory.register_column", "admin", True, None, 120, True, None),
+    "inventory.delete_column": ToolPolicy("inventory.delete_column", "admin", True, None, 120, True, None),
     "source.list_catalog": ToolPolicy("source.list_catalog", "viewer", True, 1000, 120, True, None),
     "source.list_tenant": ToolPolicy("source.list_tenant", "viewer", True, 1000, 120, True, None),
     "source.register": ToolPolicy("source.register", "admin", True, None, 60, True, None),
@@ -83,6 +110,841 @@ class PostgresMCPRepository(MCPRepository):
             cur.execute(sql, {"tenant_id": tenant_id, "user_id": user_id})
             row = cur.fetchone()
         return row["role"] if row else None
+
+    def is_superadmin(self, user_id: int) -> bool:
+        sql = f"""
+            SELECT COALESCE(is_superadmin, FALSE) AS is_superadmin
+            FROM {self.schema}.app_user
+            WHERE id = %(user_id)s
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"user_id": user_id})
+            row = cur.fetchone()
+        return bool(row and row["is_superadmin"])
+
+    def list_client_tenants(self, client_id: int) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT id, client_id, name, slug, status, created_at
+            FROM {self.schema}.tenant
+            WHERE client_id = %(client_id)s
+            ORDER BY id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"client_id": client_id})
+            rows = cur.fetchall()
+        return rows
+
+    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
+        sql = f"""
+            SELECT
+                COALESCE(p.max_tenants, 1) AS max_tenants,
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.tenant t
+                    WHERE t.client_id = %(client_id)s
+                      AND t.status = 'active'
+                ) AS active_tenants
+            FROM {self.schema}.subscription s
+            JOIN {self.schema}.plan p ON p.id = s.plan_id
+            WHERE s.client_id = %(client_id)s
+              AND s.status = 'active'
+              AND (s.ends_at IS NULL OR s.ends_at >= NOW())
+            ORDER BY s.id DESC
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"client_id": client_id})
+            row = cur.fetchone()
+        max_tenants = int(row["max_tenants"]) if row else 1
+        active_tenants = int(row["active_tenants"]) if row else 0
+        return {
+            "active_tenants": active_tenants,
+            "max_tenants": max_tenants,
+            "can_create": active_tenants < max_tenants,
+        }
+
+    def create_tenant(self, client_id: int, *, name: str, slug: str) -> dict[str, Any]:
+        limits = self.get_client_tenant_limits(client_id)
+        if not limits["can_create"]:
+            raise ValueError("limite de tenants ativos do plano foi atingido")
+        check_slug_sql = f"""
+            SELECT id
+            FROM {self.schema}.tenant
+            WHERE client_id = %(client_id)s
+              AND slug = %(slug)s
+            LIMIT 1
+        """
+        insert_sql = f"""
+            INSERT INTO {self.schema}.tenant (
+                client_id,
+                name,
+                slug,
+                status
+            )
+            VALUES (
+                %(client_id)s,
+                %(name)s,
+                %(slug)s,
+                'active'
+            )
+            RETURNING id, client_id, name, slug, status, created_at
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(check_slug_sql, {"client_id": client_id, "slug": slug})
+            if cur.fetchone():
+                raise ValueError("slug ja utilizado para este cliente")
+            cur.execute(insert_sql, {"client_id": client_id, "name": name, "slug": slug})
+            row = cur.fetchone()
+            conn.commit()
+        return row
+
+    def update_tenant_status(self, client_id: int, tenant_id: int, status: str) -> dict[str, Any]:
+        if status not in {"active", "disabled"}:
+            raise ValueError("status invalido")
+        select_sql = f"""
+            SELECT id, client_id, name, slug, status, created_at
+            FROM {self.schema}.tenant
+            WHERE id = %(tenant_id)s
+              AND client_id = %(client_id)s
+            LIMIT 1
+        """
+        update_sql = f"""
+            UPDATE {self.schema}.tenant
+               SET status = %(status)s
+             WHERE id = %(tenant_id)s
+               AND client_id = %(client_id)s
+         RETURNING id, client_id, name, slug, status, created_at
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(select_sql, {"tenant_id": tenant_id, "client_id": client_id})
+            current = cur.fetchone()
+            if not current:
+                raise ValueError("tenant nao encontrado")
+            if status == "active" and current["status"] != "active":
+                limits = self.get_client_tenant_limits(client_id)
+                if not limits["can_create"]:
+                    raise ValueError("limite de tenants ativos do plano foi atingido")
+            cur.execute(
+                update_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "client_id": client_id,
+                    "status": status,
+                },
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return row
+
+    def list_tenant_users(self, tenant_id: int) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT
+                u.id AS user_id,
+                u.email,
+                u.full_name,
+                tur.role,
+                u.is_active,
+                COALESCE(umc.is_enabled, FALSE) AS mfa_enabled
+            FROM {self.schema}.tenant_user_role tur
+            JOIN {self.schema}.app_user u ON u.id = tur.user_id
+            LEFT JOIN {self.schema}.user_mfa_config umc ON umc.user_id = u.id
+            WHERE tur.tenant_id = %(tenant_id)s
+            ORDER BY
+                CASE tur.role
+                    WHEN 'owner' THEN 3
+                    WHEN 'admin' THEN 2
+                    ELSE 1
+                END DESC,
+                u.email
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            rows = cur.fetchall()
+        return rows
+
+    def get_user_mfa_status(self, tenant_id: int, user_id: int) -> dict[str, Any]:
+        role = self.get_user_role(tenant_id, user_id)
+        if role is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        sql = f"""
+            SELECT
+                COALESCE(cfg.is_enabled, FALSE) AS enabled,
+                cfg.enabled_at,
+                pnd.expires_at AS pending_expires_at
+            FROM {self.schema}.app_user u
+            LEFT JOIN {self.schema}.user_mfa_config cfg ON cfg.user_id = u.id
+            LEFT JOIN {self.schema}.user_mfa_pending_setup pnd ON pnd.user_id = u.id
+            WHERE u.id = %(user_id)s
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"user_id": user_id})
+            row = cur.fetchone()
+        if not row:
+            raise ValueError("usuario nao encontrado")
+        return {
+            "enabled": bool(row["enabled"]),
+            "enabled_at": row["enabled_at"].isoformat() if row["enabled_at"] else None,
+            "has_pending_setup": bool(row["pending_expires_at"]),
+            "pending_expires_at": row["pending_expires_at"].isoformat() if row["pending_expires_at"] else None,
+        }
+
+    def begin_user_mfa_setup(self, tenant_id: int, user_id: int, issuer: str) -> dict[str, Any]:
+        role = self.get_user_role(tenant_id, user_id)
+        if role is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        user_sql = f"""
+            SELECT email
+            FROM {self.schema}.app_user
+            WHERE id = %(user_id)s
+            LIMIT 1
+        """
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.user_mfa_pending_setup (
+                user_id,
+                pending_secret_ciphertext,
+                expires_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                %(user_id)s,
+                %(pending_secret_ciphertext)s,
+                NOW() + INTERVAL '10 minutes',
+                NOW(),
+                NOW()
+            )
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                pending_secret_ciphertext = EXCLUDED.pending_secret_ciphertext,
+                expires_at = NOW() + INTERVAL '10 minutes',
+                updated_at = NOW()
+            RETURNING expires_at
+        """
+        secret = generate_base32_secret()
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(user_sql, {"user_id": user_id})
+            user_row = cur.fetchone()
+            if not user_row:
+                raise ValueError("usuario nao encontrado")
+            cur.execute(
+                upsert_sql,
+                {
+                    "user_id": user_id,
+                    "pending_secret_ciphertext": encrypt_text(secret),
+                },
+            )
+            pending_row = cur.fetchone()
+            conn.commit()
+        return {
+            "secret": secret,
+            "provisioning_uri": provisioning_uri(issuer=issuer, account_name=user_row["email"], secret=secret),
+            "expires_at": pending_row["expires_at"].isoformat(),
+        }
+
+    def enable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        role = self.get_user_role(tenant_id, user_id)
+        if role is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        pending_sql = f"""
+            SELECT pending_secret_ciphertext, expires_at
+            FROM {self.schema}.user_mfa_pending_setup
+            WHERE user_id = %(user_id)s
+            LIMIT 1
+        """
+        upsert_cfg_sql = f"""
+            INSERT INTO {self.schema}.user_mfa_config (
+                user_id,
+                method,
+                totp_secret_ciphertext,
+                is_enabled,
+                enabled_at,
+                disabled_at,
+                updated_at
+            )
+            VALUES (
+                %(user_id)s,
+                'totp',
+                %(totp_secret_ciphertext)s,
+                TRUE,
+                NOW(),
+                NULL,
+                NOW()
+            )
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                method = 'totp',
+                totp_secret_ciphertext = EXCLUDED.totp_secret_ciphertext,
+                is_enabled = TRUE,
+                enabled_at = NOW(),
+                disabled_at = NULL,
+                updated_at = NOW()
+            RETURNING enabled_at
+        """
+        delete_pending_sql = f"DELETE FROM {self.schema}.user_mfa_pending_setup WHERE user_id = %(user_id)s"
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(pending_sql, {"user_id": user_id})
+            pending_row = cur.fetchone()
+            if not pending_row:
+                raise ValueError("setup MFA nao iniciado")
+            if pending_row["expires_at"] < dt.datetime.now(dt.timezone.utc):
+                cur.execute(delete_pending_sql, {"user_id": user_id})
+                conn.commit()
+                raise ValueError("setup MFA expirado")
+            secret = decrypt_text(pending_row["pending_secret_ciphertext"])
+            if not verify_totp(secret, otp_code):
+                raise ValueError("codigo TOTP invalido")
+            cur.execute(
+                upsert_cfg_sql,
+                {
+                    "user_id": user_id,
+                    "totp_secret_ciphertext": encrypt_text(secret),
+                },
+            )
+            cfg_row = cur.fetchone()
+            cur.execute(delete_pending_sql, {"user_id": user_id})
+            conn.commit()
+        return {"enabled": True, "enabled_at": cfg_row["enabled_at"].isoformat()}
+
+    def disable_user_mfa(self, tenant_id: int, user_id: int, otp_code: str) -> dict[str, Any]:
+        role = self.get_user_role(tenant_id, user_id)
+        if role is None:
+            raise ValueError("usuario fora do escopo do tenant")
+        select_sql = f"""
+            SELECT totp_secret_ciphertext, is_enabled
+            FROM {self.schema}.user_mfa_config
+            WHERE user_id = %(user_id)s
+            LIMIT 1
+        """
+        disable_sql = f"""
+            UPDATE {self.schema}.user_mfa_config
+               SET is_enabled = FALSE,
+                   totp_secret_ciphertext = NULL,
+                   disabled_at = NOW(),
+                   updated_at = NOW()
+             WHERE user_id = %(user_id)s
+            RETURNING disabled_at
+        """
+        delete_pending_sql = f"DELETE FROM {self.schema}.user_mfa_pending_setup WHERE user_id = %(user_id)s"
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(select_sql, {"user_id": user_id})
+            cfg = cur.fetchone()
+            if not cfg or not bool(cfg["is_enabled"]):
+                raise ValueError("MFA nao esta habilitado")
+            secret_cipher = cfg["totp_secret_ciphertext"]
+            if not secret_cipher:
+                raise ValueError("segredo MFA indisponivel")
+            secret = decrypt_text(secret_cipher)
+            if not verify_totp(secret, otp_code):
+                raise ValueError("codigo TOTP invalido")
+            cur.execute(disable_sql, {"user_id": user_id})
+            row = cur.fetchone()
+            cur.execute(delete_pending_sql, {"user_id": user_id})
+            conn.commit()
+        return {"enabled": False, "disabled_at": row["disabled_at"].isoformat()}
+
+    def admin_reset_user_mfa(self, tenant_id: int, target_user_id: int, reset_by_user_id: int) -> dict[str, Any]:
+        if self.get_user_role(tenant_id, target_user_id) is None:
+            raise ValueError("usuario alvo fora do escopo do tenant")
+        if self.get_user_role(tenant_id, reset_by_user_id) is None:
+            raise ValueError("usuario executor fora do escopo do tenant")
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.user_mfa_config (
+                user_id,
+                method,
+                totp_secret_ciphertext,
+                is_enabled,
+                enabled_at,
+                disabled_at,
+                last_reset_by_user_id,
+                last_reset_at,
+                updated_at
+            )
+            VALUES (
+                %(target_user_id)s,
+                'totp',
+                NULL,
+                FALSE,
+                NULL,
+                NOW(),
+                %(reset_by_user_id)s,
+                NOW(),
+                NOW()
+            )
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                totp_secret_ciphertext = NULL,
+                is_enabled = FALSE,
+                enabled_at = NULL,
+                disabled_at = NOW(),
+                last_reset_by_user_id = EXCLUDED.last_reset_by_user_id,
+                last_reset_at = NOW(),
+                updated_at = NOW()
+            RETURNING last_reset_at
+        """
+        delete_pending_sql = f"DELETE FROM {self.schema}.user_mfa_pending_setup WHERE user_id = %(target_user_id)s"
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                upsert_sql,
+                {
+                    "target_user_id": target_user_id,
+                    "reset_by_user_id": reset_by_user_id,
+                },
+            )
+            row = cur.fetchone()
+            cur.execute(delete_pending_sql, {"target_user_id": target_user_id})
+            conn.commit()
+        return {
+            "target_user_id": target_user_id,
+            "enabled": False,
+            "reset_at": row["last_reset_at"].isoformat(),
+        }
+
+    def list_supported_llm_providers(self) -> list[dict[str, Any]]:
+        return [
+            {"code": "openai", "name": "OpenAI"},
+            {"code": "azure_openai", "name": "Azure OpenAI"},
+            {"code": "anthropic", "name": "Anthropic"},
+            {"code": "google_gemini", "name": "Google Gemini"},
+            {"code": "mistral", "name": "Mistral"},
+            {"code": "groq", "name": "Groq"},
+            {"code": "ollama", "name": "Ollama (Local)"},
+        ]
+
+    def get_app_default_llm_config(self) -> dict[str, Any] | None:
+        sql = f"""
+            SELECT
+                id,
+                name AS provider_name,
+                model_code,
+                endpoint_url,
+                secret_ref,
+                is_global_default,
+                created_at
+            FROM {self.schema}.llm_provider
+            WHERE client_id IS NULL
+              AND is_global_default = TRUE
+            ORDER BY id DESC
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {})
+            row = cur.fetchone()
+        return row if row else None
+
+    def upsert_app_default_llm_config(
+        self,
+        *,
+        provider_name: str,
+        model_code: str,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        disable_old_sql = f"""
+            UPDATE {self.schema}.llm_provider
+               SET is_global_default = FALSE
+             WHERE client_id IS NULL
+               AND is_global_default = TRUE
+        """
+        insert_sql = f"""
+            INSERT INTO {self.schema}.llm_provider (
+                client_id,
+                name,
+                model_code,
+                endpoint_url,
+                secret_ref,
+                is_global_default
+            )
+            VALUES (
+                NULL,
+                %(provider_name)s,
+                %(model_code)s,
+                %(endpoint_url)s,
+                %(secret_ref)s,
+                TRUE
+            )
+            RETURNING
+                id,
+                name AS provider_name,
+                model_code,
+                endpoint_url,
+                secret_ref,
+                is_global_default,
+                created_at
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(disable_old_sql, {})
+            cur.execute(
+                insert_sql,
+                {
+                    "provider_name": provider_name,
+                    "model_code": model_code,
+                    "endpoint_url": endpoint_url,
+                    "secret_ref": secret_ref,
+                },
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return row
+
+    def get_tenant_llm_config(self, client_id: int, tenant_id: int) -> dict[str, Any]:
+        cfg_sql = f"""
+            SELECT
+                tlc.billing_mode,
+                lp.name AS provider_name,
+                lp.model_code,
+                lp.endpoint_url,
+                lp.secret_ref
+            FROM {self.schema}.tenant_llm_config tlc
+            JOIN {self.schema}.llm_provider lp ON lp.id = tlc.llm_provider_id
+            JOIN {self.schema}.tenant t ON t.id = tlc.tenant_id
+            WHERE tlc.tenant_id = %(tenant_id)s
+              AND t.client_id = %(client_id)s
+            LIMIT 1
+        """
+        app_sql = f"""
+            SELECT
+                name AS provider_name,
+                model_code,
+                endpoint_url,
+                secret_ref
+            FROM {self.schema}.llm_provider
+            WHERE client_id IS NULL
+              AND is_global_default = TRUE
+            ORDER BY id DESC
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(cfg_sql, {"tenant_id": tenant_id, "client_id": client_id})
+            row = cur.fetchone()
+            cur.execute(app_sql, {})
+            app_row = cur.fetchone()
+        if row:
+            use_app = row["billing_mode"] == "app_default_token"
+            return {
+                "use_app_default_llm": use_app,
+                "billing_mode": row["billing_mode"],
+                "provider_name": row["provider_name"],
+                "model_code": row["model_code"],
+                "endpoint_url": row["endpoint_url"],
+                "secret_ref": row["secret_ref"],
+                "app_default_available": app_row is not None,
+            }
+        return {
+            "use_app_default_llm": True if app_row else False,
+            "billing_mode": "app_default_token" if app_row else "tenant_provider",
+            "provider_name": app_row["provider_name"] if app_row else None,
+            "model_code": app_row["model_code"] if app_row else None,
+            "endpoint_url": app_row["endpoint_url"] if app_row else None,
+            "secret_ref": app_row["secret_ref"] if app_row else None,
+            "app_default_available": app_row is not None,
+        }
+
+    def update_tenant_llm_config(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        use_app_default_llm: bool,
+        provider_name: str | None,
+        model_code: str | None,
+        endpoint_url: str | None,
+        secret_ref: str | None,
+    ) -> dict[str, Any]:
+        app_provider_sql = f"""
+            SELECT id
+            FROM {self.schema}.llm_provider
+            WHERE client_id IS NULL
+              AND is_global_default = TRUE
+            ORDER BY id DESC
+            LIMIT 1
+        """
+        tenant_provider_insert_sql = f"""
+            INSERT INTO {self.schema}.llm_provider (
+                client_id,
+                name,
+                model_code,
+                endpoint_url,
+                secret_ref,
+                is_global_default
+            )
+            VALUES (
+                %(client_id)s,
+                %(provider_name)s,
+                %(model_code)s,
+                %(endpoint_url)s,
+                %(secret_ref)s,
+                FALSE
+            )
+            RETURNING id
+        """
+        upsert_cfg_sql = f"""
+            INSERT INTO {self.schema}.tenant_llm_config (
+                tenant_id,
+                llm_provider_id,
+                billing_mode,
+                created_at
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(llm_provider_id)s,
+                %(billing_mode)s,
+                NOW()
+            )
+            ON CONFLICT (tenant_id)
+            DO UPDATE SET
+                llm_provider_id = EXCLUDED.llm_provider_id,
+                billing_mode = EXCLUDED.billing_mode
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            if use_app_default_llm:
+                cur.execute(app_provider_sql, {})
+                app_row = cur.fetchone()
+                if not app_row:
+                    raise ValueError("LLM padrao do app nao configurada pelo superadmin")
+                llm_provider_id = int(app_row["id"])
+                billing_mode = "app_default_token"
+            else:
+                if not provider_name or not model_code:
+                    raise ValueError("provider_name e model_code sao obrigatorios")
+                cur.execute(
+                    tenant_provider_insert_sql,
+                    {
+                        "client_id": client_id,
+                        "provider_name": provider_name,
+                        "model_code": model_code,
+                        "endpoint_url": endpoint_url,
+                        "secret_ref": secret_ref,
+                    },
+                )
+                inserted = cur.fetchone()
+                llm_provider_id = int(inserted["id"])
+                billing_mode = "tenant_provider"
+            cur.execute(
+                upsert_cfg_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "llm_provider_id": llm_provider_id,
+                    "billing_mode": billing_mode,
+                },
+            )
+            conn.commit()
+        return self.get_tenant_llm_config(client_id, tenant_id)
+
+    def resolve_channel_user_tenants(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        user_sql = f"""
+            SELECT
+                b.user_id,
+                u.email,
+                u.full_name
+            FROM {self.schema}.channel_user_binding b
+            JOIN {self.schema}.app_user u ON u.id = b.user_id
+            WHERE b.client_id = %(client_id)s
+              AND b.channel_type = %(channel_type)s
+              AND b.external_user_key = %(external_user_key)s
+              AND b.is_active = TRUE
+            LIMIT 1
+        """
+        tenants_sql = f"""
+            SELECT
+                t.id AS tenant_id,
+                t.name,
+                t.slug,
+                t.status,
+                tur.role
+            FROM {self.schema}.tenant_user_role tur
+            JOIN {self.schema}.tenant t ON t.id = tur.tenant_id
+            WHERE tur.user_id = %(user_id)s
+              AND t.client_id = %(client_id)s
+            ORDER BY t.id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                user_sql,
+                {
+                    "client_id": client_id,
+                    "channel_type": channel_type,
+                    "external_user_key": external_user_key,
+                },
+            )
+            user_row = cur.fetchone()
+            if not user_row:
+                raise ValueError("identidade do canal nao vinculada a usuario")
+            cur.execute(
+                tenants_sql,
+                {
+                    "user_id": user_row["user_id"],
+                    "client_id": client_id,
+                },
+            )
+            tenants = cur.fetchall()
+        if not tenants:
+            raise ValueError("usuario sem tenants vinculados")
+        return {
+            "user": {
+                "user_id": int(user_row["user_id"]),
+                "email": user_row["email"],
+                "full_name": user_row["full_name"],
+            },
+            "tenants": tenants,
+        }
+
+    def set_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+        tenant_id: int,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_channel_user_tenants(
+            client_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+        )
+        allowed = {int(item["tenant_id"]) for item in resolved["tenants"]}
+        if int(tenant_id) not in allowed:
+            raise ValueError("tenant nao permitido para este usuario/canal")
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.channel_tenant_context (
+                client_id,
+                user_id,
+                channel_type,
+                conversation_key,
+                active_tenant_id,
+                updated_at
+            )
+            VALUES (
+                %(client_id)s,
+                %(user_id)s,
+                %(channel_type)s,
+                %(conversation_key)s,
+                %(active_tenant_id)s,
+                NOW()
+            )
+            ON CONFLICT (channel_type, conversation_key)
+            DO UPDATE SET
+                client_id = EXCLUDED.client_id,
+                user_id = EXCLUDED.user_id,
+                active_tenant_id = EXCLUDED.active_tenant_id,
+                updated_at = NOW()
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                upsert_sql,
+                {
+                    "client_id": client_id,
+                    "user_id": resolved["user"]["user_id"],
+                    "channel_type": channel_type,
+                    "conversation_key": conversation_key,
+                    "active_tenant_id": tenant_id,
+                },
+            )
+            conn.commit()
+        return {"active_tenant_id": int(tenant_id), "conversation_key": conversation_key}
+
+    def get_channel_active_tenant(
+        self,
+        client_id: int,
+        *,
+        channel_type: str,
+        conversation_key: str,
+        external_user_key: str,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_channel_user_tenants(
+            client_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+        )
+        sql = f"""
+            SELECT active_tenant_id
+            FROM {self.schema}.channel_tenant_context
+            WHERE channel_type = %(channel_type)s
+              AND conversation_key = %(conversation_key)s
+            LIMIT 1
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "channel_type": channel_type,
+                    "conversation_key": conversation_key,
+                },
+            )
+            row = cur.fetchone()
+        return {
+            "active_tenant_id": int(row["active_tenant_id"]) if row and row["active_tenant_id"] else None,
+            "conversation_key": conversation_key,
+            "tenants": resolved["tenants"],
+            "user": resolved["user"],
+        }
+
+    def track_app_llm_usage(
+        self,
+        *,
+        tenant_id: int,
+        feature_code: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> dict[str, Any] | None:
+        cfg_sql = f"""
+            SELECT tlc.billing_mode, tlc.llm_provider_id
+            FROM {self.schema}.tenant_llm_config tlc
+            WHERE tlc.tenant_id = %(tenant_id)s
+            LIMIT 1
+        """
+        insert_sql = f"""
+            INSERT INTO {self.schema}.token_usage (
+                tenant_id,
+                llm_provider_id,
+                input_tokens,
+                output_tokens,
+                unit_price_per_1k_cents,
+                consumed_at
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(llm_provider_id)s,
+                %(input_tokens)s,
+                %(output_tokens)s,
+                %(unit_price_per_1k_cents)s,
+                NOW()
+            )
+            RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(cfg_sql, {"tenant_id": tenant_id})
+            cfg = cur.fetchone()
+            if not cfg or cfg["billing_mode"] != "app_default_token":
+                return None
+            unit_price = int(os.getenv("IAOPS_APP_LLM_PRICE_PER_1K_CENTS", "50"))
+            cur.execute(
+                insert_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "llm_provider_id": int(cfg["llm_provider_id"]),
+                    "input_tokens": max(0, int(input_tokens)),
+                    "output_tokens": max(0, int(output_tokens)),
+                    "unit_price_per_1k_cents": unit_price,
+                },
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return {
+            "usage_id": int(row["id"]),
+            "tenant_id": tenant_id,
+            "feature_code": feature_code,
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+        }
 
     def list_source_catalog(self) -> list[dict[str, Any]]:
         sql = f"""
@@ -603,6 +1465,155 @@ class PostgresMCPRepository(MCPRepository):
             )
             rows = cur.fetchall()
         return rows
+
+    def list_monitored_columns_by_table(
+        self,
+        tenant_id: int,
+        monitored_table_id: int,
+    ) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT
+                mc.id,
+                mc.monitored_table_id,
+                mc.column_name,
+                mc.data_type,
+                mc.classification,
+                mc.description_text
+            FROM {self.schema}.monitored_column mc
+            JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mt.tenant_id = %(tenant_id)s
+              AND mc.monitored_table_id = %(monitored_table_id)s
+            ORDER BY mc.column_name
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "tenant_id": tenant_id,
+                    "monitored_table_id": monitored_table_id,
+                },
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def create_monitored_column(
+        self,
+        tenant_id: int,
+        *,
+        monitored_table_id: int,
+        column_name: str,
+        data_type: str | None = None,
+        classification: str | None = None,
+        description_text: str | None = None,
+    ) -> dict[str, Any]:
+        table_check_sql = f"""
+            SELECT id
+            FROM {self.schema}.monitored_table
+            WHERE id = %(monitored_table_id)s
+              AND tenant_id = %(tenant_id)s
+            LIMIT 1
+        """
+        exists_sql = f"""
+            SELECT id
+            FROM {self.schema}.monitored_column
+            WHERE monitored_table_id = %(monitored_table_id)s
+              AND column_name = %(column_name)s
+            LIMIT 1
+        """
+        insert_sql = f"""
+            INSERT INTO {self.schema}.monitored_column (
+                tenant_id,
+                monitored_table_id,
+                column_name,
+                data_type,
+                classification,
+                description_text
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(monitored_table_id)s,
+                %(column_name)s,
+                %(data_type)s,
+                %(classification)s,
+                %(description_text)s
+            )
+            RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                table_check_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "monitored_table_id": monitored_table_id,
+                },
+            )
+            table_row = cur.fetchone()
+            if not table_row:
+                raise ValueError("monitored_table_id nao encontrado para o tenant")
+            cur.execute(
+                exists_sql,
+                {
+                    "monitored_table_id": monitored_table_id,
+                    "column_name": column_name,
+                },
+            )
+            if cur.fetchone():
+                raise ValueError("coluna ja cadastrada para a tabela")
+            cur.execute(
+                insert_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "monitored_table_id": monitored_table_id,
+                    "column_name": column_name,
+                    "data_type": data_type,
+                    "classification": classification,
+                    "description_text": description_text,
+                },
+            )
+            inserted = cur.fetchone()
+            conn.commit()
+        rows = self.list_monitored_columns_by_table(tenant_id, monitored_table_id)
+        for item in rows:
+            if int(item["id"]) == int(inserted["id"]):
+                return item
+        raise ValueError("falha ao recuperar coluna monitorada criada")
+
+    def delete_monitored_column(
+        self,
+        tenant_id: int,
+        monitored_column_id: int,
+    ) -> dict[str, Any]:
+        select_sql = f"""
+            SELECT mc.id, mc.monitored_table_id, mc.column_name
+            FROM {self.schema}.monitored_column mc
+            JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mc.id = %(monitored_column_id)s
+              AND mt.tenant_id = %(tenant_id)s
+            LIMIT 1
+        """
+        delete_sql = f"""
+            DELETE FROM {self.schema}.monitored_column
+            WHERE id = %(monitored_column_id)s
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                select_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "monitored_column_id": monitored_column_id,
+                },
+            )
+            column_row = cur.fetchone()
+            if not column_row:
+                raise ValueError("coluna monitorada nao encontrada")
+            cur.execute(delete_sql, {"monitored_column_id": monitored_column_id})
+            conn.commit()
+        return {
+            "deleted": True,
+            "id": int(column_row["id"]),
+            "monitored_table_id": int(column_row["monitored_table_id"]),
+            "column_name": column_row["column_name"],
+        }
 
     def execute_safe_sql(self, tenant_id: int, sql_text: str, max_rows: int | None) -> dict[str, Any]:
         _ = tenant_id

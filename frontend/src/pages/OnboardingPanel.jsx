@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   deleteDataSource,
+  deleteMonitoredColumn,
   deleteMonitoredTable,
   listSourceCatalog,
+  listOnboardingMonitoredColumns,
   listOnboardingMonitoredTables,
   listTenantDataSources,
   registerDataSource,
+  registerMonitoredColumn,
   registerMonitoredTable,
   updateDataSource,
   updateDataSourceStatus,
@@ -13,6 +16,7 @@ import {
 import DataSourceFormModal from "../components/DataSourceFormModal";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import MonitoredTableFormModal from "../components/MonitoredTableFormModal";
+import MonitoredColumnFormModal from "../components/MonitoredColumnFormModal";
 
 const CATEGORY_LABEL = {
   relational: "Relacionais",
@@ -35,6 +39,11 @@ export default function OnboardingPanel({ onSystemMessage }) {
   const [tablesLoading, setTablesLoading] = useState(false);
   const [isTableModalOpen, setIsTableModalOpen] = useState(false);
   const [tableSaving, setTableSaving] = useState(false);
+  const [monitoredColumns, setMonitoredColumns] = useState([]);
+  const [selectedTableIdForColumns, setSelectedTableIdForColumns] = useState("");
+  const [columnsLoading, setColumnsLoading] = useState(false);
+  const [isColumnModalOpen, setIsColumnModalOpen] = useState(false);
+  const [columnSaving, setColumnSaving] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
   const [actionLoading, setActionLoading] = useState(false);
 
@@ -83,11 +92,38 @@ export default function OnboardingPanel({ onSystemMessage }) {
     setTablesLoading(true);
     try {
       const data = await listOnboardingMonitoredTables(sourceId ? Number(sourceId) : undefined);
-      setMonitoredTables(data.tables || []);
+      const rows = data.tables || [];
+      setMonitoredTables(rows);
+      if (rows.length === 0) {
+        setSelectedTableIdForColumns("");
+        setMonitoredColumns([]);
+        return;
+      }
+      const tableExists = rows.some((item) => String(item.id) === String(selectedTableIdForColumns));
+      if (!selectedTableIdForColumns || !tableExists) {
+        setSelectedTableIdForColumns(String(rows[0].id));
+      }
     } catch (error) {
       onSystemMessage("error", "Erro ao carregar tabelas monitoradas", error.message);
     } finally {
       setTablesLoading(false);
+    }
+  };
+
+  const loadMonitoredColumns = async (tableIdRaw) => {
+    const tableId = tableIdRaw || selectedTableIdForColumns || undefined;
+    if (!tableId) {
+      setMonitoredColumns([]);
+      return;
+    }
+    setColumnsLoading(true);
+    try {
+      const data = await listOnboardingMonitoredColumns(Number(tableId));
+      setMonitoredColumns(data.columns || []);
+    } catch (error) {
+      onSystemMessage("error", "Erro ao carregar colunas monitoradas", error.message);
+    } finally {
+      setColumnsLoading(false);
     }
   };
 
@@ -150,6 +186,24 @@ export default function OnboardingPanel({ onSystemMessage }) {
     }
   };
 
+  const handleRegisterMonitoredColumn = async (payload) => {
+    setColumnSaving(true);
+    try {
+      const data = await registerMonitoredColumn(payload);
+      setIsColumnModalOpen(false);
+      onSystemMessage(
+        "success",
+        "Coluna monitorada cadastrada",
+        `Coluna ${data.column.column_name} cadastrada com sucesso.`
+      );
+      await loadMonitoredColumns(String(payload.monitored_table_id));
+    } catch (error) {
+      onSystemMessage("error", "Falha no cadastro da coluna monitorada", error.message);
+    } finally {
+      setColumnSaving(false);
+    }
+  };
+
   const openStatusAction = (source, nextIsActive) => {
     setPendingAction({
       type: "status",
@@ -172,7 +226,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
   };
 
   const handleConfirmAction = async () => {
-    if (!pendingAction?.source?.id) return;
+    if (!pendingAction) return;
     setActionLoading(true);
     try {
       if (pendingAction.type === "status") {
@@ -197,10 +251,18 @@ export default function OnboardingPanel({ onSystemMessage }) {
           "Tabela monitorada removida",
           `Tabela ${data.result.schema_name}.${data.result.table_name} removida com sucesso.`
         );
+      } else if (pendingAction.type === "delete_column") {
+        const data = await deleteMonitoredColumn({ monitored_column_id: pendingAction.column.id });
+        onSystemMessage(
+          "success",
+          "Coluna monitorada removida",
+          `Coluna ${data.result.column_name} removida com sucesso.`
+        );
       }
       setPendingAction(null);
       await loadTenantSources();
       await loadMonitoredTables();
+      await loadMonitoredColumns();
     } catch (error) {
       onSystemMessage("error", "Falha na operacao", error.message);
     } finally {
@@ -218,6 +280,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
       loadMonitoredTables(selectedSourceIdForTables);
     }
   }, [selectedSourceIdForTables]);
+
+  useEffect(() => {
+    if (selectedTableIdForColumns) {
+      loadMonitoredColumns(selectedTableIdForColumns);
+    }
+  }, [selectedTableIdForColumns]);
 
   return (
     <section className="page-panel">
@@ -373,15 +441,99 @@ export default function OnboardingPanel({ onSystemMessage }) {
                     <td>{item.table_name}</td>
                     <td>{item.is_active ? "Ativa" : "Inativa"}</td>
                     <td>
+                      <div className="chip-row">
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() => setSelectedTableIdForColumns(String(item.id))}
+                        >
+                          Colunas
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() =>
+                            setPendingAction({
+                              type: "delete_table",
+                              table: item,
+                              title: "Remover tabela monitorada",
+                              message: `Remover ${item.schema_name}.${item.table_name}?`,
+                              confirmLabel: "Remover",
+                            })
+                          }
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="catalog-block">
+        <div className="section-header">
+          <h3>Colunas monitoradas por tabela</h3>
+          <div className="chip-row">
+            <button type="button" className="btn btn-primary btn-small" onClick={() => setIsColumnModalOpen(true)}>
+              Cadastrar Coluna
+            </button>
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns()}>
+              Atualizar
+            </button>
+          </div>
+        </div>
+        <div className="inline-form">
+          <select
+            value={selectedTableIdForColumns}
+            onChange={(e) => setSelectedTableIdForColumns(e.target.value)}
+            disabled={monitoredTables.length === 0}
+          >
+            {monitoredTables.map((item) => (
+              <option key={item.id} value={item.id}>
+                {`${item.schema_name}.${item.table_name} (#${item.id})`}
+              </option>
+            ))}
+          </select>
+        </div>
+        {columnsLoading ? (
+          <p className="empty-state">Carregando colunas monitoradas...</p>
+        ) : monitoredColumns.length === 0 ? (
+          <p className="empty-state">Nenhuma coluna monitorada para a tabela selecionada.</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Coluna</th>
+                  <th>Tipo</th>
+                  <th>Classificacao</th>
+                  <th>Descricao</th>
+                  <th>Acoes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monitoredColumns.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.id}</td>
+                    <td>{item.column_name}</td>
+                    <td>{item.data_type || "-"}</td>
+                    <td>{item.classification || "-"}</td>
+                    <td>{item.description_text || "-"}</td>
+                    <td>
                       <button
                         type="button"
                         className="btn btn-small btn-secondary"
                         onClick={() =>
                           setPendingAction({
-                            type: "delete_table",
-                            table: item,
-                            title: "Remover tabela monitorada",
-                            message: `Remover ${item.schema_name}.${item.table_name}?`,
+                            type: "delete_column",
+                            column: item,
+                            title: "Remover coluna monitorada",
+                            message: `Remover coluna ${item.column_name}?`,
                             confirmLabel: "Remover",
                           })
                         }
@@ -432,6 +584,16 @@ export default function OnboardingPanel({ onSystemMessage }) {
           if (!tableSaving) setIsTableModalOpen(false);
         }}
         onSubmit={handleRegisterMonitoredTable}
+      />
+
+      <MonitoredColumnFormModal
+        open={isColumnModalOpen}
+        tables={monitoredTables}
+        defaultTableId={selectedTableIdForColumns ? Number(selectedTableIdForColumns) : undefined}
+        onClose={() => {
+          if (!columnSaving) setIsColumnModalOpen(false);
+        }}
+        onSubmit={handleRegisterMonitoredColumn}
       />
     </section>
   );

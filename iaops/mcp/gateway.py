@@ -9,9 +9,46 @@ from .repository import MCPRepository
 
 
 class MCPGateway:
+    _CLIENT_SCOPE_TOOLS = {
+        "tenant.list_client",
+        "tenant.get_limits",
+        "tenant.create",
+        "tenant.update_status",
+        "channel.list_user_tenants",
+        "channel.set_active_tenant",
+        "channel.get_active_tenant",
+        "llm_admin.list_providers",
+        "llm_admin.get_app_config",
+        "llm_admin.update_app_config",
+    }
+    _SUPERADMIN_TOOLS = {
+        "llm_admin.list_providers",
+        "llm_admin.get_app_config",
+        "llm_admin.update_app_config",
+    }
+
     def __init__(self, repository: MCPRepository) -> None:
         self.repository = repository
         self._handlers: dict[str, Callable[[RequestContext, dict[str, Any], int | None], dict[str, Any]]] = {
+            "tenant.list_client": self._handle_tenant_list_client,
+            "tenant.get_limits": self._handle_tenant_get_limits,
+            "tenant.create": self._handle_tenant_create,
+            "tenant.update_status": self._handle_tenant_update_status,
+            "channel.list_user_tenants": self._handle_channel_list_user_tenants,
+            "channel.set_active_tenant": self._handle_channel_set_active_tenant,
+            "channel.get_active_tenant": self._handle_channel_get_active_tenant,
+            "tenant_llm.get_config": self._handle_tenant_llm_get_config,
+            "tenant_llm.update_config": self._handle_tenant_llm_update_config,
+            "tenant_llm.list_providers": self._handle_tenant_llm_list_providers,
+            "llm_admin.list_providers": self._handle_llm_admin_list_providers,
+            "llm_admin.get_app_config": self._handle_llm_admin_get_app_config,
+            "llm_admin.update_app_config": self._handle_llm_admin_update_app_config,
+            "access.list_users": self._handle_access_list_users,
+            "security.mfa.get_status": self._handle_mfa_get_status,
+            "security.mfa.begin_setup": self._handle_mfa_begin_setup,
+            "security.mfa.enable": self._handle_mfa_enable,
+            "security.mfa.disable_self": self._handle_mfa_disable_self,
+            "security.mfa.admin_reset": self._handle_mfa_admin_reset,
             "source.list_catalog": self._handle_source_list_catalog,
             "source.list_tenant": self._handle_source_list_tenant,
             "source.register": self._handle_source_register,
@@ -23,6 +60,9 @@ class MCPGateway:
             "inventory.list_tenant_tables": self._handle_list_tenant_tables,
             "inventory.register_table": self._handle_register_table,
             "inventory.delete_table": self._handle_delete_table,
+            "inventory.list_table_columns": self._handle_list_table_columns,
+            "inventory.register_column": self._handle_register_column,
+            "inventory.delete_column": self._handle_delete_column,
             "query.execute_safe_sql": self._handle_execute_safe_sql,
             "security_sql.get_policy": self._handle_security_sql_get_policy,
             "security_sql.update_policy": self._handle_security_sql_update_policy,
@@ -57,7 +97,7 @@ class MCPGateway:
             return self._finalize_log(context, tool_name or "unknown", payload, result, start)
 
         tenant_ok = self.repository.is_tenant_operational(context.client_id, context.tenant_id)
-        if not tenant_ok:
+        if not tenant_ok and tool_name not in self._CLIENT_SCOPE_TOOLS:
             result = ToolExecutionResult("denied", {}, "tenant_blocked", "Tenant inativo, bloqueado ou inadimplente")
             return self._finalize_log(context, tool_name, payload, result, start)
 
@@ -73,6 +113,10 @@ class MCPGateway:
 
         if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
             result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
+        if tool_name in self._SUPERADMIN_TOOLS and not self.repository.is_superadmin(context.user_id):
+            result = ToolExecutionResult("denied", {}, "superadmin_required", "Acesso restrito a superadmin")
             return self._finalize_log(context, tool_name, payload, result, start)
 
         try:
@@ -112,6 +156,272 @@ class MCPGateway:
         if max_rows is not None:
             rows = rows[:max_rows]
         return {"sources": rows}
+
+    def _handle_tenant_list_client(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = tool_input
+        rows = self.repository.list_client_tenants(context.client_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"tenants": rows}
+
+    def _handle_tenant_get_limits(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        return {"limits": self.repository.get_client_tenant_limits(context.client_id)}
+
+    def _handle_tenant_create(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        name = str(tool_input.get("name", "")).strip()
+        slug = str(tool_input.get("slug", "")).strip().lower()
+        if not name:
+            raise ValueError("name obrigatorio")
+        if not slug:
+            raise ValueError("slug obrigatorio")
+        tenant = self.repository.create_tenant(context.client_id, name=name, slug=slug)
+        return {"tenant": tenant}
+
+    def _handle_tenant_update_status(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("tenant_id") is None:
+            raise ValueError("tenant_id obrigatorio")
+        status = str(tool_input.get("status", "")).strip().lower()
+        if status not in {"active", "disabled"}:
+            raise ValueError("status invalido")
+        tenant = self.repository.update_tenant_status(context.client_id, int(tool_input["tenant_id"]), status)
+        return {"tenant": tenant}
+
+    def _handle_llm_admin_list_providers(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context, tool_input
+        rows = self.repository.list_supported_llm_providers()
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"providers": rows}
+
+    def _handle_llm_admin_get_app_config(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context, tool_input, max_rows
+        return {"config": self.repository.get_app_default_llm_config()}
+
+    def _handle_llm_admin_update_app_config(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context, max_rows
+        provider_name = str(tool_input.get("provider_name", "")).strip().lower()
+        model_code = str(tool_input.get("model_code", "")).strip()
+        endpoint_url = str(tool_input.get("endpoint_url", "")).strip() or None
+        secret_ref = str(tool_input.get("secret_ref", "")).strip() or None
+        if not provider_name:
+            raise ValueError("provider_name obrigatorio")
+        if not model_code:
+            raise ValueError("model_code obrigatorio")
+        config = self.repository.upsert_app_default_llm_config(
+            provider_name=provider_name,
+            model_code=model_code,
+            endpoint_url=endpoint_url,
+            secret_ref=secret_ref,
+        )
+        return {"config": config}
+
+    def _handle_tenant_llm_list_providers(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context, tool_input
+        rows = self.repository.list_supported_llm_providers()
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"providers": rows}
+
+    def _handle_tenant_llm_get_config(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        return {"config": self.repository.get_tenant_llm_config(context.client_id, context.tenant_id)}
+
+    def _handle_tenant_llm_update_config(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        use_app_default_llm = bool(tool_input.get("use_app_default_llm", False))
+        provider_name = str(tool_input.get("provider_name", "")).strip().lower() or None
+        model_code = str(tool_input.get("model_code", "")).strip() or None
+        endpoint_url = str(tool_input.get("endpoint_url", "")).strip() or None
+        secret_ref = str(tool_input.get("secret_ref", "")).strip() or None
+        cfg = self.repository.update_tenant_llm_config(
+            context.client_id,
+            context.tenant_id,
+            use_app_default_llm=use_app_default_llm,
+            provider_name=provider_name,
+            model_code=model_code,
+            endpoint_url=endpoint_url,
+            secret_ref=secret_ref,
+        )
+        return {"config": cfg}
+
+    def _handle_channel_list_user_tenants(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        channel_type = str(tool_input.get("channel_type", "")).strip().lower()
+        external_user_key = str(tool_input.get("external_user_key", "")).strip()
+        if channel_type not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not external_user_key:
+            raise ValueError("external_user_key obrigatorio")
+        data = self.repository.resolve_channel_user_tenants(
+            context.client_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+        )
+        return data
+
+    def _handle_channel_set_active_tenant(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        channel_type = str(tool_input.get("channel_type", "")).strip().lower()
+        conversation_key = str(tool_input.get("conversation_key", "")).strip()
+        external_user_key = str(tool_input.get("external_user_key", "")).strip()
+        if tool_input.get("tenant_id") is None:
+            raise ValueError("tenant_id obrigatorio")
+        if channel_type not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not conversation_key:
+            raise ValueError("conversation_key obrigatorio")
+        if not external_user_key:
+            raise ValueError("external_user_key obrigatorio")
+        result = self.repository.set_channel_active_tenant(
+            context.client_id,
+            channel_type=channel_type,
+            conversation_key=conversation_key,
+            external_user_key=external_user_key,
+            tenant_id=int(tool_input["tenant_id"]),
+        )
+        return {"selection": result}
+
+    def _handle_channel_get_active_tenant(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        channel_type = str(tool_input.get("channel_type", "")).strip().lower()
+        conversation_key = str(tool_input.get("conversation_key", "")).strip()
+        external_user_key = str(tool_input.get("external_user_key", "")).strip()
+        if channel_type not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not conversation_key:
+            raise ValueError("conversation_key obrigatorio")
+        if not external_user_key:
+            raise ValueError("external_user_key obrigatorio")
+        data = self.repository.get_channel_active_tenant(
+            context.client_id,
+            channel_type=channel_type,
+            conversation_key=conversation_key,
+            external_user_key=external_user_key,
+        )
+        return data
+
+    def _handle_access_list_users(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = tool_input
+        rows = self.repository.list_tenant_users(context.tenant_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"users": rows}
+
+    def _handle_mfa_get_status(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        status = self.repository.get_user_mfa_status(context.tenant_id, context.user_id)
+        return {"mfa": status}
+
+    def _handle_mfa_begin_setup(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = max_rows
+        issuer = str(tool_input.get("issuer", "IAOps Governance")).strip() or "IAOps Governance"
+        setup = self.repository.begin_user_mfa_setup(context.tenant_id, context.user_id, issuer)
+        return {"setup": setup}
+
+    def _handle_mfa_enable(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = max_rows
+        otp_code = str(tool_input.get("otp_code", "")).strip()
+        if not otp_code:
+            raise ValueError("otp_code obrigatorio")
+        result = self.repository.enable_user_mfa(context.tenant_id, context.user_id, otp_code)
+        return {"mfa": result}
+
+    def _handle_mfa_disable_self(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        otp_code = str(tool_input.get("otp_code", "")).strip()
+        if not otp_code:
+            raise ValueError("otp_code obrigatorio")
+        result = self.repository.disable_user_mfa(context.tenant_id, context.user_id, otp_code)
+        return {"mfa": result}
+
+    def _handle_mfa_admin_reset(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("target_user_id") is None:
+            raise ValueError("target_user_id obrigatorio")
+        result = self.repository.admin_reset_user_mfa(
+            context.tenant_id,
+            target_user_id=int(tool_input["target_user_id"]),
+            reset_by_user_id=context.user_id,
+        )
+        return {"mfa": result}
 
     def _handle_list_columns(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
         schema_name = str(tool_input.get("schema_name", ""))
@@ -172,6 +482,59 @@ class MCPGateway:
         result = self.repository.delete_monitored_table(
             context.tenant_id,
             monitored_table_id=int(tool_input["monitored_table_id"]),
+        )
+        return {"result": result}
+
+    def _handle_list_table_columns(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        if tool_input.get("monitored_table_id") is None:
+            raise ValueError("monitored_table_id obrigatorio")
+        rows = self.repository.list_monitored_columns_by_table(
+            context.tenant_id,
+            monitored_table_id=int(tool_input["monitored_table_id"]),
+        )
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"columns": rows}
+
+    def _handle_register_column(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("monitored_table_id") is None:
+            raise ValueError("monitored_table_id obrigatorio")
+        column_name = str(tool_input.get("column_name", "")).strip()
+        if not column_name:
+            raise ValueError("column_name obrigatorio")
+        column = self.repository.create_monitored_column(
+            context.tenant_id,
+            monitored_table_id=int(tool_input["monitored_table_id"]),
+            column_name=column_name,
+            data_type=(str(tool_input.get("data_type")).strip() if tool_input.get("data_type") else None),
+            classification=(str(tool_input.get("classification")).strip() if tool_input.get("classification") else None),
+            description_text=(str(tool_input.get("description_text")).strip() if tool_input.get("description_text") else None),
+        )
+        return {"column": column}
+
+    def _handle_delete_column(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("monitored_column_id") is None:
+            raise ValueError("monitored_column_id obrigatorio")
+        result = self.repository.delete_monitored_column(
+            context.tenant_id,
+            monitored_column_id=int(tool_input["monitored_column_id"]),
         )
         return {"result": result}
 
@@ -387,6 +750,20 @@ class MCPGateway:
             error_message=result.error_message,
             latency_ms=latency_ms,
         )
+        if result.status == "success":
+            try:
+                request_len = len(str(request_payload.get("input", {})))
+                response_len = len(str(response.get("data", {})))
+                input_tokens = max(1, request_len // 4)
+                output_tokens = max(1, response_len // 4)
+                self.repository.track_app_llm_usage(
+                    tenant_id=context.tenant_id,
+                    feature_code=tool_name,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+            except Exception:
+                pass
         return response
 
     @staticmethod

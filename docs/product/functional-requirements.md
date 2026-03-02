@@ -1,4 +1,4 @@
-# Requisitos Funcionais e Regras
+﻿# Requisitos Funcionais e Regras
 
 ## Hierarquia e acesso
 - Cliente: entidade comercial contratante.
@@ -23,13 +23,15 @@
   - plano_escolhido
 - Confirmacao de e-mail obrigatoria antes do primeiro acesso.
 - Senha com hash forte.
+- MFA opcional por usuario via TOTP, com ativacao voluntaria no perfil.
+- Admin/owner do cliente pode resetar MFA de usuarios do tenant em caso de perda/troca de celular.
 
-## RF-02 Onboarding do tenant
+## RF-02 Onboarding do tenant`r`n- Assistente inicial de configuracao no primeiro acesso com etapas pulaveis (configurar agora ou depois).
 - Cadastro de fonte de dados por tenant.
 - Escolha de schemas/tabelas monitorados.
 - Configuracao de canais de alerta.
 - Configuracao de agendamento de varredura.
-- Cat�logo de fontes suportadas deve incluir:
+- Catálogo de fontes suportadas deve incluir:
   - relacionais: SQL Server, PostgreSQL, MySQL, Oracle
   - NoSQL: MongoDB, Cassandra, DynamoDB
   - warehouses: Snowflake, BigQuery, Redshift
@@ -48,7 +50,7 @@
 - Opcao de detalhes tecnicos sob demanda.
 - Geracao SQL assistida com guardrails.
 - Aplicacao de regras LGPD no resultado.
-- Suporte a LLM do tenant ou LLM padrao do app.
+- Suporte a LLM do tenant ou LLM padrao do app.`r`n- Quando tenant opta por usar LLM padrao do app, consumo de tokens deve ser contabilizado em todas as funcionalidades.
 
 ## RF-05 Eventos e incidentes
 - Registro de eventos de monitoramento.
@@ -68,14 +70,14 @@
 - Ativacao/desativacao de usuario.
 - Restricoes anti-escalacao de privilegio.
 
-## RF-08 Faturamento e parcelas (owner)
+## RF-08 Faturamento e parcelas (owner)`r`n- Quando atingir limite de tenants ativos do plano, cliente pode desabilitar tenant para liberar vaga e criar outro.
 - Cadastro de planos com limites e preco.
 - Assinatura por cliente.
 - Geracao de parcelas com vencimento.
 - Baixa de pagamento e status de atraso.
 - Bloqueio de acesso por inadimplencia acima da tolerancia.
 
-## RF-09 Notificacoes
+## RF-09 Notificacoes`r`n- Em canais WhatsApp/Telegram, usuario pode listar tenants permitidos e selecionar tenant ativo da conversa.
 - Canais por tenant: Telegram e WhatsApp.
 - Indicadores de status de configuracao/servico.
 
@@ -88,3 +90,6 @@
 - Segredos com criptografia simetrica em repouso.
 - Disponibilidade com workers assincornos (Celery).
 - Observabilidade minima: logs estruturados e metricas basicas.
+
+
+

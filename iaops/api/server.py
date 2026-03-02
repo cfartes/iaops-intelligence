@@ -35,6 +35,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/onboarding/monitored-tables":
             self._handle_onboarding_monitored_tables_list(parsed.query)
             return
+        if parsed.path == "/api/onboarding/monitored-columns":
+            self._handle_onboarding_monitored_columns_list(parsed.query)
+            return
         if parsed.path == "/api/incidents":
             self._handle_incident_list(parsed.query)
             return
@@ -49,6 +52,30 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/security-sql/policy":
             self._handle_security_sql_policy_get()
+            return
+        if parsed.path == "/api/access/users":
+            self._handle_access_users_list()
+            return
+        if parsed.path == "/api/security/mfa/status":
+            self._handle_mfa_status_get()
+            return
+        if parsed.path == "/api/tenants":
+            self._handle_tenants_list()
+            return
+        if parsed.path == "/api/tenants/limits":
+            self._handle_tenant_limits_get()
+            return
+        if parsed.path == "/api/admin/llm/providers":
+            self._handle_admin_llm_providers_list()
+            return
+        if parsed.path == "/api/admin/llm/config":
+            self._handle_admin_llm_config_get()
+            return
+        if parsed.path == "/api/tenant-llm/providers":
+            self._handle_tenant_llm_providers_list()
+            return
+        if parsed.path == "/api/tenant-llm/config":
+            self._handle_tenant_llm_config_get()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -81,11 +108,50 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/onboarding/monitored-tables/delete":
             self._handle_onboarding_monitored_table_delete()
             return
+        if parsed.path == "/api/onboarding/monitored-columns":
+            self._handle_onboarding_monitored_column_create()
+            return
+        if parsed.path == "/api/onboarding/monitored-columns/delete":
+            self._handle_onboarding_monitored_column_delete()
+            return
         if parsed.path == "/api/security-sql/policy":
             self._handle_security_sql_policy_update()
             return
         if parsed.path == "/api/chat-bi/query":
             self._handle_chat_bi_query()
+            return
+        if parsed.path == "/api/security/mfa/setup":
+            self._handle_mfa_setup_begin()
+            return
+        if parsed.path == "/api/security/mfa/enable":
+            self._handle_mfa_enable()
+            return
+        if parsed.path == "/api/security/mfa/disable":
+            self._handle_mfa_disable()
+            return
+        if parsed.path == "/api/security/mfa/admin-reset":
+            self._handle_mfa_admin_reset()
+            return
+        if parsed.path == "/api/tenants":
+            self._handle_tenant_create()
+            return
+        if parsed.path == "/api/tenants/status":
+            self._handle_tenant_update_status()
+            return
+        if parsed.path == "/api/admin/llm/config":
+            self._handle_admin_llm_config_update()
+            return
+        if parsed.path == "/api/tenant-llm/config":
+            self._handle_tenant_llm_config_update()
+            return
+        if parsed.path == "/api/channel/tenants/list":
+            self._handle_channel_list_tenants()
+            return
+        if parsed.path == "/api/channel/tenant/select":
+            self._handle_channel_select_tenant()
+            return
+        if parsed.path == "/api/channel/tenant/active":
+            self._handle_channel_get_active_tenant()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -215,6 +281,44 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_onboarding_monitored_columns_list(self, query: str) -> None:
+        qs = parse_qs(query)
+        monitored_table_id_raw = qs.get("monitored_table_id", [None])[0]
+        payload = {
+            "context": self._request_context(),
+            "tool": "inventory.list_table_columns",
+            "input": {
+                "monitored_table_id": int(monitored_table_id_raw) if monitored_table_id_raw else None,
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_onboarding_monitored_column_create(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "inventory.register_column",
+            "input": {
+                "monitored_table_id": body.get("monitored_table_id"),
+                "column_name": body.get("column_name"),
+                "data_type": body.get("data_type"),
+                "classification": body.get("classification"),
+                "description_text": body.get("description_text"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_onboarding_monitored_column_delete(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "inventory.delete_column",
+            "input": {
+                "monitored_column_id": body.get("monitored_column_id"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_incident_create(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -295,6 +399,206 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "context": self._request_context(),
             "tool": "security_sql.get_policy",
             "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_access_users_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "access.list_users",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mfa_status_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "security.mfa.get_status",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mfa_setup_begin(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "security.mfa.begin_setup",
+            "input": {
+                "issuer": body.get("issuer", "IAOps Governance"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mfa_enable(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "security.mfa.enable",
+            "input": {
+                "otp_code": body.get("otp_code"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mfa_disable(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "security.mfa.disable_self",
+            "input": {
+                "otp_code": body.get("otp_code"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mfa_admin_reset(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "security.mfa.admin_reset",
+            "input": {
+                "target_user_id": body.get("target_user_id"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenants_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant.list_client",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_limits_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant.get_limits",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_create(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant.create",
+            "input": {
+                "name": body.get("name"),
+                "slug": body.get("slug"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_update_status(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant.update_status",
+            "input": {
+                "tenant_id": body.get("tenant_id"),
+                "status": body.get("status"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_admin_llm_providers_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "llm_admin.list_providers",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_admin_llm_config_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "llm_admin.get_app_config",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_admin_llm_config_update(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "llm_admin.update_app_config",
+            "input": {
+                "provider_name": body.get("provider_name"),
+                "model_code": body.get("model_code"),
+                "endpoint_url": body.get("endpoint_url"),
+                "secret_ref": body.get("secret_ref"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_llm_providers_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant_llm.list_providers",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_llm_config_get(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant_llm.get_config",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_llm_config_update(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant_llm.update_config",
+            "input": {
+                "use_app_default_llm": body.get("use_app_default_llm", False),
+                "provider_name": body.get("provider_name"),
+                "model_code": body.get("model_code"),
+                "endpoint_url": body.get("endpoint_url"),
+                "secret_ref": body.get("secret_ref"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_list_tenants(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.list_user_tenants",
+            "input": {
+                "channel_type": body.get("channel_type"),
+                "external_user_key": body.get("external_user_key"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_select_tenant(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.set_active_tenant",
+            "input": {
+                "channel_type": body.get("channel_type"),
+                "conversation_key": body.get("conversation_key"),
+                "external_user_key": body.get("external_user_key"),
+                "tenant_id": body.get("tenant_id"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_get_active_tenant(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.get_active_tenant",
+            "input": {
+                "channel_type": body.get("channel_type"),
+                "conversation_key": body.get("conversation_key"),
+                "external_user_key": body.get("external_user_key"),
+            },
         }
         self._dispatch_mcp(payload)
 

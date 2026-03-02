@@ -5,5 +5,8 @@
 \i sql/001_initial_governance_schema.sql
 \i sql/002_mcp_foundation.sql
 \i sql/005_data_source_catalog.sql
+\i sql/006_user_mfa.sql
+\i sql/007_superadmin_user.sql
+\i sql/008_channel_tenant_context.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql

@@ -1,4 +1,4 @@
--- Demo data baseline para desenvolvimento local
+﻿-- Demo data baseline para desenvolvimento local
 -- Requer execucao previa de:
 -- 001_initial_governance_schema.sql
 -- 002_mcp_foundation.sql
@@ -128,17 +128,37 @@ INSERT INTO iaops_gov.app_user (
     full_name,
     password_hash,
     is_active,
+    is_superadmin,
     created_at
 )
 VALUES
-    (100, 1, 'owner@iaops.demo', 'Owner Demo', 'demo_hash_not_for_prod', TRUE, NOW()),
-    (101, 1, 'admin@iaops.demo', 'Admin Demo', 'demo_hash_not_for_prod', TRUE, NOW()),
-    (102, 1, 'viewer@iaops.demo', 'Viewer Demo', 'demo_hash_not_for_prod', TRUE, NOW())
+    (100, 1, 'owner@iaops.demo', 'Owner Demo', 'demo_hash_not_for_prod', TRUE, TRUE, NOW()),
+    (101, 1, 'admin@iaops.demo', 'Admin Demo', 'demo_hash_not_for_prod', TRUE, FALSE, NOW()),
+    (102, 1, 'viewer@iaops.demo', 'Viewer Demo', 'demo_hash_not_for_prod', TRUE, FALSE, NOW())
 ON CONFLICT (id) DO UPDATE SET
     client_id = EXCLUDED.client_id,
     email = EXCLUDED.email,
     full_name = EXCLUDED.full_name,
-    is_active = EXCLUDED.is_active;
+    is_active = EXCLUDED.is_active,
+    is_superadmin = EXCLUDED.is_superadmin;
+
+INSERT INTO iaops_gov.channel_user_binding (
+    client_id,
+    user_id,
+    channel_type,
+    external_user_key,
+    is_active,
+    created_at,
+    updated_at
+)
+VALUES
+    (1, 100, 'telegram', 'tg-owner-demo', TRUE, NOW(), NOW()),
+    (1, 100, 'whatsapp', 'wa-owner-demo', TRUE, NOW(), NOW())
+ON CONFLICT (channel_type, external_user_key) DO UPDATE SET
+    client_id = EXCLUDED.client_id,
+    user_id = EXCLUDED.user_id,
+    is_active = EXCLUDED.is_active,
+    updated_at = NOW();
 
 INSERT INTO iaops_gov.tenant_user_role (
     tenant_id,
@@ -304,3 +324,4 @@ SELECT setval(pg_get_serial_sequence('iaops_gov.tenant', 'id'), GREATEST((SELECT
 SELECT setval(pg_get_serial_sequence('iaops_gov.app_user', 'id'), GREATEST((SELECT COALESCE(MAX(id), 1) FROM iaops_gov.app_user), 1), TRUE);
 SELECT setval(pg_get_serial_sequence('iaops_gov.data_source', 'id'), GREATEST((SELECT COALESCE(MAX(id), 1) FROM iaops_gov.data_source), 1), TRUE);
 SELECT setval(pg_get_serial_sequence('iaops_gov.monitored_table', 'id'), GREATEST((SELECT COALESCE(MAX(id), 1) FROM iaops_gov.monitored_table), 1), TRUE);
+

@@ -59,6 +59,33 @@ export async function deleteMonitoredTable(payload) {
   return parseResponse(response);
 }
 
+export async function listOnboardingMonitoredColumns(monitoredTableId) {
+  const query = monitoredTableId ? `?monitored_table_id=${encodeURIComponent(monitoredTableId)}` : "";
+  const response = await fetch(`/api/onboarding/monitored-columns${query}`, {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function registerMonitoredColumn(payload) {
+  const response = await fetch("/api/onboarding/monitored-columns", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function deleteMonitoredColumn(payload) {
+  const response = await fetch("/api/onboarding/monitored-columns/delete", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function listSourceCatalog() {
   const response = await fetch("/api/data-sources/catalog", {
     method: "GET",
@@ -192,6 +219,169 @@ export async function updateSqlSecurityPolicy(payload) {
 
 export async function runChatBiQuery(payload) {
   const response = await fetch("/api/chat-bi/query", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listAccessUsers() {
+  const response = await fetch("/api/access/users", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function getMfaStatus() {
+  const response = await fetch("/api/security/mfa/status", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function beginMfaSetup(payload = {}) {
+  const response = await fetch("/api/security/mfa/setup", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function enableMfa(payload) {
+  const response = await fetch("/api/security/mfa/enable", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function disableMfa(payload) {
+  const response = await fetch("/api/security/mfa/disable", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function adminResetMfa(payload) {
+  const response = await fetch("/api/security/mfa/admin-reset", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listClientTenants() {
+  const response = await fetch("/api/tenants", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function getTenantLimits() {
+  const response = await fetch("/api/tenants/limits", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function createTenant(payload) {
+  const response = await fetch("/api/tenants", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function updateTenantStatus(payload) {
+  const response = await fetch("/api/tenants/status", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listAdminLlmProviders() {
+  const response = await fetch("/api/admin/llm/providers", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function getAdminLlmConfig() {
+  const response = await fetch("/api/admin/llm/config", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function updateAdminLlmConfig(payload) {
+  const response = await fetch("/api/admin/llm/config", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listTenantLlmProviders() {
+  const response = await fetch("/api/tenant-llm/providers", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function getTenantLlmConfig() {
+  const response = await fetch("/api/tenant-llm/config", {
+    method: "GET",
+    headers: DEFAULT_HEADERS,
+  });
+  return parseResponse(response);
+}
+
+export async function updateTenantLlmConfig(payload) {
+  const response = await fetch("/api/tenant-llm/config", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function channelListUserTenants(payload) {
+  const response = await fetch("/api/channel/tenants/list", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function channelSelectTenant(payload) {
+  const response = await fetch("/api/channel/tenant/select", {
+    method: "POST",
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function channelGetActiveTenant(payload) {
+  const response = await fetch("/api/channel/tenant/active", {
     method: "POST",
     headers: DEFAULT_HEADERS,
     body: JSON.stringify(payload),
