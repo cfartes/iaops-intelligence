@@ -3,9 +3,9 @@ import {
   deleteDataSource,
   deleteMonitoredColumn,
   deleteMonitoredTable,
-  listSourceCatalog,
   listOnboardingMonitoredColumns,
   listOnboardingMonitoredTables,
+  listSourceCatalog,
   listTenantDataSources,
   registerDataSource,
   registerMonitoredColumn,
@@ -13,10 +13,11 @@ import {
   updateDataSource,
   updateDataSourceStatus,
 } from "../api/mcpApi";
-import DataSourceFormModal from "../components/DataSourceFormModal";
 import ConfirmActionModal from "../components/ConfirmActionModal";
-import MonitoredTableFormModal from "../components/MonitoredTableFormModal";
+import DataSourceFormModal from "../components/DataSourceFormModal";
 import MonitoredColumnFormModal from "../components/MonitoredColumnFormModal";
+import MonitoredTableFormModal from "../components/MonitoredTableFormModal";
+import { tUi } from "../i18n/uiText";
 
 const CATEGORY_LABEL = {
   relational: "Relacionais",
@@ -62,7 +63,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
       const data = await listSourceCatalog();
       setSources(data.sources || []);
     } catch (error) {
-      onSystemMessage("error", "Erro no onboarding", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.catalog", "Erro no onboarding"), error.message);
     } finally {
       setLoading(false);
     }
@@ -83,7 +84,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
         setSelectedSourceIdForTables(String(rows[0].id));
       }
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar fontes do tenant", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.tenantSources", "Erro ao carregar fontes do tenant"), error.message);
     }
   };
 
@@ -104,7 +105,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
         setSelectedTableIdForColumns(String(rows[0].id));
       }
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar tabelas monitoradas", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.tables", "Erro ao carregar tabelas monitoradas"), error.message);
     } finally {
       setTablesLoading(false);
     }
@@ -121,7 +122,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
       const data = await listOnboardingMonitoredColumns(Number(tableId));
       setMonitoredColumns(data.columns || []);
     } catch (error) {
-      onSystemMessage("error", "Erro ao carregar colunas monitoradas", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.columns", "Erro ao carregar colunas monitoradas"), error.message);
     } finally {
       setColumnsLoading(false);
     }
@@ -134,12 +135,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
       setIsModalOpen(false);
       onSystemMessage(
         "success",
-        "Fonte cadastrada",
+        tUi("onboarding.ok.sourceCreated.title", "Fonte cadastrada"),
         `Fonte ${data.source.source_name || data.source.source_type} cadastrada com sucesso.`
       );
       await loadTenantSources();
     } catch (error) {
-      onSystemMessage("error", "Falha no cadastro da fonte", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.sourceCreate", "Falha no cadastro da fonte"), error.message);
     } finally {
       setRegistering(false);
     }
@@ -157,12 +158,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
       setIsModalOpen(false);
       onSystemMessage(
         "success",
-        "Fonte atualizada",
+        tUi("onboarding.ok.sourceUpdated.title", "Fonte atualizada"),
         `Fonte ${data.source.source_name || data.source.source_type} atualizada com sucesso.`
       );
       await loadTenantSources();
     } catch (error) {
-      onSystemMessage("error", "Falha na edicao da fonte", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.sourceUpdate", "Falha na edicao da fonte"), error.message);
     } finally {
       setRegistering(false);
     }
@@ -175,12 +176,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
       setIsTableModalOpen(false);
       onSystemMessage(
         "success",
-        "Tabela monitorada cadastrada",
+        tUi("onboarding.ok.tableCreated.title", "Tabela monitorada cadastrada"),
         `Tabela ${data.table.schema_name}.${data.table.table_name} cadastrada com sucesso.`
       );
       await loadMonitoredTables(String(payload.data_source_id));
     } catch (error) {
-      onSystemMessage("error", "Falha no cadastro da tabela monitorada", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.tableCreate", "Falha no cadastro da tabela monitorada"), error.message);
     } finally {
       setTableSaving(false);
     }
@@ -193,12 +194,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
       setIsColumnModalOpen(false);
       onSystemMessage(
         "success",
-        "Coluna monitorada cadastrada",
+        tUi("onboarding.ok.columnCreated.title", "Coluna monitorada cadastrada"),
         `Coluna ${data.column.column_name} cadastrada com sucesso.`
       );
       await loadMonitoredColumns(String(payload.monitored_table_id));
     } catch (error) {
-      onSystemMessage("error", "Falha no cadastro da coluna monitorada", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.columnCreate", "Falha no cadastro da coluna monitorada"), error.message);
     } finally {
       setColumnSaving(false);
     }
@@ -209,9 +210,11 @@ export default function OnboardingPanel({ onSystemMessage }) {
       type: "status",
       source,
       nextIsActive,
-      title: nextIsActive ? "Ativar fonte" : "Inativar fonte",
-      message: `${nextIsActive ? "Ativar" : "Inativar"} a fonte ${source.source_name || source.source_type}?`,
-      confirmLabel: nextIsActive ? "Ativar" : "Inativar",
+      title: nextIsActive ? tUi("onboarding.source.activate", "Ativar fonte") : tUi("onboarding.source.deactivate", "Inativar fonte"),
+      message: `${nextIsActive ? tUi("onboarding.action.activate", "Ativar") : tUi("onboarding.action.deactivate", "Inativar")} a fonte ${
+        source.source_name || source.source_type
+      }?`,
+      confirmLabel: nextIsActive ? tUi("onboarding.action.activate", "Ativar") : tUi("onboarding.action.deactivate", "Inativar"),
     });
   };
 
@@ -219,9 +222,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
     setPendingAction({
       type: "delete",
       source,
-      title: "Remover fonte",
+      title: tUi("onboarding.source.remove", "Remover fonte"),
       message: `Remover a fonte ${source.source_name || source.source_type}? Essa acao nao pode ser desfeita.`,
-      confirmLabel: "Remover",
+      confirmLabel: tUi("common.remove", "Remover"),
     });
   };
 
@@ -236,26 +239,26 @@ export default function OnboardingPanel({ onSystemMessage }) {
         });
         onSystemMessage(
           "success",
-          "Fonte atualizada",
+          tUi("onboarding.ok.sourceUpdated.title", "Fonte atualizada"),
           `Fonte ${data.source.source_name || data.source.source_type} atualizada para ${
-            data.source.is_active ? "ativa" : "inativa"
+            data.source.is_active ? tUi("common.active", "ativa") : tUi("common.inactive", "inativa")
           }.`
         );
       } else if (pendingAction.type === "delete") {
         const data = await deleteDataSource({ data_source_id: pendingAction.source.id });
-        onSystemMessage("success", "Fonte removida", `Fonte ${data.result.source_type} removida com sucesso.`);
+        onSystemMessage("success", tUi("onboarding.ok.sourceRemoved.title", "Fonte removida"), `Fonte ${data.result.source_type} removida com sucesso.`);
       } else if (pendingAction.type === "delete_table") {
         const data = await deleteMonitoredTable({ monitored_table_id: pendingAction.table.id });
         onSystemMessage(
           "success",
-          "Tabela monitorada removida",
+          tUi("onboarding.ok.tableRemoved.title", "Tabela monitorada removida"),
           `Tabela ${data.result.schema_name}.${data.result.table_name} removida com sucesso.`
         );
       } else if (pendingAction.type === "delete_column") {
         const data = await deleteMonitoredColumn({ monitored_column_id: pendingAction.column.id });
         onSystemMessage(
           "success",
-          "Coluna monitorada removida",
+          tUi("onboarding.ok.columnRemoved.title", "Coluna monitorada removida"),
           `Coluna ${data.result.column_name} removida com sucesso.`
         );
       }
@@ -264,7 +267,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
       await loadMonitoredTables();
       await loadMonitoredColumns();
     } catch (error) {
-      onSystemMessage("error", "Falha na operacao", error.message);
+      onSystemMessage("error", tUi("onboarding.fail.action", "Falha na operacao"), error.message);
     } finally {
       setActionLoading(false);
     }
@@ -290,13 +293,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
   return (
     <section className="page-panel">
       <header>
-        <h2>Onboarding</h2>
-        <p>Catalogo de fontes suportadas para governanca: bancos, NoSQL, warehouses, lakes, Power BI e Fabric.</p>
+        <h2>{tUi("onboarding.header.title", "Onboarding")}</h2>
+        <p>{tUi("onboarding.header.subtitle", "Catalogo de fontes suportadas para governanca: bancos, NoSQL, warehouses, lakes, Power BI e Fabric.")}</p>
       </header>
 
       <div className="page-actions">
         <button type="button" className="btn btn-secondary" onClick={loadCatalog}>
-          Atualizar Catalogo
+          {tUi("onboarding.refresh.catalog", "Atualizar Catalogo")}
         </button>
         <button
           type="button"
@@ -306,14 +309,14 @@ export default function OnboardingPanel({ onSystemMessage }) {
             setIsModalOpen(true);
           }}
         >
-          Cadastrar Fonte
+          {tUi("onboarding.create.source", "Cadastrar Fonte")}
         </button>
         <button type="button" className="btn btn-secondary" onClick={loadTenantSources}>
-          Atualizar Fontes do Tenant
+          {tUi("onboarding.refresh.tenantSources", "Atualizar Fontes do Tenant")}
         </button>
       </div>
 
-      {loading && <p className="empty-state">Carregando fontes...</p>}
+      {loading && <p className="empty-state">{tUi("onboarding.loading.sources", "Carregando fontes...")}</p>}
 
       {!loading &&
         Object.entries(grouped).map(([category, items]) => (
@@ -330,9 +333,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
         ))}
 
       <section className="catalog-block">
-        <h3>Fontes cadastradas no tenant</h3>
+        <h3>{tUi("onboarding.sources.title", "Fontes cadastradas no tenant")}</h3>
         {tenantSources.length === 0 ? (
-          <p className="empty-state">Nenhuma fonte cadastrada ainda.</p>
+          <p className="empty-state">{tUi("onboarding.sources.empty", "Nenhuma fonte cadastrada ainda.")}</p>
         ) : (
           <div className="table-wrap">
             <table className="data-table">
@@ -353,7 +356,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                     <td>{item.source_name || item.source_type}</td>
                     <td>{item.source_type}</td>
                     <td>{item.conn_secret_ref}</td>
-                    <td>{item.is_active ? "Ativa" : "Inativa"}</td>
+                    <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
                     <td>
                       <div className="chip-row">
                         <button
@@ -364,21 +367,17 @@ export default function OnboardingPanel({ onSystemMessage }) {
                             setIsModalOpen(true);
                           }}
                         >
-                          Editar
+                          {tUi("common.edit", "Editar")}
                         </button>
                         <button
                           type="button"
                           className="btn btn-small btn-secondary"
                           onClick={() => openStatusAction(item, !item.is_active)}
                         >
-                          {item.is_active ? "Inativar" : "Ativar"}
+                          {item.is_active ? tUi("onboarding.action.deactivate", "Inativar") : tUi("onboarding.action.activate", "Ativar")}
                         </button>
-                        <button
-                          type="button"
-                          className="btn btn-small btn-secondary"
-                          onClick={() => openDeleteAction(item)}
-                        >
-                          Remover
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => openDeleteAction(item)}>
+                          {tUi("common.remove", "Remover")}
                         </button>
                       </div>
                     </td>
@@ -392,13 +391,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
 
       <section className="catalog-block">
         <div className="section-header">
-          <h3>Tabelas monitoradas por fonte</h3>
+          <h3>{tUi("onboarding.tables.title", "Tabelas monitoradas por fonte")}</h3>
           <div className="chip-row">
             <button type="button" className="btn btn-primary btn-small" onClick={() => setIsTableModalOpen(true)}>
-              Cadastrar Tabela
+              {tUi("onboarding.create.table", "Cadastrar Tabela")}
             </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredTables()}>
-              Atualizar
+              {tUi("common.refresh", "Atualizar")}
             </button>
           </div>
         </div>
@@ -416,9 +415,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
           </select>
         </div>
         {tablesLoading ? (
-          <p className="empty-state">Carregando tabelas monitoradas...</p>
+          <p className="empty-state">{tUi("onboarding.loading.tables", "Carregando tabelas monitoradas...")}</p>
         ) : monitoredTables.length === 0 ? (
-          <p className="empty-state">Nenhuma tabela monitorada para a fonte selecionada.</p>
+          <p className="empty-state">{tUi("onboarding.tables.empty", "Nenhuma tabela monitorada para a fonte selecionada.")}</p>
         ) : (
           <div className="table-wrap">
             <table className="data-table">
@@ -439,7 +438,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                     <td>{item.source_name || item.source_type}</td>
                     <td>{item.schema_name}</td>
                     <td>{item.table_name}</td>
-                    <td>{item.is_active ? "Ativa" : "Inativa"}</td>
+                    <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
                     <td>
                       <div className="chip-row">
                         <button
@@ -447,7 +446,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                           className="btn btn-small btn-secondary"
                           onClick={() => setSelectedTableIdForColumns(String(item.id))}
                         >
-                          Colunas
+                          {tUi("onboarding.columns.button", "Colunas")}
                         </button>
                         <button
                           type="button"
@@ -456,13 +455,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
                             setPendingAction({
                               type: "delete_table",
                               table: item,
-                              title: "Remover tabela monitorada",
+                              title: tUi("onboarding.table.remove", "Remover tabela monitorada"),
                               message: `Remover ${item.schema_name}.${item.table_name}?`,
-                              confirmLabel: "Remover",
+                              confirmLabel: tUi("common.remove", "Remover"),
                             })
                           }
                         >
-                          Remover
+                          {tUi("common.remove", "Remover")}
                         </button>
                       </div>
                     </td>
@@ -476,13 +475,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
 
       <section className="catalog-block">
         <div className="section-header">
-          <h3>Colunas monitoradas por tabela</h3>
+          <h3>{tUi("onboarding.columns.title", "Colunas monitoradas por tabela")}</h3>
           <div className="chip-row">
             <button type="button" className="btn btn-primary btn-small" onClick={() => setIsColumnModalOpen(true)}>
-              Cadastrar Coluna
+              {tUi("onboarding.create.column", "Cadastrar Coluna")}
             </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns()}>
-              Atualizar
+              {tUi("common.refresh", "Atualizar")}
             </button>
           </div>
         </div>
@@ -500,9 +499,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
           </select>
         </div>
         {columnsLoading ? (
-          <p className="empty-state">Carregando colunas monitoradas...</p>
+          <p className="empty-state">{tUi("onboarding.loading.columns", "Carregando colunas monitoradas...")}</p>
         ) : monitoredColumns.length === 0 ? (
-          <p className="empty-state">Nenhuma coluna monitorada para a tabela selecionada.</p>
+          <p className="empty-state">{tUi("onboarding.columns.empty", "Nenhuma coluna monitorada para a tabela selecionada.")}</p>
         ) : (
           <div className="table-wrap">
             <table className="data-table">
@@ -532,13 +531,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
                           setPendingAction({
                             type: "delete_column",
                             column: item,
-                            title: "Remover coluna monitorada",
+                            title: tUi("onboarding.column.remove", "Remover coluna monitorada"),
                             message: `Remover coluna ${item.column_name}?`,
-                            confirmLabel: "Remover",
+                            confirmLabel: tUi("common.remove", "Remover"),
                           })
                         }
                       >
-                        Remover
+                        {tUi("common.remove", "Remover")}
                       </button>
                     </td>
                   </tr>
@@ -553,8 +552,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
         open={isModalOpen}
         sourceCatalog={sources}
         initialData={editingSource}
-        title={editingSource ? "Editar fonte de dados do tenant" : "Nova fonte de dados do tenant"}
-        submitLabel={editingSource ? "Salvar alteracoes" : "Cadastrar"}
+        title={
+          editingSource
+            ? tUi("onboarding.modal.source.edit", "Editar fonte de dados do tenant")
+            : tUi("onboarding.modal.source.new", "Nova fonte de dados do tenant")
+        }
+        submitLabel={editingSource ? tUi("common.saveChanges", "Salvar alteracoes") : tUi("common.create", "Cadastrar")}
         onClose={() => {
           if (!registering) {
             setEditingSource(null);
@@ -566,9 +569,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
 
       <ConfirmActionModal
         open={Boolean(pendingAction)}
-        title={pendingAction?.title || "Confirmacao"}
+        title={pendingAction?.title || tUi("common.confirmation", "Confirmacao")}
         message={pendingAction?.message || ""}
-        confirmLabel={pendingAction?.confirmLabel || "Confirmar"}
+        confirmLabel={pendingAction?.confirmLabel || tUi("common.confirm", "Confirmar")}
         loading={actionLoading}
         onConfirm={handleConfirmAction}
         onClose={() => {
