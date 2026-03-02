@@ -4,6 +4,7 @@ import json
 import os
 import re
 import smtplib
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -2413,6 +2414,70 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             }
 
+        if kind == "tenant_select_guess":
+            listed = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.list_user_tenants",
+                    "input": {
+                        "channel_type": channel_type,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            if listed["status"] != "success":
+                return self._channel_error_response(listed, language_code)
+            listed_data = listed["data"]
+            resolved_tenant_id = self._resolve_tenant_candidate(command.get("selection_text", ""), listed_data.get("tenants") or [])
+            if resolved_tenant_id is None:
+                return {
+                    "ok": False,
+                    "command": "tenant_select",
+                    "reply_text": "\n".join(
+                        [
+                            self._t(language_code, "tenant_selection_not_understood"),
+                            self._reply_tenant_list(listed_data, language_code),
+                        ]
+                    ),
+                    "data": {"tenants": listed_data.get("tenants") or []},
+                }
+            result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.set_active_tenant",
+                    "input": {
+                        "channel_type": channel_type,
+                        "conversation_key": conversation_key,
+                        "external_user_key": external_user_key,
+                        "tenant_id": resolved_tenant_id,
+                    },
+                }
+            )
+            if result["status"] != "success":
+                return self._channel_error_response(result, language_code)
+            active = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.get_active_tenant",
+                    "input": {
+                        "channel_type": channel_type,
+                        "conversation_key": conversation_key,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            active_data = active["data"] if active["status"] == "success" else {}
+            active_lang = self._resolve_language_code_from_active(context, active_data, language_code)
+            return {
+                "ok": True,
+                "command": "tenant_select",
+                "reply_text": self._reply_active_tenant(active_data, active_lang),
+                "data": {
+                    "selection": result["data"].get("selection"),
+                    "active": active_data,
+                },
+            }
+
         if kind == "tenant_active":
             result = self._call_mcp(
                 {
@@ -2449,6 +2514,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 channel_type=channel_type,
                 external_user_key=external_user_key,
                 conversation_key=conversation_key,
+                message_text=command["question_text"],
                 language_code=language_code,
             )
             if runtime.get("error"):
@@ -2481,6 +2547,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         channel_type: str,
         external_user_key: str,
         conversation_key: str,
+        message_text: str = "",
         language_code: str = "pt-BR",
     ) -> dict:
         active = self._call_mcp(
@@ -2500,6 +2567,66 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         active_tenant_id = active_data.get("active_tenant_id")
         user = active_data.get("user") or {}
         active_user_id = user.get("user_id")
+        if active_tenant_id is None:
+            tenants_data = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "channel.list_user_tenants",
+                    "input": {
+                        "channel_type": channel_type,
+                        "external_user_key": external_user_key,
+                    },
+                }
+            )
+            if tenants_data["status"] != "success":
+                return {"error": self._channel_error_response(tenants_data, language_code)}
+            listed_data = tenants_data["data"]
+            guessed_tenant_id = self._resolve_tenant_candidate(message_text, listed_data.get("tenants") or [])
+            if guessed_tenant_id is not None:
+                selected = self._call_mcp(
+                    {
+                        "context": context,
+                        "tool": "channel.set_active_tenant",
+                        "input": {
+                            "channel_type": channel_type,
+                            "conversation_key": conversation_key,
+                            "external_user_key": external_user_key,
+                            "tenant_id": guessed_tenant_id,
+                        },
+                    }
+                )
+                if selected["status"] == "success":
+                    active = self._call_mcp(
+                        {
+                            "context": context,
+                            "tool": "channel.get_active_tenant",
+                            "input": {
+                                "channel_type": channel_type,
+                                "conversation_key": conversation_key,
+                                "external_user_key": external_user_key,
+                            },
+                        }
+                    )
+                    if active["status"] == "success":
+                        active_data = active["data"]
+                        active_tenant_id = active_data.get("active_tenant_id")
+                        user = active_data.get("user") or {}
+                        active_user_id = user.get("user_id")
+            if active_tenant_id is None:
+                no_tenant_reply = "\n".join(
+                    [
+                        self._t(language_code, "no_active_tenant_conversation"),
+                        self._reply_tenant_list(listed_data, language_code),
+                    ]
+                )
+                return {
+                    "error": {
+                        "ok": False,
+                        "command": "error",
+                        "reply_text": no_tenant_reply,
+                        "data": {"active": active_data, "tenants": listed_data.get("tenants") or []},
+                    }
+                }
         if active_tenant_id is None:
             return {
                 "error": {
@@ -2541,6 +2668,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         selected = re.match(r"^/?tenant\s+select\s+(\d+)$", normalized)
         if selected:
             return {"kind": "tenant_select", "tenant_id": int(selected.group(1))}
+        if re.match(r"^/?(?:select|selecionar|seleccione|escolher|choose|usar|use|trocar|cambiar)\s+", normalized):
+            return {"kind": "tenant_select_guess", "selection_text": raw}
+        if re.match(r"^/?(?:tenant|tenants?)\s+.+$", normalized):
+            return {"kind": "tenant_select_guess", "selection_text": raw}
+        if re.match(r"^\d+$", normalized):
+            return {"kind": "tenant_select_guess", "selection_text": raw}
         if re.match(r"^/?sql\s+", raw, flags=re.IGNORECASE):
             return {"kind": "sql_query"}
         return {"kind": "nl_query", "question_text": raw}
@@ -2564,9 +2697,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lines.append(self._t(language_code, "user_label", value=(user.get("full_name") or user.get("email") or "n/a")))
         lines.append(self._t(language_code, "available_tenants"))
         for item in tenants:
+            status_label = self._t(language_code, "tenant_status_label", value=item.get("status"))
+            role_label = self._t(language_code, "tenant_role_label", value=item.get("role"))
             lines.append(
-                f"- {item.get('tenant_id')}: {item.get('name')} ({item.get('status')}, role={item.get('role')})"
+                f"- {item.get('tenant_id')}: {item.get('name')} ({status_label}; {role_label})"
             )
+        lines.append(self._t(language_code, "hint_tenant_pick_natural"))
         lines.append(self._t(language_code, "hint_tenant_select"))
         lines.append(self._t(language_code, "hint_tenant_active"))
         return "\n".join(lines)
@@ -2593,13 +2729,45 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _reply_help(self, message_text: str, language_code: str) -> str:
         prefix = self._t(language_code, "unknown_command", value=message_text) if message_text else ""
         return (
-            f"{prefix}Comandos disponiveis:\n"
+            f"{prefix}{self._t(language_code, 'available_commands')}\n"
             "tenant list\n"
             "tenant select <id>\n"
             "tenant active\n"
             f"{self._t(language_code, 'help_keyword')}\n"
             f"{self._t(language_code, 'ask_natural_language')}"
         )
+
+    @staticmethod
+    def _normalize_lookup_text(value: str) -> str:
+        if not value:
+            return ""
+        normalized = unicodedata.normalize("NFKD", value)
+        no_accent = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        cleaned = re.sub(r"[^a-zA-Z0-9]+", " ", no_accent.lower())
+        return " ".join(cleaned.split())
+
+    def _resolve_tenant_candidate(self, selection_text: str, tenants: list[dict]) -> int | None:
+        normalized = self._normalize_lookup_text(selection_text)
+        if not normalized or not tenants:
+            return None
+
+        id_match = re.search(r"(?:^|\\s)(\\d+)(?:$|\\s)", normalized)
+        if id_match:
+            tenant_id = int(id_match.group(1))
+            if any(int(item.get("tenant_id", -1)) == tenant_id for item in tenants):
+                return tenant_id
+
+        matches: list[int] = []
+        for item in tenants:
+            tenant_name = self._normalize_lookup_text(str(item.get("name") or ""))
+            if not tenant_name:
+                continue
+            if normalized == tenant_name or tenant_name in normalized:
+                matches.append(int(item.get("tenant_id")))
+        unique_matches = sorted(set(matches))
+        if len(unique_matches) == 1:
+            return unique_matches[0]
+        return None
 
     @staticmethod
     def _reply_sql_result(sql_text: str, data: dict) -> str:
@@ -3048,6 +3216,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error_prefix": "Erro: {message}",
                 "user_label": "Usuario: {value}",
                 "available_tenants": "Tenants disponiveis:",
+                "available_commands": "Comandos disponiveis:",
+                "tenant_selection_not_understood": "Nao consegui identificar o tenant. Escolha pelo numero ou nome.",
+                "tenant_status_label": "status={value}",
+                "tenant_role_label": "perfil={value}",
+                "hint_tenant_pick_natural": "Dica: responda com o numero do tenant ou com o nome (ex.: Comercial).",
                 "hint_tenant_select": "Use: tenant select <id>",
                 "hint_tenant_active": "Use: tenant active",
                 "no_active_tenant": "Nenhum tenant ativo para esta conversa. Use: tenant list",
@@ -3073,6 +3246,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error_prefix": "Error: {message}",
                 "user_label": "User: {value}",
                 "available_tenants": "Available tenants:",
+                "available_commands": "Available commands:",
+                "tenant_selection_not_understood": "I could not identify the tenant. Choose by number or name.",
+                "tenant_status_label": "status={value}",
+                "tenant_role_label": "role={value}",
+                "hint_tenant_pick_natural": "Tip: reply with tenant number or name (e.g., Sales).",
                 "hint_tenant_select": "Use: tenant select <id>",
                 "hint_tenant_active": "Use: tenant active",
                 "no_active_tenant": "No active tenant for this conversation. Use: tenant list",
@@ -3098,6 +3276,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "error_prefix": "Error: {message}",
                 "user_label": "Usuario: {value}",
                 "available_tenants": "Tenants disponibles:",
+                "available_commands": "Comandos disponibles:",
+                "tenant_selection_not_understood": "No pude identificar el tenant. Elija por numero o nombre.",
+                "tenant_status_label": "estado={value}",
+                "tenant_role_label": "rol={value}",
+                "hint_tenant_pick_natural": "Sugerencia: responda con numero o nombre del tenant (ej.: Comercial).",
                 "hint_tenant_select": "Use: tenant select <id>",
                 "hint_tenant_active": "Use: tenant active",
                 "no_active_tenant": "No hay tenant activo para esta conversacion. Use: tenant list",

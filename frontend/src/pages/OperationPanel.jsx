@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
-import { channelWebhookTelegram, channelWebhookWhatsapp, getOperationHealth } from "../api/mcpApi";
+import {
+  channelGetActiveTenant,
+  channelListUserTenants,
+  channelSelectTenant,
+  channelWebhookTelegram,
+  channelWebhookWhatsapp,
+  getOperationHealth,
+} from "../api/mcpApi";
 import { tUi } from "../i18n/uiText";
 
 export default function OperationPanel({ onSystemMessage }) {
@@ -10,6 +17,30 @@ export default function OperationPanel({ onSystemMessage }) {
   const [messageText, setMessageText] = useState("tenant list");
   const [webhookResponse, setWebhookResponse] = useState(null);
   const [isSending, setIsSending] = useState(false);
+  const [tenantOptions, setTenantOptions] = useState([]);
+  const [selectedTenantId, setSelectedTenantId] = useState("");
+  const [activeTenantLabel, setActiveTenantLabel] = useState("");
+  const [isLoadingTenants, setIsLoadingTenants] = useState(false);
+  const [isLoadingActive, setIsLoadingActive] = useState(false);
+  const [isSelectingTenant, setIsSelectingTenant] = useState(false);
+
+  const baseChannelPayload = () => ({
+    channel_type: channelType,
+    external_user_key: externalUserKey.trim(),
+    conversation_key: conversationKey.trim(),
+  });
+
+  const ensureChannelKeys = () => {
+    if (!externalUserKey.trim() || !conversationKey.trim()) {
+      onSystemMessage(
+        "warning",
+        tUi("op.required.title", "Campos obrigatorios"),
+        tUi("op.required.message", "Informe external_user_key e conversation_key.")
+      );
+      return false;
+    }
+    return true;
+  };
 
   const loadHealth = async () => {
     try {
@@ -32,13 +63,96 @@ export default function OperationPanel({ onSystemMessage }) {
     }
     setExternalUserKey("wa-owner-demo");
     setConversationKey("wa-owner-demo");
+    setTenantOptions([]);
+    setSelectedTenantId("");
+    setActiveTenantLabel("");
   }, [channelType]);
 
-  const sendChannelMessage = async () => {
-    if (!externalUserKey.trim() || !conversationKey.trim()) {
-      onSystemMessage("warning", tUi("op.required.title", "Campos obrigatorios"), tUi("op.required.message", "Informe external_user_key e conversation_key."));
+  const loadChannelTenants = async () => {
+    if (!ensureChannelKeys()) return;
+    setIsLoadingTenants(true);
+    try {
+      const data = await channelListUserTenants(baseChannelPayload());
+      const tenants = data.tenants || [];
+      setTenantOptions(tenants);
+      setSelectedTenantId((prev) => {
+        if (prev && tenants.some((item) => String(item.tenant_id) === String(prev))) {
+          return prev;
+        }
+        return tenants[0] ? String(tenants[0].tenant_id) : "";
+      });
+      onSystemMessage(
+        "success",
+        tUi("op.tenant.loaded.title", "Tenants carregados"),
+        tUi("op.tenant.loaded.message", "{count} tenant(s) disponivel(is) para este usuario/canal.", {
+          count: tenants.length,
+        })
+      );
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsLoadingTenants(false);
+    }
+  };
+
+  const loadActiveTenant = async () => {
+    if (!ensureChannelKeys()) return;
+    setIsLoadingActive(true);
+    try {
+      const data = await channelGetActiveTenant(baseChannelPayload());
+      const activeTenantId = data.active_tenant_id;
+      const tenants = data.tenants || tenantOptions;
+      if (tenants.length > 0 && tenantOptions.length === 0) {
+        setTenantOptions(tenants);
+      }
+      if (activeTenantId == null) {
+        setActiveTenantLabel(tUi("op.tenant.active.none", "Nenhum tenant ativo na conversa."));
+        return;
+      }
+      const selected = tenants.find((item) => String(item.tenant_id) === String(activeTenantId));
+      const label = selected
+        ? `${selected.tenant_id} - ${selected.name} (${selected.status}, ${selected.role})`
+        : tUi("op.tenant.active.onlyId", "Tenant ativo: {tenant_id}", { tenant_id: activeTenantId });
+      setActiveTenantLabel(label);
+      setSelectedTenantId(String(activeTenantId));
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsLoadingActive(false);
+    }
+  };
+
+  const selectActiveTenant = async () => {
+    if (!ensureChannelKeys()) return;
+    if (!selectedTenantId) {
+      onSystemMessage(
+        "warning",
+        tUi("op.required.title", "Campos obrigatorios"),
+        tUi("op.tenant.select.required", "Selecione um tenant para ativar no canal.")
+      );
       return;
     }
+    setIsSelectingTenant(true);
+    try {
+      await channelSelectTenant({
+        ...baseChannelPayload(),
+        tenant_id: Number(selectedTenantId),
+      });
+      await loadActiveTenant();
+      onSystemMessage(
+        "success",
+        tUi("op.tenant.select.ok.title", "Tenant ativo atualizado"),
+        tUi("op.tenant.select.ok.message", "Tenant da conversa atualizado com sucesso.")
+      );
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsSelectingTenant(false);
+    }
+  };
+
+  const sendChannelMessage = async () => {
+    if (!ensureChannelKeys()) return;
     setIsSending(true);
     setWebhookResponse(null);
     try {
@@ -140,6 +254,41 @@ export default function OperationPanel({ onSystemMessage }) {
             <pre>{webhookResponse.reply_text || tUi("op.tester.noReply", "Sem resposta textual")}</pre>
           </article>
         )}
+      </section>
+
+      <section className="catalog-block channel-tester">
+        <h3>{tUi("op.tenant.title", "Gestao de Tenant no Canal")}</h3>
+        <p className="muted">
+          {tUi("op.tenant.subtitle", "Liste tenants disponiveis e defina o tenant ativo da conversa sem comandos tecnicos.")}
+        </p>
+
+        <div className="inline-form">
+          <button type="button" className="btn btn-secondary" onClick={loadChannelTenants} disabled={isLoadingTenants}>
+            {isLoadingTenants ? tUi("op.tenant.loading", "Carregando...") : tUi("op.tenant.list", "Listar Tenants")}
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadActiveTenant} disabled={isLoadingActive}>
+            {isLoadingActive ? tUi("op.tenant.loading", "Carregando...") : tUi("op.tenant.active.get", "Ver Tenant Ativo")}
+          </button>
+        </div>
+
+        <div className="inline-form">
+          <select value={selectedTenantId} onChange={(event) => setSelectedTenantId(event.target.value)}>
+            <option value="">{tUi("op.tenant.select.placeholder", "Selecione um tenant")}</option>
+            {tenantOptions.map((item) => (
+              <option key={item.tenant_id} value={String(item.tenant_id)}>
+                {`${item.tenant_id} - ${item.name} (${item.status}, ${item.role})`}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="btn btn-primary" onClick={selectActiveTenant} disabled={isSelectingTenant || !selectedTenantId}>
+            {isSelectingTenant ? tUi("op.tenant.select.saving", "Atualizando...") : tUi("op.tenant.select.set", "Definir Tenant Ativo")}
+          </button>
+        </div>
+
+        <article className="metric-card webhook-output">
+          <h4>{tUi("op.tenant.active.title", "Tenant ativo da conversa")}</h4>
+          <pre>{activeTenantLabel || tUi("op.tenant.active.none", "Nenhum tenant ativo na conversa.")}</pre>
+        </article>
       </section>
     </section>
   );
