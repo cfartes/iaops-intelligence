@@ -5,8 +5,7 @@ import SystemMessageModal from "./components/SystemMessageModal";
 import IncidentFormModal from "./components/IncidentFormModal";
 import IncidentStatusModal from "./components/IncidentStatusModal";
 import SetupAssistantModal, { ASSISTANT_STEPS } from "./components/SetupAssistantModal";
-import ClientSignupModal from "./components/ClientSignupModal";
-import LoginModal from "./components/LoginModal";
+import AuthScreen from "./components/AuthScreen";
 import PagePanel from "./pages/PagePanel";
 import OnboardingPanel from "./pages/OnboardingPanel";
 import InventoryPanel from "./pages/InventoryPanel";
@@ -34,6 +33,8 @@ import {
   confirmClientSignup,
   loginClient,
   verifyLoginMfa,
+  refreshAuthSession,
+  logoutSession,
   getAuthContext as getStoredAuthContext,
   setAuthContext as setStoredAuthContext,
   clearAuthContext as clearStoredAuthContext,
@@ -47,6 +48,7 @@ const SETUP_DEFER_UNTIL_STORAGE_KEY = "iaops_setup_assistant_defer_until_v1";
 const SETUP_MINI_CHECKLIST_COLLAPSED_KEY = "iaops_setup_mini_checklist_collapsed_v1";
 const SETUP_DEFER_HOURS = 24;
 const SESSION_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const SESSION_REFRESH_AHEAD_MS = 2 * 60 * 1000;
 
 const UI_TEXT = {
   pt: {
@@ -90,6 +92,21 @@ const UI_TEXT = {
     signUp: "Cadastre-se",
     signIn: "Entrar",
     signOut: "Sair",
+    authScreen: {
+      title: "IAOps Governance",
+      headline: "Governanca inteligente para operacao de dados",
+      lead: "Inventario de metadados, deteccao de mudancas, LGPD e consultas naturais em um unico painel.",
+      benefits: [
+        "Multi-tenant com trilha de auditoria completa",
+        "Chat BI, WhatsApp e Telegram com linguagem natural",
+        "Controles de acesso, MFA e bloqueio por risco",
+      ],
+      language_options: [
+        { value: "pt-BR", label: "Portugues (Brasil)" },
+        { value: "en-US", label: "English (US)" },
+        { value: "es-ES", label: "Espanol" },
+      ],
+    },
     sessionLabel: "Sessao: {email} ({role})",
     loginModal: {
       title: "Acesso ao IAOps",
@@ -240,6 +257,21 @@ const UI_TEXT = {
     signUp: "Sign up",
     signIn: "Sign in",
     signOut: "Sign out",
+    authScreen: {
+      title: "IAOps Governance",
+      headline: "Intelligent governance for data operations",
+      lead: "Metadata inventory, change detection, LGPD controls and natural language insights in one workspace.",
+      benefits: [
+        "Multi-tenant governance with full audit trail",
+        "Chat BI, WhatsApp and Telegram in natural language",
+        "Access controls, MFA and risk-based blocking",
+      ],
+      language_options: [
+        { value: "pt-BR", label: "Portuguese (Brazil)" },
+        { value: "en-US", label: "English (US)" },
+        { value: "es-ES", label: "Spanish" },
+      ],
+    },
     sessionLabel: "Session: {email} ({role})",
     loginModal: {
       title: "IAOps Sign in",
@@ -390,6 +422,21 @@ const UI_TEXT = {
     signUp: "Registrarse",
     signIn: "Iniciar sesion",
     signOut: "Salir",
+    authScreen: {
+      title: "IAOps Governance",
+      headline: "Gobernanza inteligente para operaciones de datos",
+      lead: "Inventario de metadatos, deteccion de cambios, controles LGPD y respuestas en lenguaje natural en un solo lugar.",
+      benefits: [
+        "Gobernanza multi-tenant con auditoria completa",
+        "Chat BI, WhatsApp y Telegram con lenguaje natural",
+        "Controles de acceso, MFA y bloqueo por riesgo",
+      ],
+      language_options: [
+        { value: "pt-BR", label: "Portugues (Brasil)" },
+        { value: "en-US", label: "English (US)" },
+        { value: "es-ES", label: "Espanol" },
+      ],
+    },
     sessionLabel: "Sesion: {email} ({role})",
     loginModal: {
       title: "Acceso IAOps",
@@ -504,8 +551,8 @@ const UI_TEXT = {
 export default function App() {
   const setupSyncSignatureRef = useRef("");
   const inactivityTimerRef = useRef(null);
+  const sessionRefreshTimerRef = useRef(null);
   const [authContext, setAuthContext] = useState(() => getStoredAuthContext());
-  const [isLoginModalOpen, setIsLoginModalOpen] = useState(() => !getStoredAuthContext());
   const [activePage, setActivePage] = useState("onboarding");
   const [userTheme, setUserTheme] = useState("light");
   const [uiLanguage, setUiLanguage] = useState("pt-BR");
@@ -515,7 +562,6 @@ export default function App() {
   const [setupPendingReasons, setSetupPendingReasons] = useState({});
   const [miniChecklistCollapsed, setMiniChecklistCollapsed] = useState(false);
   const [isEntityModalOpen, setIsEntityModalOpen] = useState(false);
-  const [isSignupModalOpen, setIsSignupModalOpen] = useState(false);
   const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
   const [isIncidentStatusModalOpen, setIsIncidentStatusModalOpen] = useState(false);
   const [selectedIncident, setSelectedIncident] = useState(null);
@@ -591,10 +637,18 @@ export default function App() {
   };
 
   const performLogout = ({ dueToInactivity = false } = {}) => {
+    const current = getStoredAuthContext();
+    if (current?.refresh_token || current?.session_token) {
+      logoutSession({
+        refresh_token: current.refresh_token || undefined,
+        session_token: current.session_token || undefined,
+      }).catch(() => {
+        // sem bloqueio de UX para logout local
+      });
+    }
     clearStoredAuthContext();
     setAuthContext(null);
     setIsSetupAssistantOpen(false);
-    setIsLoginModalOpen(true);
     if (dueToInactivity) {
       openSystemMessage("warning", uiText.inactivityLogoutTitle, uiText.inactivityLogoutMessage);
     }
@@ -637,6 +691,39 @@ export default function App() {
       }
     };
   }, [authContext, uiText.inactivityLogoutMessage, uiText.inactivityLogoutTitle]);
+
+  useEffect(() => {
+    if (sessionRefreshTimerRef.current) {
+      window.clearTimeout(sessionRefreshTimerRef.current);
+      sessionRefreshTimerRef.current = null;
+    }
+    if (!authContext?.refresh_token || !authContext?.session_expires_at_epoch) return undefined;
+
+    const expiresAtMs = Number(authContext.session_expires_at_epoch) * 1000;
+    const nowMs = Date.now();
+    const delayMs = Math.max(15_000, expiresAtMs - nowMs - SESSION_REFRESH_AHEAD_MS);
+    sessionRefreshTimerRef.current = window.setTimeout(async () => {
+      try {
+        const data = await refreshAuthSession({ refresh_token: authContext.refresh_token });
+        const next = {
+          ...(data?.auth_context || {}),
+          ...(data?.profile || {}),
+          ...(data?.session || {}),
+        };
+        setStoredAuthContext(next);
+        setAuthContext(next);
+      } catch (_) {
+        performLogout();
+      }
+    }, delayMs);
+
+    return () => {
+      if (sessionRefreshTimerRef.current) {
+        window.clearTimeout(sessionRefreshTimerRef.current);
+        sessionRefreshTimerRef.current = null;
+      }
+    };
+  }, [authContext]);
 
   useEffect(() => {
     if (!authContext) return;
@@ -874,7 +961,6 @@ export default function App() {
 
   const handleClientSignupConfirm = async (payload) => {
     await confirmClientSignup(payload);
-    setIsSignupModalOpen(false);
     openSystemMessage("success", uiText.signupModal.ok_confirm_title, uiText.signupModal.ok_confirm_message);
   };
 
@@ -887,10 +973,10 @@ export default function App() {
       const ctx = {
         ...(data?.auth_context || {}),
         ...(data?.profile || {}),
+        ...(data?.session || {}),
       };
       setStoredAuthContext(ctx);
       setAuthContext(ctx);
-      setIsLoginModalOpen(false);
       openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
       return data;
     } catch (error) {
@@ -905,10 +991,10 @@ export default function App() {
       const ctx = {
         ...(data?.auth_context || {}),
         ...(data?.profile || {}),
+        ...(data?.session || {}),
       };
       setStoredAuthContext(ctx);
       setAuthContext(ctx);
-      setIsLoginModalOpen(false);
       openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
       return data;
     } catch (error) {
@@ -962,34 +1048,47 @@ export default function App() {
     }
   };
 
+  if (!authContext) {
+    return (
+      <>
+        <AuthScreen
+          labels={{
+            signIn: uiText.signIn,
+            signUp: uiText.signUp,
+            login: uiText.loginModal,
+            signup: uiText.signupModal,
+            auth: uiText.authScreen,
+          }}
+          onLogin={handleLoginSubmit}
+          onVerifyMfa={handleVerifyLoginMfa}
+          onSignup={handleClientSignup}
+          onConfirm={handleClientSignupConfirm}
+        />
+        <SystemMessageModal
+          state={messageModal}
+          onClose={() => setMessageModal((prev) => ({ ...prev, open: false }))}
+        />
+      </>
+    );
+  }
+
   return (
     <div className="app-shell">
       <SideMenu items={localizedNavItems} activeKey={activePage} onSelect={setActivePage} />
 
       <main className="content-area">
         <div className="page-actions">
-          {authContext ? (
-            <>
-              <span className="chip">
-                {uiText.sessionLabel
-                  .replace("{email}", authContext.email || "-")
-                  .replace("{role}", authContext.role || "viewer")}
-              </span>
-              <button
-                type="button"
-                className="btn btn-secondary btn-small"
-                onClick={() => performLogout()}
-              >
-                {uiText.signOut}
-              </button>
-            </>
-          ) : (
-            <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsLoginModalOpen(true)}>
-              {uiText.signIn}
-            </button>
-          )}
-          <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSignupModalOpen(true)}>
-            {uiText.signUp}
+          <span className="chip">
+            {uiText.sessionLabel
+              .replace("{email}", authContext.email || "-")
+              .replace("{role}", authContext.role || "viewer")}
+          </span>
+          <button
+            type="button"
+            className="btn btn-secondary btn-small"
+            onClick={() => performLogout()}
+          >
+            {uiText.signOut}
           </button>
           <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSetupAssistantOpen(true)}>
             {uiText.setupAssistant}
@@ -1090,6 +1189,7 @@ export default function App() {
               setUiLanguage(preference?.language_code || "pt-BR");
               setUserTheme(preference?.theme_code || "light");
             }}
+            onSessionRevokedCurrent={() => performLogout()}
           />
         ) : activePage === "incidentes" ? (
           <IncidentPanel
@@ -1130,21 +1230,6 @@ export default function App() {
         ]}
         onClose={() => setIsEntityModalOpen(false)}
         onSubmit={handleEntityFormSubmit}
-      />
-
-      <ClientSignupModal
-        open={isSignupModalOpen}
-        onClose={() => setIsSignupModalOpen(false)}
-        onSignup={handleClientSignup}
-        onConfirm={handleClientSignupConfirm}
-        labels={uiText.signupModal}
-      />
-
-      <LoginModal
-        open={isLoginModalOpen}
-        labels={uiText.loginModal}
-        onLogin={handleLoginSubmit}
-        onVerifyMfa={handleVerifyLoginMfa}
       />
 
       <IncidentFormModal

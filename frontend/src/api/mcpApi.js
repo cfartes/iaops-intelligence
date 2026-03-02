@@ -18,6 +18,10 @@ function readStoredAuthContext() {
       full_name: parsed.full_name || "",
       role: parsed.role || "",
       tenant_name: parsed.tenant_name || "",
+      session_token: parsed.session_token || "",
+      refresh_token: parsed.refresh_token || "",
+      session_expires_at_epoch: parsed.session_expires_at_epoch || null,
+      refresh_expires_at_epoch: parsed.refresh_expires_at_epoch || null,
     };
   } catch (_) {
     return null;
@@ -51,6 +55,7 @@ function buildHeaders(overrides = {}) {
         "X-Client-Id": String(auth.client_id),
         "X-Tenant-Id": String(auth.tenant_id),
         "X-User-Id": String(auth.user_id),
+        ...(auth.session_token ? { "X-Session-Token": String(auth.session_token) } : {}),
       }
     : {
         "X-Client-Id": "1",
@@ -491,6 +496,41 @@ export async function loginClient(payload) {
 
 export async function verifyLoginMfa(payload) {
   const response = await fetch("/api/auth/mfa/verify", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function refreshAuthSession(payload) {
+  const response = await fetch("/api/auth/session/refresh", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function logoutSession(payload = {}) {
+  const response = await fetch("/api/auth/logout", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listAuthSessions() {
+  const response = await fetch("/api/auth/sessions", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function revokeAuthSession(payload) {
+  const response = await fetch("/api/auth/sessions/revoke", {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),

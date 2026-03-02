@@ -1,5 +1,15 @@
 import { useEffect, useState } from "react";
-import { adminResetMfa, createTenant, getSetupProgress, getTenantLimits, listAccessUsers, listClientTenants, updateTenantStatus } from "../api/mcpApi";
+import {
+  adminResetMfa,
+  createTenant,
+  getSetupProgress,
+  getTenantLimits,
+  listAccessUsers,
+  listAuthSessions,
+  listClientTenants,
+  revokeAuthSession,
+  updateTenantStatus,
+} from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import TenantFormModal from "../components/TenantFormModal";
 import { tUi } from "../i18n/uiText";
@@ -14,6 +24,11 @@ export default function AccessPanel({ onSystemMessage }) {
   const [tenantModalOpen, setTenantModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [tenantSetupById, setTenantSetupById] = useState({});
+  const [sessions, setSessions] = useState([]);
+  const [sessionScope, setSessionScope] = useState("self");
+  const [sessionRole, setSessionRole] = useState("viewer");
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [pendingSessionRevoke, setPendingSessionRevoke] = useState(null);
 
   const loadUsers = async () => {
     setLoading(true);
@@ -70,7 +85,22 @@ export default function AccessPanel({ onSystemMessage }) {
   useEffect(() => {
     loadUsers();
     loadTenants();
+    loadSessions();
   }, []);
+
+  const loadSessions = async () => {
+    setSessionsLoading(true);
+    try {
+      const data = await listAuthSessions();
+      setSessions(data.sessions || []);
+      setSessionScope(data.scope || "self");
+      setSessionRole(data.actor_role || "viewer");
+    } catch (error) {
+      onSystemMessage("error", tUi("access.fail.sessions", "Falha ao listar sessoes ativas"), error.message);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
 
   const confirmReset = async () => {
     if (!pendingResetUser) return;
@@ -130,6 +160,31 @@ export default function AccessPanel({ onSystemMessage }) {
       await loadTenants();
     } catch (error) {
       onSystemMessage("error", tUi("access.fail.updateTenant", "Falha ao atualizar tenant"), error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const formatEpoch = (value) => {
+    const num = Number(value || 0);
+    if (!num) return "-";
+    return new Date(num * 1000).toLocaleString();
+  };
+
+  const confirmSessionRevoke = async () => {
+    if (!pendingSessionRevoke) return;
+    setSubmitting(true);
+    try {
+      await revokeAuthSession({ session_token: pendingSessionRevoke.session_token });
+      setPendingSessionRevoke(null);
+      onSystemMessage(
+        "success",
+        tUi("access.ok.revokeSession.title", "Sessao revogada"),
+        tUi("access.ok.revokeSession.message", "Sessao de {email} foi revogada.", { email: pendingSessionRevoke.email })
+      );
+      await loadSessions();
+    } catch (error) {
+      onSystemMessage("error", tUi("access.fail.revokeSession", "Falha ao revogar sessao"), error.message);
     } finally {
       setSubmitting(false);
     }
@@ -251,6 +306,72 @@ export default function AccessPanel({ onSystemMessage }) {
         )}
       </section>
 
+      <section className="catalog-block">
+        <div className="section-header">
+          <h3>{tUi("access.sessions.title", "Sessoes ativas")}</h3>
+          <button type="button" className="btn btn-secondary btn-small" onClick={loadSessions}>
+            {tUi("common.refresh", "Atualizar")}
+          </button>
+        </div>
+        <p className="muted">
+          {tUi("access.sessions.scope", "Escopo: {scope} | Perfil: {role}", {
+            scope:
+              sessionScope === "client"
+                ? tUi("access.sessions.scope.client", "cliente")
+                : tUi("access.sessions.scope.user", "usuario"),
+            role: sessionRole,
+          })}
+        </p>
+        {sessionsLoading ? (
+          <p className="empty-state">{tUi("access.sessions.loading", "Carregando sessoes...")}</p>
+        ) : sessions.length === 0 ? (
+          <p className="empty-state">{tUi("access.sessions.empty", "Nenhuma sessao ativa.")}</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>{tUi("access.sessions.col.email", "Email")}</th>
+                  <th>{tUi("access.sessions.col.role", "Role")}</th>
+                  <th>{tUi("access.sessions.col.tenant", "Tenant")}</th>
+                  <th>{tUi("access.sessions.col.issued", "Emitida em")}</th>
+                  <th>{tUi("access.sessions.col.lastSeen", "Ultima atividade")}</th>
+                  <th>{tUi("access.sessions.col.expires", "Expira em")}</th>
+                  <th>{tUi("access.sessions.col.actions", "Acoes")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sessions.map((item) => (
+                  <tr key={item.session_token}>
+                    <td>
+                      {item.email}
+                      {item.is_current ? tUi("access.sessions.currentTag", " (atual)") : ""}
+                    </td>
+                    <td>{item.role}</td>
+                    <td>{item.tenant_name || item.tenant_id}</td>
+                    <td>{formatEpoch(item.issued_at_epoch)}</td>
+                    <td>{formatEpoch(item.last_seen_epoch)}</td>
+                    <td>{formatEpoch(item.session_expires_at_epoch)}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn-small btn-secondary"
+                        onClick={() => setPendingSessionRevoke(item)}
+                        disabled={submitting}
+                      >
+                        {item.is_current
+                          ? tUi("access.sessions.endCurrent", "Encerrar atual")
+                          : tUi("access.sessions.revoke", "Revogar")}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       <ConfirmActionModal
         open={Boolean(pendingResetUser)}
         title={tUi("access.modal.reset.title", "Resetar MFA do usuario")}
@@ -296,6 +417,25 @@ export default function AccessPanel({ onSystemMessage }) {
         onConfirm={confirmTenantStatusChange}
         onClose={() => {
           if (!submitting) setPendingTenantAction(null);
+        }}
+      />
+
+      <ConfirmActionModal
+        open={Boolean(pendingSessionRevoke)}
+        title={tUi("access.sessions.modal.title", "Revogar sessao")}
+        message={
+          pendingSessionRevoke
+            ? tUi("access.sessions.modal.message", "Deseja revogar a sessao de {email}{current}?", {
+                email: pendingSessionRevoke.email,
+                current: pendingSessionRevoke.is_current ? tUi("access.sessions.currentTag", " (atual)") : "",
+              })
+            : ""
+        }
+        confirmLabel={tUi("common.confirm", "Confirmar")}
+        loading={submitting}
+        onConfirm={confirmSessionRevoke}
+        onClose={() => {
+          if (!submitting) setPendingSessionRevoke(null);
         }}
       />
 

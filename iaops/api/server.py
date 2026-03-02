@@ -26,11 +26,25 @@ except Exception:  # pragma: no cover - depende de ambiente
 
 class IAOpsAPIHandler(BaseHTTPRequestHandler):
     server_version = "IAOpsAPI/0.1"
+    session_ttl_seconds = 30 * 60
+    refresh_ttl_seconds = 7 * 24 * 60 * 60
+    login_max_attempts = 5
+    login_attempt_window_seconds = 15 * 60
+    login_lock_seconds = 15 * 60
+    ip_throttle_window_seconds = 30 * 60
+    ip_throttle_step_one_attempts = 20
+    ip_throttle_step_two_attempts = 40
+    ip_throttle_step_one_lock_seconds = 15 * 60
+    ip_throttle_step_two_lock_seconds = 60 * 60
     signup_schema = "iaops_gov"
     signup_tables_ready = False
     pending_signups: dict[str, dict] = {}
     confirmed_signups: dict[str, dict] = {}
     mfa_login_challenges: dict[str, dict] = {}
+    active_sessions: dict[str, dict] = {}
+    refresh_sessions: dict[str, str] = {}
+    failed_login_attempts: dict[str, dict] = {}
+    failed_login_attempts_ip: dict[str, dict] = {}
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json(HTTPStatus.NO_CONTENT, {})
@@ -103,6 +117,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/setup/progress":
             self._handle_setup_progress_get()
             return
+        if parsed.path == "/api/auth/sessions":
+            self._handle_auth_sessions_list()
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -112,6 +129,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/auth/mfa/verify":
             self._handle_auth_mfa_verify()
+            return
+        if parsed.path == "/api/auth/session/refresh":
+            self._handle_auth_session_refresh()
+            return
+        if parsed.path == "/api/auth/logout":
+            self._handle_auth_logout()
+            return
+        if parsed.path == "/api/auth/sessions/revoke":
+            self._handle_auth_sessions_revoke()
             return
         if parsed.path == "/api/auth/signup":
             self._handle_auth_signup()
@@ -770,9 +796,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_auth_login(self) -> None:
+        self._cleanup_ephemeral_auth_state()
         body = self._read_json_body()
         email = str(body.get("email") or "").strip().lower()
         password = str(body.get("password") or "")
+        client_ip = self._request_ip()
         tenant_id_raw = body.get("tenant_id")
         tenant_id = None
         if tenant_id_raw not in (None, ""):
@@ -803,8 +831,79 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        throttle = self._check_login_throttle(email=email, client_ip=client_ip)
+        if throttle:
+            self._log_auth_event(
+                action_code="auth.login.blocked",
+                client_id=None,
+                tenant_id=None,
+                user_id=None,
+                target_id=email,
+                payload={
+                    "email": email,
+                    "ip": client_ip,
+                    "blocked_remaining_seconds": throttle["blocked_remaining_seconds"],
+                },
+            )
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {
+                    "status": "denied",
+                    "tool": "auth.login",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {
+                        "code": "too_many_attempts",
+                        "message": f"Tentativas excedidas. Tente novamente em {throttle['blocked_remaining_seconds']}s.",
+                    },
+                },
+            )
+            return
+        ip_throttle = self._check_ip_login_throttle(client_ip=client_ip)
+        if ip_throttle:
+            self._log_auth_event(
+                action_code="auth.login.blocked_ip",
+                client_id=None,
+                tenant_id=None,
+                user_id=None,
+                target_id=email,
+                payload={
+                    "email": email,
+                    "ip": client_ip,
+                    "blocked_remaining_seconds": ip_throttle["blocked_remaining_seconds"],
+                },
+            )
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {
+                    "status": "denied",
+                    "tool": "auth.login",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {
+                        "code": "too_many_attempts_ip",
+                        "message": f"Muitas tentativas neste IP. Tente novamente em {ip_throttle['blocked_remaining_seconds']}s.",
+                    },
+                },
+            )
+            return
+
         result = self._login_user(email=email, password=password, tenant_id=tenant_id)
         if result.get("error_code"):
+            if result.get("error_code") in {"invalid_credentials"}:
+                self._register_failed_login(email=email, client_ip=client_ip)
+            self._log_auth_event(
+                action_code="auth.login.failed",
+                client_id=None,
+                tenant_id=None,
+                user_id=None,
+                target_id=email,
+                payload={
+                    "email": email,
+                    "ip": client_ip,
+                    "error_code": result.get("error_code"),
+                },
+            )
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {
@@ -816,6 +915,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        self._clear_failed_login(email=email, client_ip=client_ip)
+        auth_ctx = result.get("auth_context") or {}
+        self._log_auth_event(
+            action_code="auth.login.success",
+            client_id=auth_ctx.get("client_id"),
+            tenant_id=auth_ctx.get("tenant_id"),
+            user_id=auth_ctx.get("user_id"),
+            target_id=email,
+            payload={
+                "email": email,
+                "ip": client_ip,
+                "mfa_required": bool(result.get("mfa_required")),
+            },
+        )
         self._send_json(
             HTTPStatus.OK,
             {
@@ -831,6 +944,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         challenge_token = str(body.get("challenge_token") or "").strip()
         otp_code = str(body.get("otp_code") or "").strip()
+        challenge_snapshot = self.mfa_login_challenges.get(challenge_token) if challenge_token else None
         if not challenge_token or not otp_code:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -846,6 +960,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
         result = self._verify_login_mfa(challenge_token=challenge_token, otp_code=otp_code)
         if result.get("error_code"):
+            self._log_auth_event(
+                action_code="auth.mfa.failed",
+                client_id=challenge_snapshot.get("client_id") if isinstance(challenge_snapshot, dict) else None,
+                tenant_id=challenge_snapshot.get("tenant_id") if isinstance(challenge_snapshot, dict) else None,
+                user_id=challenge_snapshot.get("user_id") if isinstance(challenge_snapshot, dict) else None,
+                target_id=str(challenge_snapshot.get("email")) if isinstance(challenge_snapshot, dict) else None,
+                payload={
+                    "error_code": result.get("error_code"),
+                },
+            )
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {
@@ -857,11 +981,186 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        auth_ctx = result.get("auth_context") or {}
+        profile = result.get("profile") or {}
+        self._log_auth_event(
+            action_code="auth.mfa.success",
+            client_id=auth_ctx.get("client_id"),
+            tenant_id=auth_ctx.get("tenant_id"),
+            user_id=auth_ctx.get("user_id"),
+            target_id=profile.get("email"),
+            payload={"mfa_required": False},
+        )
         self._send_json(
             HTTPStatus.OK,
             {
                 "status": "success",
                 "tool": "auth.mfa.verify",
+                "correlation_id": str(uuid.uuid4()),
+                "data": result,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_session_refresh(self) -> None:
+        body = self._read_json_body()
+        refresh_token = str(body.get("refresh_token") or "").strip()
+        if not refresh_token:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.session.refresh",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "refresh_token obrigatorio"},
+                },
+            )
+            return
+        result = self._refresh_session(refresh_token=refresh_token)
+        if result.get("error_code"):
+            self._log_auth_event(
+                action_code="auth.session.refresh.failed",
+                client_id=None,
+                tenant_id=None,
+                user_id=None,
+                target_id=None,
+                payload={"error_code": result.get("error_code")},
+            )
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.session.refresh",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": result["error_code"], "message": result.get("message", "Falha no refresh")},
+                },
+            )
+            return
+        auth_ctx = result.get("auth_context") or {}
+        profile = result.get("profile") or {}
+        self._log_auth_event(
+            action_code="auth.session.refresh.success",
+            client_id=auth_ctx.get("client_id"),
+            tenant_id=auth_ctx.get("tenant_id"),
+            user_id=auth_ctx.get("user_id"),
+            target_id=profile.get("email"),
+            payload={"refreshed": True},
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.session.refresh",
+                "correlation_id": str(uuid.uuid4()),
+                "data": result,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_logout(self) -> None:
+        body = self._read_json_body()
+        refresh_token = str(body.get("refresh_token") or "").strip()
+        session_token = str(self.headers.get("X-Session-Token", "") or "").strip()
+        if not session_token:
+            session_token = str(body.get("session_token") or "").strip()
+        logout_ctx = self._resolve_context_from_tokens(session_token=session_token, refresh_token=refresh_token)
+        self._invalidate_session(session_token=session_token, refresh_token=refresh_token)
+        self._log_auth_event(
+            action_code="auth.logout",
+            client_id=logout_ctx.get("client_id"),
+            tenant_id=logout_ctx.get("tenant_id"),
+            user_id=logout_ctx.get("user_id"),
+            target_id=logout_ctx.get("email"),
+            payload={"logout": True},
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.logout",
+                "correlation_id": str(uuid.uuid4()),
+                "data": {"logged_out": True},
+                "error": None,
+            },
+        )
+
+    def _handle_auth_sessions_list(self) -> None:
+        session_token = str(self.headers.get("X-Session-Token", "") or "").strip()
+        if not session_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "auth.sessions.list",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao obrigatoria."},
+                },
+            )
+            return
+        result = self._list_active_sessions_for_actor(session_token=session_token)
+        if result.get("error_code"):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "auth.sessions.list",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": result["error_code"], "message": result.get("message", "Acesso negado")},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.sessions.list",
+                "correlation_id": str(uuid.uuid4()),
+                "data": result,
+                "error": None,
+            },
+        )
+
+    def _handle_auth_sessions_revoke(self) -> None:
+        session_token = str(self.headers.get("X-Session-Token", "") or "").strip()
+        body = self._read_json_body()
+        target_session_token = str(body.get("session_token") or "").strip()
+        if not session_token or not target_session_token:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "auth.sessions.revoke",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "Sessao atual e session_token alvo sao obrigatorios."},
+                },
+            )
+            return
+        result = self._revoke_active_session_for_actor(
+            actor_session_token=session_token,
+            target_session_token=target_session_token,
+        )
+        if result.get("error_code"):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "auth.sessions.revoke",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": result["error_code"], "message": result.get("message", "Acesso negado")},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "auth.sessions.revoke",
                 "correlation_id": str(uuid.uuid4()),
                 "data": result,
                 "error": None,
@@ -1416,6 +1715,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "expires_at_epoch": int(time()) + (5 * 60),
                     }
 
+                session_data = self._issue_session(
+                    client_id=int(user[1]),
+                    tenant_id=resolved_tenant_id,
+                    user_id=int(user[0]),
+                    email=str(user[2]),
+                    full_name=str(user[3] or ""),
+                    role=role,
+                    tenant_name=tenant_name,
+                )
                 return {
                     "mfa_required": False,
                     "auth_context": {
@@ -1429,6 +1737,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "role": role,
                         "tenant_name": tenant_name,
                     },
+                    "session": session_data,
                 }
         except Exception:
             return {"error_code": "login_failed", "message": "Falha ao processar login."}
@@ -1450,6 +1759,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not verify_totp(secret, otp_code):
             return {"error_code": "invalid_otp", "message": "Codigo TOTP invalido."}
         self.mfa_login_challenges.pop(challenge_token, None)
+        session_data = self._issue_session(
+            client_id=int(challenge["client_id"]),
+            tenant_id=int(challenge["tenant_id"]),
+            user_id=int(challenge["user_id"]),
+            email=str(challenge["email"]),
+            full_name=str(challenge["full_name"] or ""),
+            role=str(challenge["role"] or "viewer"),
+            tenant_name=str(challenge["tenant_name"] or ""),
+        )
         return {
             "mfa_required": False,
             "auth_context": {
@@ -1463,6 +1781,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "role": str(challenge["role"] or "viewer"),
                 "tenant_name": str(challenge["tenant_name"] or ""),
             },
+            "session": session_data,
         }
 
     @staticmethod
@@ -1530,6 +1849,392 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not row:
             return None
         return int(row[0]), str(row[1]), str(row[2])
+
+    def _issue_session(
+        self,
+        *,
+        client_id: int,
+        tenant_id: int,
+        user_id: int,
+        email: str,
+        full_name: str,
+        role: str,
+        tenant_name: str,
+    ) -> dict:
+        now_epoch = int(time())
+        session_token = token_hex(24)
+        refresh_token = token_hex(30)
+        session_expires_at_epoch = now_epoch + int(self.session_ttl_seconds)
+        refresh_expires_at_epoch = now_epoch + int(self.refresh_ttl_seconds)
+        session_payload = {
+            "client_id": int(client_id),
+            "tenant_id": int(tenant_id),
+            "user_id": int(user_id),
+            "email": str(email),
+            "full_name": str(full_name or ""),
+            "role": str(role or "viewer"),
+            "tenant_name": str(tenant_name or ""),
+            "session_token": session_token,
+            "refresh_token": refresh_token,
+            "issued_at_epoch": now_epoch,
+            "last_seen_epoch": now_epoch,
+            "session_expires_at_epoch": session_expires_at_epoch,
+            "refresh_expires_at_epoch": refresh_expires_at_epoch,
+        }
+        self.active_sessions[session_token] = dict(session_payload)
+        self.refresh_sessions[refresh_token] = session_token
+        return {
+            "session_token": session_token,
+            "refresh_token": refresh_token,
+            "session_expires_at_epoch": session_expires_at_epoch,
+            "refresh_expires_at_epoch": refresh_expires_at_epoch,
+        }
+
+    def _refresh_session(self, *, refresh_token: str) -> dict:
+        self._cleanup_expired_sessions()
+        session_token = self.refresh_sessions.get(refresh_token)
+        if not session_token:
+            return {"error_code": "invalid_refresh_token", "message": "Refresh token invalido."}
+        current = self.active_sessions.get(session_token)
+        if not current:
+            self.refresh_sessions.pop(refresh_token, None)
+            return {"error_code": "invalid_refresh_token", "message": "Sessao nao encontrada para o refresh."}
+        if int(current.get("refresh_expires_at_epoch") or 0) < int(time()):
+            self._invalidate_session(session_token=session_token, refresh_token=refresh_token)
+            return {"error_code": "expired_refresh_token", "message": "Refresh token expirado."}
+        self._invalidate_session(session_token=session_token, refresh_token=refresh_token)
+        session_data = self._issue_session(
+            client_id=int(current["client_id"]),
+            tenant_id=int(current["tenant_id"]),
+            user_id=int(current["user_id"]),
+            email=str(current["email"]),
+            full_name=str(current.get("full_name") or ""),
+            role=str(current.get("role") or "viewer"),
+            tenant_name=str(current.get("tenant_name") or ""),
+        )
+        return {
+            "auth_context": {
+                "client_id": int(current["client_id"]),
+                "tenant_id": int(current["tenant_id"]),
+                "user_id": int(current["user_id"]),
+            },
+            "profile": {
+                "email": str(current["email"]),
+                "full_name": str(current.get("full_name") or ""),
+                "role": str(current.get("role") or "viewer"),
+                "tenant_name": str(current.get("tenant_name") or ""),
+            },
+            "session": session_data,
+        }
+
+    def _invalidate_session(self, *, session_token: str | None, refresh_token: str | None) -> None:
+        if session_token:
+            data = self.active_sessions.pop(session_token, None)
+            if data:
+                token = str(data.get("refresh_token") or "")
+                if token:
+                    self.refresh_sessions.pop(token, None)
+        if refresh_token:
+            mapped_session = self.refresh_sessions.pop(refresh_token, None)
+            if mapped_session:
+                self.active_sessions.pop(mapped_session, None)
+
+    def _cleanup_expired_sessions(self) -> None:
+        now_epoch = int(time())
+        expired_tokens = []
+        for session_token, data in self.active_sessions.items():
+            if int(data.get("refresh_expires_at_epoch") or 0) < now_epoch:
+                expired_tokens.append(session_token)
+                continue
+            if int(data.get("session_expires_at_epoch") or 0) < now_epoch:
+                refresh_token = str(data.get("refresh_token") or "")
+                if refresh_token:
+                    self.refresh_sessions.pop(refresh_token, None)
+                expired_tokens.append(session_token)
+        for session_token in expired_tokens:
+            self.active_sessions.pop(session_token, None)
+
+    def _resolve_session_context(self, session_token: str) -> dict | None:
+        if not session_token:
+            return None
+        self._cleanup_expired_sessions()
+        data = self.active_sessions.get(session_token)
+        if not data:
+            return None
+        if int(data.get("session_expires_at_epoch") or 0) < int(time()):
+            self._invalidate_session(
+                session_token=session_token,
+                refresh_token=str(data.get("refresh_token") or ""),
+            )
+            return None
+        data["last_seen_epoch"] = int(time())
+        self.active_sessions[session_token] = data
+        return {
+            "client_id": int(data["client_id"]),
+            "tenant_id": int(data["tenant_id"]),
+            "user_id": int(data["user_id"]),
+        }
+
+    def _resolve_context_from_tokens(self, *, session_token: str | None, refresh_token: str | None) -> dict:
+        token = str(session_token or "").strip()
+        if not token and refresh_token:
+            mapped = self.refresh_sessions.get(str(refresh_token))
+            token = str(mapped or "")
+        if not token:
+            return {}
+        data = self.active_sessions.get(token) or {}
+        if not data:
+            return {}
+        return {
+            "client_id": data.get("client_id"),
+            "tenant_id": data.get("tenant_id"),
+            "user_id": data.get("user_id"),
+            "email": data.get("email"),
+        }
+
+    def _list_active_sessions_for_actor(self, *, session_token: str) -> dict:
+        self._cleanup_ephemeral_auth_state()
+        actor = self.active_sessions.get(session_token)
+        if not actor:
+            return {"error_code": "invalid_session", "message": "Sessao invalida ou expirada."}
+        role = self._resolve_actor_role_from_session(actor)
+        allow_all_client = role in {"owner", "admin"}
+        actor_user_id = int(actor.get("user_id") or 0)
+        actor_client_id = int(actor.get("client_id") or 0)
+        items = []
+        for token, data in self.active_sessions.items():
+            if int(data.get("client_id") or 0) != actor_client_id:
+                continue
+            if not allow_all_client and int(data.get("user_id") or 0) != actor_user_id:
+                continue
+            items.append(
+                {
+                    "session_token": token,
+                    "user_id": int(data.get("user_id") or 0),
+                    "email": str(data.get("email") or ""),
+                    "role": str(data.get("role") or "viewer"),
+                    "tenant_id": int(data.get("tenant_id") or 0),
+                    "tenant_name": str(data.get("tenant_name") or ""),
+                    "issued_at_epoch": int(data.get("issued_at_epoch") or 0),
+                    "last_seen_epoch": int(data.get("last_seen_epoch") or 0),
+                    "session_expires_at_epoch": int(data.get("session_expires_at_epoch") or 0),
+                    "is_current": token == session_token,
+                }
+            )
+        items.sort(key=lambda row: row["issued_at_epoch"], reverse=True)
+        return {
+            "sessions": items,
+            "scope": "client" if allow_all_client else "self",
+            "actor_role": role,
+        }
+
+    def _revoke_active_session_for_actor(self, *, actor_session_token: str, target_session_token: str) -> dict:
+        self._cleanup_ephemeral_auth_state()
+        actor = self.active_sessions.get(actor_session_token)
+        target = self.active_sessions.get(target_session_token)
+        if not actor or not target:
+            return {"error_code": "invalid_session", "message": "Sessao nao encontrada."}
+        actor_role = self._resolve_actor_role_from_session(actor)
+        if int(actor.get("client_id") or 0) != int(target.get("client_id") or 0):
+            return {"error_code": "forbidden", "message": "Sessao alvo fora do cliente."}
+        is_self = actor_session_token == target_session_token
+        if not is_self and actor_role not in {"owner", "admin"}:
+            return {"error_code": "forbidden", "message": "Somente owner/admin podem revogar outras sessoes."}
+        self._invalidate_session(
+            session_token=target_session_token,
+            refresh_token=str(target.get("refresh_token") or ""),
+        )
+        self._log_auth_event(
+            action_code="auth.session.revoke",
+            client_id=actor.get("client_id"),
+            tenant_id=actor.get("tenant_id"),
+            user_id=actor.get("user_id"),
+            target_id=str(target.get("email") or ""),
+            payload={
+                "revoked_session_token": target_session_token,
+                "revoked_user_id": target.get("user_id"),
+                "is_self": is_self,
+            },
+        )
+        return {"revoked": True, "session_token": target_session_token, "is_self": is_self}
+
+    def _resolve_actor_role_from_session(self, session_data: dict) -> str:
+        if not isinstance(session_data, dict):
+            return "viewer"
+        if not self._is_db_enabled():
+            return str(session_data.get("role") or "viewer")
+        try:
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT tur.role
+                    FROM iaops_gov.tenant_user_role tur
+                    WHERE tur.tenant_id = %(tenant_id)s
+                      AND tur.user_id = %(user_id)s
+                    LIMIT 1
+                    """,
+                    {
+                        "tenant_id": int(session_data.get("tenant_id") or 0),
+                        "user_id": int(session_data.get("user_id") or 0),
+                    },
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+        except Exception:
+            pass
+        return str(session_data.get("role") or "viewer")
+
+    def _check_login_throttle(self, *, email: str, client_ip: str) -> dict | None:
+        key = self._login_throttle_key(email=email, client_ip=client_ip)
+        now_epoch = int(time())
+        state = self.failed_login_attempts.get(key)
+        if not state:
+            return None
+        locked_until = int(state.get("locked_until") or 0)
+        if locked_until > now_epoch:
+            return {"blocked_remaining_seconds": locked_until - now_epoch}
+        attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(self.login_attempt_window_seconds)]
+        state["attempts"] = attempts
+        state["locked_until"] = 0
+        if attempts:
+            self.failed_login_attempts[key] = state
+        else:
+            self.failed_login_attempts.pop(key, None)
+        return None
+
+    def _register_failed_login(self, *, email: str, client_ip: str) -> None:
+        key = self._login_throttle_key(email=email, client_ip=client_ip)
+        now_epoch = int(time())
+        state = self.failed_login_attempts.get(key) or {"attempts": [], "locked_until": 0}
+        attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(self.login_attempt_window_seconds)]
+        attempts.append(now_epoch)
+        locked_until = int(state.get("locked_until") or 0)
+        if len(attempts) >= int(self.login_max_attempts):
+            locked_until = now_epoch + int(self.login_lock_seconds)
+            attempts = []
+        self.failed_login_attempts[key] = {"attempts": attempts, "locked_until": locked_until}
+
+        ip_state = self.failed_login_attempts_ip.get(client_ip) or {"attempts": [], "locked_until": 0}
+        ip_attempts = [ts for ts in (ip_state.get("attempts") or []) if int(ts) >= now_epoch - int(self.ip_throttle_window_seconds)]
+        ip_attempts.append(now_epoch)
+        ip_locked_until = int(ip_state.get("locked_until") or 0)
+        if len(ip_attempts) >= int(self.ip_throttle_step_two_attempts):
+            ip_locked_until = now_epoch + int(self.ip_throttle_step_two_lock_seconds)
+            ip_attempts = []
+        elif len(ip_attempts) >= int(self.ip_throttle_step_one_attempts):
+            ip_locked_until = now_epoch + int(self.ip_throttle_step_one_lock_seconds)
+            ip_attempts = []
+        self.failed_login_attempts_ip[client_ip] = {"attempts": ip_attempts, "locked_until": ip_locked_until}
+
+    def _clear_failed_login(self, *, email: str, client_ip: str) -> None:
+        key = self._login_throttle_key(email=email, client_ip=client_ip)
+        self.failed_login_attempts.pop(key, None)
+
+    def _check_ip_login_throttle(self, *, client_ip: str) -> dict | None:
+        now_epoch = int(time())
+        state = self.failed_login_attempts_ip.get(client_ip)
+        if not state:
+            return None
+        locked_until = int(state.get("locked_until") or 0)
+        if locked_until > now_epoch:
+            return {"blocked_remaining_seconds": locked_until - now_epoch}
+        attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(self.ip_throttle_window_seconds)]
+        state["attempts"] = attempts
+        state["locked_until"] = 0
+        if attempts:
+            self.failed_login_attempts_ip[client_ip] = state
+        else:
+            self.failed_login_attempts_ip.pop(client_ip, None)
+        return None
+
+    @staticmethod
+    def _login_throttle_key(*, email: str, client_ip: str) -> str:
+        return f"{str(email or '').strip().lower()}|{str(client_ip or '').strip()}"
+
+    def _request_ip(self) -> str:
+        forwarded = str(self.headers.get("X-Forwarded-For", "") or "").strip()
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        remote = self.client_address[0] if self.client_address else ""
+        return str(remote or "").strip()
+
+    def _cleanup_ephemeral_auth_state(self) -> None:
+        now_epoch = int(time())
+        expired_challenges = [
+            token
+            for token, data in self.mfa_login_challenges.items()
+            if int(data.get("expires_at_epoch") or 0) <= now_epoch
+        ]
+        for token in expired_challenges:
+            self.mfa_login_challenges.pop(token, None)
+        self._cleanup_expired_sessions()
+
+        for key, state in list(self.failed_login_attempts.items()):
+            locked_until = int(state.get("locked_until") or 0)
+            attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(self.login_attempt_window_seconds)]
+            if locked_until > now_epoch or attempts:
+                self.failed_login_attempts[key] = {"attempts": attempts, "locked_until": locked_until if locked_until > now_epoch else 0}
+            else:
+                self.failed_login_attempts.pop(key, None)
+
+        for ip, state in list(self.failed_login_attempts_ip.items()):
+            locked_until = int(state.get("locked_until") or 0)
+            attempts = [ts for ts in (state.get("attempts") or []) if int(ts) >= now_epoch - int(self.ip_throttle_window_seconds)]
+            if locked_until > now_epoch or attempts:
+                self.failed_login_attempts_ip[ip] = {"attempts": attempts, "locked_until": locked_until if locked_until > now_epoch else 0}
+            else:
+                self.failed_login_attempts_ip.pop(ip, None)
+
+    def _log_auth_event(
+        self,
+        *,
+        action_code: str,
+        client_id: int | None,
+        tenant_id: int | None,
+        user_id: int | None,
+        target_id: str | None,
+        payload: dict | None,
+    ) -> None:
+        if not self._is_db_enabled():
+            return
+        try:
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.audit_log (
+                        client_id,
+                        tenant_id,
+                        user_id,
+                        action_code,
+                        target_type,
+                        target_id,
+                        payload_json
+                    )
+                    VALUES (
+                        %(client_id)s,
+                        %(tenant_id)s,
+                        %(user_id)s,
+                        %(action_code)s,
+                        'auth',
+                        %(target_id)s,
+                        %(payload_json)s::jsonb
+                    )
+                    """,
+                    {
+                        "client_id": int(client_id) if client_id else None,
+                        "tenant_id": int(tenant_id) if tenant_id else None,
+                        "user_id": int(user_id) if user_id else None,
+                        "action_code": action_code,
+                        "target_id": str(target_id) if target_id else None,
+                        "payload_json": json.dumps(payload or {}, ensure_ascii=True),
+                    },
+                )
+                conn.commit()
+        except Exception:
+            # auditoria nao deve bloquear fluxo de autenticacao
+            return
 
     @staticmethod
     def _slugify_text(value: str) -> str:
@@ -2480,6 +3185,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         self._dispatch_mcp(payload)
 
     def _dispatch_mcp(self, payload: dict) -> None:
+        context = payload.get("context") if isinstance(payload, dict) else None
+        if isinstance(context, dict) and context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": payload.get("tool"),
+                    "correlation_id": context.get("correlation_id"),
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
         result = self._call_mcp(payload)
         if result["status"] == "success":
             self._send_json(HTTPStatus.OK, result)
@@ -2494,6 +3212,23 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return handle_request(payload)
 
     def _request_context(self) -> dict:
+        session_token = str(self.headers.get("X-Session-Token", "") or "").strip()
+        if session_token:
+            session_context = self._resolve_session_context(session_token)
+            if not session_context:
+                return {
+                    "client_id": 0,
+                    "tenant_id": 0,
+                    "user_id": 0,
+                    "correlation_id": self.headers.get("X-Correlation-Id", str(uuid.uuid4())),
+                    "invalid_session": True,
+                }
+            return {
+                "client_id": int(session_context["client_id"]),
+                "tenant_id": int(session_context["tenant_id"]),
+                "user_id": int(session_context["user_id"]),
+                "correlation_id": self.headers.get("X-Correlation-Id", str(uuid.uuid4())),
+            }
         return {
             "client_id": int(self.headers.get("X-Client-Id", "1")),
             "tenant_id": int(self.headers.get("X-Tenant-Id", "10")),

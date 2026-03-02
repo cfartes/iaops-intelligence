@@ -7,18 +7,22 @@ import {
   getMfaStatus,
   getUserTenantPreference,
   getTenantLlmConfig,
+  getAuthContext,
   listAdminLlmProviders,
+  listAuthSessions,
   listTenantLlmProviders,
+  revokeAuthSession,
   updateUserTenantPreference,
   updateTenantLlmConfig,
   updateAdminLlmConfig,
 } from "../api/mcpApi";
 import AppLlmConfigModal from "../components/AppLlmConfigModal";
+import ConfirmActionModal from "../components/ConfirmActionModal";
 import MfaCodeModal from "../components/MfaCodeModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
 import { tUi } from "../i18n/uiText";
 
-export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied }) {
+export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied, onSessionRevokedCurrent }) {
   const [mfa, setMfa] = useState(null);
   const [loading, setLoading] = useState(false);
   const [setupInfo, setSetupInfo] = useState(null);
@@ -35,6 +39,9 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
   const [languageDraft, setLanguageDraft] = useState("pt-BR");
   const [themeDraft, setThemeDraft] = useState("light");
   const [chatResponseModeDraft, setChatResponseModeDraft] = useState("executive");
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [pendingSessionRevoke, setPendingSessionRevoke] = useState(null);
 
   const loadStatus = async () => {
     setLoading(true);
@@ -53,6 +60,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
     loadLlmAdmin();
     loadTenantLlmConfig();
     loadUserPreference();
+    loadSessions();
   }, []);
 
   const loadLlmAdmin = async () => {
@@ -199,6 +207,53 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
     }
   };
 
+  const loadSessions = async () => {
+    setSessionsLoading(true);
+    try {
+      const data = await listAuthSessions();
+      const current = getAuthContext();
+      const scoped =
+        data.scope === "client"
+          ? (data.sessions || []).filter((item) => Number(item.user_id) === Number(current?.user_id))
+          : data.sessions || [];
+      setSessions(scoped);
+    } catch (error) {
+      onSystemMessage("error", tUi("config.fail.sessions", "Falha ao carregar sessoes"), error.message);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const formatEpoch = (value) => {
+    const num = Number(value || 0);
+    if (!num) return "-";
+    return new Date(num * 1000).toLocaleString();
+  };
+
+  const confirmRevokeSession = async () => {
+    if (!pendingSessionRevoke) return;
+    setSubmitting(true);
+    try {
+      await revokeAuthSession({ session_token: pendingSessionRevoke.session_token });
+      const wasCurrent = Boolean(pendingSessionRevoke.is_current);
+      setPendingSessionRevoke(null);
+      onSystemMessage(
+        "success",
+        tUi("config.ok.revokeSession.title", "Sessao encerrada"),
+        tUi("config.ok.revokeSession.message", "Sessao revogada com sucesso.")
+      );
+      if (wasCurrent) {
+        onSessionRevokedCurrent?.();
+        return;
+      }
+      await loadSessions();
+    } catch (error) {
+      onSystemMessage("error", tUi("config.fail.revokeSession", "Falha ao revogar sessao"), error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -282,6 +337,59 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
             {tUi("config.pref.refresh", "Atualizar Preferencia")}
           </button>
         </div>
+      </section>
+
+      <section className="catalog-block">
+        <div className="section-header">
+          <h3>{tUi("config.sessions.title", "Sessoes do usuario")}</h3>
+          <button type="button" className="btn btn-secondary btn-small" onClick={loadSessions} disabled={submitting}>
+            {tUi("common.refresh", "Atualizar")}
+          </button>
+        </div>
+        {sessionsLoading ? (
+          <p className="empty-state">{tUi("config.sessions.loading", "Carregando sessoes...")}</p>
+        ) : sessions.length === 0 ? (
+          <p className="empty-state">{tUi("config.sessions.empty", "Nenhuma sessao ativa para este usuario.")}</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>{tUi("config.sessions.col.tenant", "Tenant")}</th>
+                  <th>{tUi("config.sessions.col.issued", "Emitida em")}</th>
+                  <th>{tUi("config.sessions.col.lastSeen", "Ultima atividade")}</th>
+                  <th>{tUi("config.sessions.col.expires", "Expira em")}</th>
+                  <th>{tUi("config.sessions.col.actions", "Acoes")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sessions.map((item) => (
+                  <tr key={item.session_token}>
+                    <td>
+                      {item.tenant_name || item.tenant_id}
+                      {item.is_current ? tUi("config.sessions.currentRowTag", " (atual)") : ""}
+                    </td>
+                    <td>{formatEpoch(item.issued_at_epoch)}</td>
+                    <td>{formatEpoch(item.last_seen_epoch)}</td>
+                    <td>{formatEpoch(item.session_expires_at_epoch)}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn-small btn-secondary"
+                        onClick={() => setPendingSessionRevoke(item)}
+                        disabled={submitting}
+                      >
+                        {item.is_current
+                          ? tUi("config.sessions.endCurrent", "Encerrar atual")
+                          : tUi("config.sessions.end", "Encerrar")}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section className="catalog-block">
@@ -408,6 +516,24 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           if (!submitting) setTenantLlmModalOpen(false);
         }}
         onSubmit={submitTenantLlmConfig}
+      />
+
+      <ConfirmActionModal
+        open={Boolean(pendingSessionRevoke)}
+        title={tUi("config.sessions.modal.title", "Encerrar sessao")}
+        message={
+          pendingSessionRevoke
+            ? tUi("config.sessions.modal.message", "Deseja encerrar esta sessao{current}?", {
+                current: pendingSessionRevoke.is_current ? tUi("config.sessions.currentTag", " atual") : "",
+              })
+            : ""
+        }
+        confirmLabel={tUi("common.confirm", "Confirmar")}
+        loading={submitting}
+        onConfirm={confirmRevokeSession}
+        onClose={() => {
+          if (!submitting) setPendingSessionRevoke(null);
+        }}
       />
     </section>
   );
