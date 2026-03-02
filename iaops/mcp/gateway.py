@@ -1,0 +1,433 @@
+from __future__ import annotations
+
+import re
+import time
+from typing import Any, Callable
+
+from .models import ROLE_ORDER, RequestContext, ToolExecutionResult
+from .repository import MCPRepository
+
+
+class MCPGateway:
+    def __init__(self, repository: MCPRepository) -> None:
+        self.repository = repository
+        self._handlers: dict[str, Callable[[RequestContext, dict[str, Any], int | None], dict[str, Any]]] = {
+            "source.list_catalog": self._handle_source_list_catalog,
+            "source.list_tenant": self._handle_source_list_tenant,
+            "source.register": self._handle_source_register,
+            "source.update_status": self._handle_source_update_status,
+            "source.update": self._handle_source_update,
+            "source.delete": self._handle_source_delete,
+            "inventory.list_tables": self._handle_list_tables,
+            "inventory.list_columns": self._handle_list_columns,
+            "inventory.list_tenant_tables": self._handle_list_tenant_tables,
+            "inventory.register_table": self._handle_register_table,
+            "inventory.delete_table": self._handle_delete_table,
+            "query.execute_safe_sql": self._handle_execute_safe_sql,
+            "security_sql.get_policy": self._handle_security_sql_get_policy,
+            "security_sql.update_policy": self._handle_security_sql_update_policy,
+            "incident.create": self._handle_incident_create,
+            "incident.list": self._handle_incident_list,
+            "incident.update_status": self._handle_incident_update_status,
+            "events.list": self._handle_events_list,
+            "audit.list_calls": self._handle_audit_list_calls,
+            "ops.get_health_summary": self._handle_health_summary,
+        }
+
+    def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        start = time.perf_counter()
+        try:
+            context = self._parse_context(payload)
+        except ValueError as exc:
+            return {
+                "status": "denied",
+                "tool": payload.get("tool", "unknown"),
+                "correlation_id": None,
+                "data": {},
+                "error": {
+                    "code": "invalid_context",
+                    "message": str(exc),
+                },
+            }
+        tool_name = payload.get("tool")
+        tool_input = payload.get("input", {})
+
+        if not isinstance(tool_name, str) or tool_name not in self._handlers:
+            result = ToolExecutionResult("error", {}, "tool_not_found", "Tool nao registrada")
+            return self._finalize_log(context, tool_name or "unknown", payload, result, start)
+
+        tenant_ok = self.repository.is_tenant_operational(context.client_id, context.tenant_id)
+        if not tenant_ok:
+            result = ToolExecutionResult("denied", {}, "tenant_blocked", "Tenant inativo, bloqueado ou inadimplente")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
+        policy = self.repository.get_tool_policy(context.tenant_id, tool_name)
+        if policy is None or not policy.is_enabled:
+            result = ToolExecutionResult("denied", {}, "tool_disabled", "Tool nao habilitada para o tenant")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
+        role = self.repository.get_user_role(context.tenant_id, context.user_id)
+        if role is None:
+            result = ToolExecutionResult("denied", {}, "user_not_scoped", "Usuario sem escopo no tenant")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
+        if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
+            result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
+        try:
+            data = self._handlers[tool_name](context, tool_input, policy.max_rows)
+            result = ToolExecutionResult("success", data)
+        except ValueError as exc:
+            result = ToolExecutionResult("denied", {}, "invalid_input", str(exc))
+        except Exception as exc:  # pragma: no cover - scaffold fallback
+            result = ToolExecutionResult("error", {}, "internal_error", f"Falha ao executar tool: {exc}")
+
+        return self._finalize_log(context, tool_name, payload, result, start)
+
+    def _parse_context(self, payload: dict[str, Any]) -> RequestContext:
+        context = payload.get("context") or {}
+        missing = [key for key in ["client_id", "tenant_id", "user_id", "correlation_id"] if key not in context]
+        if missing:
+            raise ValueError(f"Contexto incompleto: faltando {', '.join(missing)}")
+        return RequestContext(
+            client_id=int(context["client_id"]),
+            tenant_id=int(context["tenant_id"]),
+            user_id=int(context["user_id"]),
+            correlation_id=str(context["correlation_id"]),
+        )
+
+    def _handle_list_tables(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        schema_name = tool_input.get("schema_name")
+        rows = self.repository.list_monitored_tables(context.tenant_id, schema_name)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"tables": rows}
+
+    def _handle_source_list_catalog(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = context, tool_input
+        rows = self.repository.list_source_catalog()
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"sources": rows}
+
+    def _handle_list_columns(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        schema_name = str(tool_input.get("schema_name", ""))
+        table_name = str(tool_input.get("table_name", ""))
+        if not schema_name or not table_name:
+            raise ValueError("schema_name e table_name sao obrigatorios")
+        rows = self.repository.list_monitored_columns(context.tenant_id, schema_name, table_name)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"columns": rows}
+
+    def _handle_list_tenant_tables(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        raw_source_id = tool_input.get("data_source_id")
+        data_source_id = int(raw_source_id) if raw_source_id is not None else None
+        rows = self.repository.list_tenant_monitored_tables(context.tenant_id, data_source_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"tables": rows}
+
+    def _handle_register_table(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("data_source_id") is None:
+            raise ValueError("data_source_id obrigatorio")
+        schema_name = str(tool_input.get("schema_name", "")).strip()
+        table_name = str(tool_input.get("table_name", "")).strip()
+        if not schema_name:
+            raise ValueError("schema_name obrigatorio")
+        if not table_name:
+            raise ValueError("table_name obrigatorio")
+        table = self.repository.create_monitored_table(
+            context.tenant_id,
+            data_source_id=int(tool_input["data_source_id"]),
+            schema_name=schema_name,
+            table_name=table_name,
+            is_active=bool(tool_input.get("is_active", True)),
+        )
+        return {"table": table}
+
+    def _handle_delete_table(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("monitored_table_id") is None:
+            raise ValueError("monitored_table_id obrigatorio")
+        result = self.repository.delete_monitored_table(
+            context.tenant_id,
+            monitored_table_id=int(tool_input["monitored_table_id"]),
+        )
+        return {"result": result}
+
+    def _handle_source_list_tenant(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = tool_input
+        rows = self.repository.list_tenant_data_sources(context.tenant_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"sources": rows}
+
+    def _handle_source_register(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        source_type = str(tool_input.get("source_type", "")).strip().lower()
+        conn_secret_ref = str(tool_input.get("conn_secret_ref", "")).strip()
+        is_active = bool(tool_input.get("is_active", True))
+        if not source_type:
+            raise ValueError("source_type obrigatorio")
+        if not conn_secret_ref:
+            raise ValueError("conn_secret_ref obrigatorio")
+        source = self.repository.create_tenant_data_source(
+            context.tenant_id,
+            source_type=source_type,
+            conn_secret_ref=conn_secret_ref,
+            is_active=is_active,
+        )
+        return {"source": source}
+
+    def _handle_source_update_status(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("data_source_id") is None:
+            raise ValueError("data_source_id obrigatorio")
+        source = self.repository.update_tenant_data_source_status(
+            context.tenant_id,
+            data_source_id=int(tool_input["data_source_id"]),
+            is_active=bool(tool_input.get("is_active", True)),
+        )
+        return {"source": source}
+
+    def _handle_source_update(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("data_source_id") is None:
+            raise ValueError("data_source_id obrigatorio")
+        source_type = str(tool_input.get("source_type", "")).strip().lower()
+        conn_secret_ref = str(tool_input.get("conn_secret_ref", "")).strip()
+        if not source_type:
+            raise ValueError("source_type obrigatorio")
+        if not conn_secret_ref:
+            raise ValueError("conn_secret_ref obrigatorio")
+        source = self.repository.update_tenant_data_source(
+            context.tenant_id,
+            data_source_id=int(tool_input["data_source_id"]),
+            source_type=source_type,
+            conn_secret_ref=conn_secret_ref,
+        )
+        return {"source": source}
+
+    def _handle_source_delete(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("data_source_id") is None:
+            raise ValueError("data_source_id obrigatorio")
+        result = self.repository.delete_tenant_data_source(
+            context.tenant_id,
+            data_source_id=int(tool_input["data_source_id"]),
+        )
+        return {"result": result}
+
+    def _handle_execute_safe_sql(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        sql_text = str(tool_input.get("sql_text", "")).strip()
+        if not sql_text:
+            raise ValueError("sql_text obrigatorio")
+        self._assert_safe_select(sql_text)
+        sql_policy = self.repository.get_sql_security_policy(context.tenant_id)
+        self._assert_allowed_schemas(sql_text, sql_policy.get("allowed_schema_patterns") or [])
+        return self.repository.execute_safe_sql(context.tenant_id, sql_text, max_rows)
+
+    def _handle_security_sql_get_policy(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = tool_input, max_rows
+        return {"policy": self.repository.get_sql_security_policy(context.tenant_id)}
+
+    def _handle_security_sql_update_policy(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        allowed_patterns = tool_input.get("allowed_schema_patterns", [])
+        if not isinstance(allowed_patterns, list):
+            raise ValueError("allowed_schema_patterns deve ser lista")
+        normalized = [str(item).strip() for item in allowed_patterns if str(item).strip()]
+        policy = self.repository.update_sql_security_policy(
+            context.tenant_id,
+            max_rows=int(tool_input["max_rows"]) if tool_input.get("max_rows") is not None else None,
+            max_calls_per_minute=(
+                int(tool_input["max_calls_per_minute"]) if tool_input.get("max_calls_per_minute") is not None else None
+            ),
+            require_masking=bool(tool_input.get("require_masking", True)),
+            allowed_schema_patterns=normalized,
+        )
+        return {"policy": policy}
+
+    def _handle_incident_create(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = max_rows
+        title = str(tool_input.get("title", "")).strip()
+        severity = str(tool_input.get("severity", "")).strip()
+        source_event_id = tool_input.get("source_event_id")
+        if not title:
+            raise ValueError("title obrigatorio")
+        if severity not in {"low", "medium", "high", "critical"}:
+            raise ValueError("severity invalida")
+        return self.repository.create_incident(context.tenant_id, title, severity, source_event_id)
+
+    def _handle_incident_list(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        status = tool_input.get("status")
+        severity = tool_input.get("severity")
+        limit = int(tool_input.get("limit", max_rows or 50))
+        rows = self.repository.list_incidents(
+            context.tenant_id,
+            status=str(status) if status else None,
+            severity=str(severity) if severity else None,
+            limit=max(1, min(limit, max_rows or 500)),
+        )
+        return {"incidents": rows}
+
+    def _handle_incident_update_status(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if "incident_id" not in tool_input:
+            raise ValueError("incident_id obrigatorio")
+        new_status = str(tool_input.get("new_status", "")).strip()
+        if new_status not in {"open", "ack", "resolved", "closed"}:
+            raise ValueError("new_status invalido")
+        incident = self.repository.update_incident_status(
+            context.tenant_id,
+            incident_id=int(tool_input["incident_id"]),
+            new_status=new_status,
+        )
+        return {"incident": incident}
+
+    def _handle_events_list(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        severity = tool_input.get("severity")
+        limit = int(tool_input.get("limit", max_rows or 50))
+        rows = self.repository.list_events(
+            context.tenant_id,
+            severity=str(severity) if severity else None,
+            limit=max(1, min(limit, max_rows or 500)),
+        )
+        return {"events": rows}
+
+    def _handle_audit_list_calls(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        tool_name = tool_input.get("tool_name")
+        status = tool_input.get("status")
+        correlation_id = tool_input.get("correlation_id")
+        limit = int(tool_input.get("limit", max_rows or 50))
+        rows = self.repository.list_audit_calls(
+            context.tenant_id,
+            tool_name=str(tool_name) if tool_name else None,
+            status=str(status) if status else None,
+            correlation_id=str(correlation_id) if correlation_id else None,
+            limit=max(1, min(limit, max_rows or 500)),
+        )
+        return {"calls": rows}
+
+    def _handle_health_summary(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
+        _ = max_rows
+        window_minutes = int(tool_input.get("window_minutes", 60))
+        return self.repository.get_health_summary(context.tenant_id, window_minutes)
+
+    def _finalize_log(
+        self,
+        context: RequestContext,
+        tool_name: str,
+        request_payload: dict[str, Any],
+        result: ToolExecutionResult,
+        start: float,
+    ) -> dict[str, Any]:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        response = {
+            "status": result.status,
+            "tool": tool_name,
+            "correlation_id": context.correlation_id,
+            "data": result.data,
+            "error": {
+                "code": result.error_code,
+                "message": result.error_message,
+            }
+            if result.error_code
+            else None,
+        }
+        self.repository.log_mcp_call(
+            client_id=context.client_id,
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            tool_name=tool_name,
+            status=result.status,
+            correlation_id=context.correlation_id,
+            request_payload=request_payload,
+            response_payload=response,
+            error_code=result.error_code,
+            error_message=result.error_message,
+            latency_ms=latency_ms,
+        )
+        return response
+
+    @staticmethod
+    def _assert_safe_select(sql_text: str) -> None:
+        # Guardrail simples de scaffold; substituir por parser SQL robusto no hardening.
+        stripped = re.sub(r"\s+", " ", sql_text.strip().lower())
+        forbidden = [
+            " insert ",
+            " update ",
+            " delete ",
+            " drop ",
+            " alter ",
+            " create ",
+            " truncate ",
+            " grant ",
+            " revoke ",
+        ]
+        if not stripped.startswith("select"):
+            raise ValueError("somente SELECT e permitido")
+        for token in forbidden:
+            if token in f" {stripped} ":
+                raise ValueError("comando SQL bloqueado por politica de seguranca")
+        if ";" in stripped:
+            raise ValueError("multiplas instrucoes nao sao permitidas")
+
+    @staticmethod
+    def _assert_allowed_schemas(sql_text: str, allowed_patterns: list[str]) -> None:
+        if not allowed_patterns:
+            return
+        found_schemas = re.findall(r"(?:from|join)\s+([a-zA-Z_][\w]*)\.", sql_text, flags=re.IGNORECASE)
+        if not found_schemas:
+            return
+
+        def _matches(schema_name: str) -> bool:
+            for pattern in allowed_patterns:
+                if pattern.endswith("*") and schema_name.startswith(pattern[:-1]):
+                    return True
+                if schema_name == pattern:
+                    return True
+            return False
+
+        invalid = [schema for schema in found_schemas if not _matches(schema)]
+        if invalid:
+            raise ValueError(f"schema nao permitido na consulta: {', '.join(sorted(set(invalid)))}")

@@ -1,0 +1,1 @@
+"""Simple HTTP API for IAOps MCP scaffold."""

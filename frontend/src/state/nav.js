@@ -1,0 +1,16 @@
+export const NAV_ITEMS = [
+  { key: "onboarding", label: "Onboarding" },
+  { key: "inventario", label: "Inventario" },
+  { key: "sugestoes", label: "Sugestoes" },
+  { key: "chat-bi", label: "Chat BI" },
+  { key: "eventos", label: "Eventos" },
+  { key: "incidentes", label: "Incidentes" },
+  { key: "auditoria", label: "Auditoria" },
+  { key: "seguranca-sql", label: "Seguranca SQL" },
+  { key: "acesso", label: "Acesso (Owner)" },
+  { key: "lgpd", label: "LGPD" },
+  { key: "operacao", label: "Operacao" },
+  { key: "faturamento", label: "Faturamento (Owner)" },
+  { key: "parcelas", label: "Parcelas (Owner)" },
+  { key: "configuracao", label: "Configuracao" },
+];
