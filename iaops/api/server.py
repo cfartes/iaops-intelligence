@@ -983,7 +983,55 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 continue
             key = f"{table.get('schema_name')}.{table.get('table_name')}"
             columns_by_table[key] = (column_result.get("data") or {}).get("columns") or []
-        return {"tables": tables, "columns": columns_by_table}
+        relationships = self._infer_table_relationships(tables, columns_by_table)
+        return {"tables": tables, "columns": columns_by_table, "relationships": relationships}
+
+    @staticmethod
+    def _infer_table_relationships(tables: list[dict], columns_by_table: dict[str, list[dict]]) -> list[dict]:
+        def singular(name: str) -> str:
+            if name.endswith("ies") and len(name) > 3:
+                return f"{name[:-3]}y"
+            if name.endswith("s") and len(name) > 1:
+                return name[:-1]
+            return name
+
+        table_names = {f"{item.get('schema_name')}.{item.get('table_name')}": str(item.get("table_name") or "") for item in tables}
+        normalized_cols: dict[str, set[str]] = {}
+        for key, cols in columns_by_table.items():
+            normalized_cols[key] = {str(col.get("column_name") or "").lower() for col in cols}
+
+        links: list[dict] = []
+        keys = list(table_names.keys())
+        for source_key in keys:
+            source_cols = normalized_cols.get(source_key, set())
+            for target_key in keys:
+                if source_key == target_key:
+                    continue
+                target_table_name = singular(table_names[target_key].lower())
+                candidate = f"{target_table_name}_id"
+                if candidate in source_cols:
+                    links.append(
+                        {
+                            "source_table": source_key,
+                            "target_table": target_key,
+                            "source_column": candidate,
+                            "target_column": "id",
+                        }
+                    )
+        unique: list[dict] = []
+        seen = set()
+        for item in links:
+            key = (
+                item["source_table"],
+                item["source_column"],
+                item["target_table"],
+                item["target_column"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
 
     def _plan_sql_from_question(self, context: dict, question_text: str, rag: dict) -> dict:
         llm_plan = self._plan_sql_with_llm(context, question_text, rag)
@@ -1046,6 +1094,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "question": question_text,
             "tables": rag.get("tables") or [],
             "columns": rag.get("columns") or {},
+            "relationships": rag.get("relationships") or [],
             "allowed_schemas_hint": ["public", "analytics", "iaops_gov"],
         }
         llm_output = self._invoke_llm_json(
@@ -1058,9 +1107,26 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         sql_text = str((llm_output or {}).get("sql_text") or "").strip()
         if not sql_text:
             return {"mode": "llm_empty", "sql_text": None}
-        if ";" in sql_text or not sql_text.lower().startswith("select"):
+        if not self._is_planned_sql_allowed(sql_text):
             return {"mode": "llm_rejected", "sql_text": None}
         return {"mode": "llm", "sql_text": sql_text, "llm_provider": provider_name}
+
+    @staticmethod
+    def _is_planned_sql_allowed(sql_text: str) -> bool:
+        lowered = re.sub(r"\s+", " ", sql_text.strip().lower())
+        if not lowered.startswith("select"):
+            return False
+        if len(lowered) > 5000:
+            return False
+        blocked = [" insert ", " update ", " delete ", " drop ", " alter ", " create ", " truncate ", " grant ", " revoke "]
+        decorated = f" {lowered} "
+        if any(token in decorated for token in blocked):
+            return False
+        if ";" in lowered:
+            return False
+        if "--" in lowered or "/*" in lowered or "*/" in lowered:
+            return False
+        return True
 
     def _resolve_secret_value(self, secret_ref: str | None) -> str | None:
         ref = str(secret_ref or "").strip()
