@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 export default function MfaCodeModal({
   open,
@@ -10,6 +11,7 @@ export default function MfaCodeModal({
   onClose,
   onSubmit,
 }) {
+  useModalBehavior({ open, onClose });
   const [otpCode, setOtpCode] = useState("");
   const [showQr, setShowQr] = useState(true);
   const canSubmit = useMemo(() => otpCode.trim().length >= 6, [otpCode]);

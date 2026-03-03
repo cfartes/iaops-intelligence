@@ -4330,8 +4330,30 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             }
         )
         if query_result["status"] != "success":
-            return self._channel_error_response(query_result, resolved_language)
-        query_data = query_result["data"]
+            fallback = self._try_query_from_monitored_source(
+                context=context,
+                sql_text=sql_text,
+                rag=rag,
+            )
+            if not fallback.get("ok"):
+                return {
+                    "ok": False,
+                    "command": "error",
+                    "reply_text": self._t(resolved_language, "chat_query_failed_user"),
+                    "data": {
+                        "question_text": question_text,
+                        "planned_sql": sql_text,
+                        "planning_mode": planned.get("mode", "rules"),
+                        "llm_provider": planned.get("llm_provider"),
+                        "language_code": resolved_language,
+                        "chat_response_mode": response_mode,
+                        "rag": rag,
+                        "mcp": query_result,
+                    },
+                }
+            query_data = fallback["data"]
+        else:
+            query_data = query_result["data"]
         return {
             "ok": True,
             "reply_text": self._reply_nl_result(
@@ -4348,6 +4370,382 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "result": query_data,
             },
         }
+
+    def _try_query_from_monitored_source(self, *, context: dict, sql_text: str, rag: dict) -> dict:
+        spec = self._parse_supported_source_query(sql_text)
+        if not spec:
+            return {"ok": False}
+        matched_table = self._match_monitored_table(
+            rag=rag,
+            schema_name=str(spec.get("schema_name") or ""),
+            table_name=str(spec.get("table_name") or ""),
+        )
+        if not matched_table:
+            return {"ok": False}
+        data_source_id = matched_table.get("data_source_id")
+        if data_source_id is None:
+            return {"ok": False}
+        source_result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "source.list_tenant",
+                "input": {},
+            }
+        )
+        if source_result.get("status") != "success":
+            return {"ok": False}
+        source = next(
+            (
+                item
+                for item in ((source_result.get("data") or {}).get("sources") or [])
+                if int(item.get("id") or 0) == int(data_source_id)
+            ),
+            None,
+        )
+        if not source:
+            return {"ok": False}
+        source_type = str(source.get("source_type") or "").strip().lower()
+        conn_secret_ref = str(source.get("conn_secret_ref") or "").strip()
+        if not source_type or not conn_secret_ref:
+            return {"ok": False}
+        try:
+            profile = self._extract_connection_profile(conn_secret_ref=conn_secret_ref, secret_payload=None)
+            query_data = self._execute_source_fallback_query(
+                source_type=source_type,
+                profile=profile,
+                spec=spec,
+            )
+        except Exception:
+            return {"ok": False}
+        return {"ok": True, "data": query_data}
+
+    @staticmethod
+    def _parse_supported_source_query(sql_text: str) -> dict | None:
+        sql = str(sql_text or "").strip()
+        if not sql:
+            return None
+        match = re.search(r"\bfrom\s+([^\s;]+)", sql, flags=re.IGNORECASE)
+        if not match:
+            return None
+        raw_target = str(match.group(1) or "").strip()
+        if not raw_target:
+            return None
+        cleaned = raw_target.replace("`", "").replace('"', "").replace("[", "").replace("]", "")
+        parts = [part for part in cleaned.split(".") if part]
+        if len(parts) >= 2:
+            schema_name, table_name = parts[-2], parts[-1]
+        elif len(parts) == 1:
+            schema_name, table_name = "public", parts[0]
+        else:
+            return None
+        limit_match = re.search(r"\blimit\s+(\d+)", sql, flags=re.IGNORECASE)
+        limit_value = int(limit_match.group(1)) if limit_match else 20
+        limit_value = int(max(1, min(limit_value, 500)))
+        select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", sql, flags=re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            return None
+        select_expr = str(select_match.group(1) or "").strip()
+        if select_expr == "*":
+            return {
+                "kind": "list",
+                "schema_name": schema_name,
+                "table_name": table_name,
+                "limit": limit_value,
+            }
+        chunks = [item.strip() for item in select_expr.split(",") if item.strip()]
+        group_match = re.search(r"\bgroup\s+by\s+([A-Za-z_][A-Za-z0-9_]*)", sql, flags=re.IGNORECASE)
+        group_col = str(group_match.group(1) or "").strip().lower() if group_match else None
+        order_match = re.search(r"\border\s+by\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(asc|desc))?", sql, flags=re.IGNORECASE)
+        order_col = str(order_match.group(1) or "").strip().lower() if order_match else None
+        order_dir = str(order_match.group(2) or "asc").strip().lower() if order_match else "asc"
+        if order_dir not in {"asc", "desc"}:
+            order_dir = "asc"
+        plain_columns: list[str] = []
+        metrics: list[dict] = []
+        for chunk in chunks:
+            plain_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)$", chunk)
+            if plain_match:
+                plain_columns.append(str(plain_match.group(1)).lower())
+                continue
+            metric_match = re.match(
+                r"^(count|sum|avg|min|max)\s*\(\s*(distinct\s+)?(\*|[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*(?:as\s+([A-Za-z_][A-Za-z0-9_]*))?$",
+                chunk,
+                flags=re.IGNORECASE,
+            )
+            if not metric_match:
+                return None
+            func = str(metric_match.group(1) or "").lower()
+            distinct = bool(metric_match.group(2))
+            column = str(metric_match.group(3) or "").lower()
+            alias = str(metric_match.group(4) or f"{func}_{column if column != '*' else 'all'}").lower()
+            metrics.append(
+                {
+                    "func": func,
+                    "distinct": distinct,
+                    "column": column,
+                    "alias": alias,
+                }
+            )
+        if not metrics:
+            return None
+        if group_col:
+            if len(plain_columns) != 1 or plain_columns[0] != group_col:
+                return None
+        elif plain_columns:
+            return None
+        return {
+            "kind": "aggregate",
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "group_col": group_col,
+            "metrics": metrics,
+            "order_col": order_col,
+            "order_dir": order_dir,
+            "limit": limit_value,
+        }
+
+    @staticmethod
+    def _match_monitored_table(*, rag: dict, schema_name: str, table_name: str) -> dict | None:
+        tables = rag.get("tables") or []
+        schema_v = str(schema_name or "").strip().lower()
+        table_v = str(table_name or "").strip().lower()
+        exact = next(
+            (
+                item
+                for item in tables
+                if str(item.get("schema_name") or "").strip().lower() == schema_v
+                and str(item.get("table_name") or "").strip().lower() == table_v
+            ),
+            None,
+        )
+        if exact:
+            return exact
+        by_name = [
+            item
+            for item in tables
+            if str(item.get("table_name") or "").strip().lower() == table_v
+        ]
+        if len(by_name) == 1:
+            return by_name[0]
+        return None
+
+    def _execute_source_fallback_query(self, *, source_type: str, profile: dict, spec: dict) -> dict:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._execute_source_fallback_postgres(profile=profile, spec=spec)
+        if kind == "mysql":
+            return self._execute_source_fallback_mysql(profile=profile, spec=spec)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._execute_source_fallback_sqlserver(profile=profile, spec=spec)
+        if kind == "oracle":
+            return self._execute_source_fallback_oracle(profile=profile, spec=spec)
+        raise ValueError(f"Fallback de consulta nao suportado para source_type={kind}")
+
+    def _execute_source_fallback_postgres(self, *, profile: dict, spec: dict) -> dict:
+        if connect is None:
+            raise ValueError("Driver PostgreSQL indisponivel (psycopg).")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                raise ValueError("Informe dsn ou host/user/password/dbname no secret_payload.")
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        sql, columns = self._build_fallback_sql(
+            dialect="postgres",
+            spec=spec,
+            default_schema=str(profile.get("schema") or "public"),
+        )
+        with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            result_columns = columns or [str(item[0]) for item in (cur.description or [])]
+        return {
+            "columns": result_columns,
+            "rows": [dict(zip(result_columns, row)) for row in rows],
+        }
+
+    def _execute_source_fallback_mysql(self, *, profile: dict, spec: dict) -> dict:
+        if pymysql is None:
+            raise ValueError("Driver pymysql nao instalado para consulta MySQL.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        sql, columns = self._build_fallback_sql(
+            dialect="mysql",
+            spec=spec,
+            default_schema=database,
+        )
+        with pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database or schema,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            charset="utf8mb4",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                result_columns = columns or [str(item[0]) for item in (cur.description or [])]
+        return {
+            "columns": result_columns,
+            "rows": [dict(zip(result_columns, row)) for row in rows],
+        }
+
+    def _execute_source_fallback_sqlserver(self, *, profile: dict, spec: dict) -> dict:
+        if pyodbc is None:
+            raise ValueError("Driver pyodbc nao instalado para consulta SQL Server.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                f"Encrypt=yes;TrustServerCertificate=yes;Connection Timeout={timeout};"
+            )
+        sql, columns = self._build_fallback_sql(
+            dialect="sqlserver",
+            spec=spec,
+            default_schema="dbo",
+        )
+        with pyodbc.connect(conn_str, timeout=timeout) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            result_columns = columns or [str(item[0]) for item in (cur.description or [])]
+        return {
+            "columns": result_columns,
+            "rows": [dict(zip(result_columns, row)) for row in rows],
+        }
+
+    def _execute_source_fallback_oracle(self, *, profile: dict, spec: dict) -> dict:
+        if oracledb is None:
+            raise ValueError("Driver oracledb nao instalado para consulta Oracle.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        sql, columns = self._build_fallback_sql(
+            dialect="oracle",
+            spec=spec,
+            default_schema=str(profile.get("owner") or profile.get("schema") or user),
+        )
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                result_columns = columns or [str(item[0]) for item in (cur.description or [])]
+        return {
+            "columns": result_columns,
+            "rows": [dict(zip(result_columns, row)) for row in rows],
+        }
+
+    def _build_fallback_sql(self, *, dialect: str, spec: dict, default_schema: str) -> tuple[str, list[str]]:
+        schema = self._safe_identifier(str(spec.get("schema_name") or default_schema or "public"))
+        table = self._safe_identifier(str(spec.get("table_name") or ""))
+        kind = str(spec.get("kind") or "")
+        limit_value = int(max(1, min(int(spec.get("limit") or 20), 500)))
+        q_table = self._q_table(dialect=dialect, schema=schema, table=table)
+        if kind == "list":
+            if dialect == "sqlserver":
+                return f"SELECT TOP {limit_value} * FROM {q_table}", []
+            if dialect == "oracle":
+                return f"SELECT * FROM {q_table} FETCH FIRST {limit_value} ROWS ONLY", []
+            return f"SELECT * FROM {q_table} LIMIT {limit_value}", []
+        metrics = list(spec.get("metrics") or [])
+        if not metrics:
+            raise ValueError("Consulta sem metricas suportadas.")
+        group_col = str(spec.get("group_col") or "").strip()
+        select_parts: list[str] = []
+        output_cols: list[str] = []
+        if group_col:
+            safe_group = self._safe_identifier(group_col)
+            select_parts.append(self._q_ident(dialect, safe_group))
+            output_cols.append(safe_group)
+        for metric in metrics:
+            func = str(metric.get("func") or "").lower()
+            distinct = bool(metric.get("distinct"))
+            column = str(metric.get("column") or "").lower()
+            alias = self._safe_identifier(str(metric.get("alias") or f"{func}_{column or 'value'}").lower())
+            if column == "*":
+                expr = "COUNT(*)"
+            else:
+                safe_col = self._safe_identifier(column)
+                q_col = self._q_ident(dialect, safe_col)
+                expr = f"{func.upper()}(DISTINCT {q_col})" if distinct else f"{func.upper()}({q_col})"
+            select_parts.append(f"{expr} AS {self._q_ident(dialect, alias)}")
+            output_cols.append(alias)
+        sql = f"SELECT {', '.join(select_parts)} FROM {q_table}"
+        if group_col:
+            sql += f" GROUP BY {self._q_ident(dialect, self._safe_identifier(group_col))}"
+            order_col = str(spec.get("order_col") or "").strip().lower()
+            order_dir = str(spec.get("order_dir") or "asc").strip().lower()
+            if order_col and order_col in set(output_cols):
+                sql += f" ORDER BY {self._q_ident(dialect, self._safe_identifier(order_col))} {'DESC' if order_dir == 'desc' else 'ASC'}"
+            if dialect == "sqlserver":
+                sql += f" OFFSET 0 ROWS FETCH NEXT {limit_value} ROWS ONLY"
+            elif dialect == "oracle":
+                sql += f" FETCH FIRST {limit_value} ROWS ONLY"
+            else:
+                sql += f" LIMIT {limit_value}"
+        return sql, output_cols
+
+    @staticmethod
+    def _q_ident(dialect: str, ident: str) -> str:
+        if dialect == "mysql":
+            return f"`{ident}`"
+        if dialect == "sqlserver":
+            return f"[{ident}]"
+        return f'"{ident}"' if dialect in {"postgres", "oracle"} else ident
+
+    def _q_table(self, *, dialect: str, schema: str, table: str) -> str:
+        if dialect == "mysql":
+            return f"`{schema}`.`{table}`"
+        if dialect == "sqlserver":
+            return f"[{schema}].[{table}]"
+        if dialect == "oracle":
+            return f"{schema.upper()}.{table.upper()}"
+        return f'"{schema}"."{table}"'
 
     def _resolve_chat_response_mode(self, context: dict) -> str:
         result = self._call_mcp(
@@ -4521,27 +4919,31 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _plan_sql_with_rules(question_text: str, rag: dict) -> dict:
         q = question_text.lower()
-        if "incidente" in q and ("aberto" in q or "abertos" in q):
+        tokens = IAOpsAPIHandler._normalize_query_tokens(question_text)
+        if ("incidente" in q or "incident" in q) and ("aberto" in q or "abertos" in q or "open" in q):
             return {
                 "mode": "rules",
                 "sql_text": "SELECT status, COUNT(*) AS total FROM iaops_gov.incident WHERE status IN ('open','ack') GROUP BY status",
             }
-        if "evento" in q and ("critico" in q or "criticos" in q):
+        if ("evento" in q or "event" in q) and ("critico" in q or "criticos" in q or "critical" in q):
             return {
                 "mode": "rules",
                 "sql_text": "SELECT severity, COUNT(*) AS total FROM iaops_gov.schema_change_event WHERE severity = 'critical' GROUP BY severity",
             }
-        if "tabela" in q or "inventario" in q:
+        if "tabela" in q or "inventario" in q or "table" in q or "tables" in q:
             return {
                 "mode": "rules",
                 "sql_text": "SELECT schema_name, table_name, is_active FROM iaops_gov.monitored_table ORDER BY schema_name, table_name LIMIT 50",
             }
+        grouped = IAOpsAPIHandler._plan_grouped_count_sql(tokens=tokens, rag=rag)
+        if grouped:
+            return {"mode": "rules", "sql_text": grouped}
         ranked = IAOpsAPIHandler._rank_tables_for_question(question_text, rag.get("tables") or [])
         if ranked:
             target = ranked[0]
             schema_name = str(target.get("schema_name"))
             table_name = str(target.get("table_name"))
-            if any(term in q for term in ["quantos", "qtd", "total", "count"]):
+            if any(term in tokens for term in ["quantos", "qtd", "total", "count", "how", "many", "cuantos"]):
                 return {"mode": "rules", "sql_text": f"SELECT COUNT(*) AS total FROM {schema_name}.{table_name}"}
             return {"mode": "rules", "sql_text": f"SELECT * FROM {schema_name}.{table_name} LIMIT 20"}
         return {"mode": "rules", "sql_text": None}
@@ -4698,7 +5100,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return os.environ.get(ref)
         normalized = re.sub(r"[^A-Za-z0-9_]+", "_", ref).strip("_").upper()
         if normalized:
-            return os.getenv(f"IAOPS_SECRET_{normalized}")
+            env_value = os.getenv(f"IAOPS_SECRET_{normalized}")
+            if env_value:
+                return env_value
+        # Compatibilidade: se a chave foi salva diretamente no secret_ref, usa valor bruto.
+        if "://" not in ref and len(ref) >= 12:
+            return ref
         return None
 
     def _invoke_llm_json(
@@ -4799,17 +5206,90 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _rank_tables_for_question(question_text: str, tables: list[dict]) -> list[dict]:
-        tokens = [token for token in re.split(r"[^a-zA-Z0-9_]+", question_text.lower()) if len(token) > 2]
+        tokens = IAOpsAPIHandler._normalize_query_tokens(question_text)
         if not tokens:
             return []
         scored: list[tuple[int, dict]] = []
         for item in tables:
-            haystack = f"{item.get('schema_name', '')} {item.get('table_name', '')}".lower()
+            schema_name = str(item.get("schema_name", "") or "").lower()
+            table_name = str(item.get("table_name", "") or "").lower()
+            singular = table_name[:-1] if table_name.endswith("s") else table_name
+            haystack = f"{schema_name} {table_name} {singular}"
             score = sum(1 for token in tokens if token in haystack)
             if score > 0:
                 scored.append((score, item))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [item for _, item in scored]
+
+    @staticmethod
+    def _normalize_query_tokens(question_text: str) -> list[str]:
+        raw = unicodedata.normalize("NFKD", str(question_text or "").lower())
+        raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
+        tokens = [token for token in re.split(r"[^a-zA-Z0-9_]+", raw) if len(token) > 1]
+        synonyms = {
+            "filme": "film",
+            "filmes": "film",
+            "ator": "actor",
+            "atores": "actor",
+            "cliente": "customer",
+            "clientes": "customer",
+            "aluguel": "rental",
+            "locacao": "rental",
+            "devolucao": "return",
+            "pagamento": "payment",
+            "pagamentos": "payment",
+            "loja": "store",
+            "lojas": "store",
+            "inventario": "inventory",
+            "inventarios": "inventory",
+            "por": "by",
+            "cuantos": "count",
+        }
+        return [synonyms.get(token, token) for token in tokens]
+
+    @staticmethod
+    def _plan_grouped_count_sql(tokens: list[str], rag: dict) -> str | None:
+        if not tokens:
+            return None
+        if "by" not in tokens and "por" not in tokens:
+            return None
+        if not any(term in tokens for term in ["quantos", "qtd", "total", "count", "how", "many"]):
+            return None
+        by_idx = tokens.index("by") if "by" in tokens else tokens.index("por")
+        if by_idx <= 0 or by_idx >= len(tokens) - 1:
+            return None
+        measure_entity = tokens[by_idx - 1]
+        group_entity = tokens[by_idx + 1]
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", measure_entity):
+            return None
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", group_entity):
+            return None
+
+        tables = rag.get("tables") or []
+        columns_by_table = rag.get("columns") or {}
+        for table in tables:
+            schema_name = str(table.get("schema_name") or "").strip()
+            table_name = str(table.get("table_name") or "").strip()
+            if not schema_name or not table_name:
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema_name):
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+                continue
+            key = f"{schema_name}.{table_name}"
+            cols = columns_by_table.get(key) or []
+            col_names = {str(col.get("column_name") or "").strip().lower() for col in cols}
+            group_col = f"{group_entity}_id"
+            measure_col = f"{measure_entity}_id"
+            if group_col in col_names and measure_col in col_names:
+                return (
+                    f"SELECT {group_col}, COUNT(DISTINCT {measure_col}) AS total "
+                    f"FROM {schema_name}.{table_name} "
+                    f"GROUP BY {group_col} "
+                    f"ORDER BY total DESC "
+                    f"LIMIT 50"
+                )
+        return None
 
     def _reply_nl_result(
         self,
@@ -4870,6 +5350,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "ask_natural_language": "Ou envie a pergunta em linguagem natural.",
                 "chat_question_required": "question_text obrigatorio",
                 "could_not_interpret_question": "Nao consegui interpretar sua pergunta com as tabelas monitoradas.",
+                "chat_query_failed_user": "Nao consegui executar esta consulta na base monitorada. Tente reformular a pergunta.",
                 "question_label": "Pergunta: {value}",
                 "found_records": "Encontrei {total} registro(s).",
                 "total_label": "Total: {value}",
@@ -4900,6 +5381,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "ask_natural_language": "Or send your question in natural language.",
                 "chat_question_required": "question_text is required",
                 "could_not_interpret_question": "I could not interpret your question using monitored tables.",
+                "chat_query_failed_user": "I could not run this query on the monitored data source. Please rephrase your question.",
                 "question_label": "Question: {value}",
                 "found_records": "I found {total} record(s).",
                 "total_label": "Total: {value}",
@@ -4930,6 +5412,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "ask_natural_language": "O envie su pregunta en lenguaje natural.",
                 "chat_question_required": "question_text es obligatorio",
                 "could_not_interpret_question": "No pude interpretar su pregunta con las tablas monitoreadas.",
+                "chat_query_failed_user": "No pude ejecutar esta consulta en la fuente monitoreada. Intente reformular su pregunta.",
                 "question_label": "Pregunta: {value}",
                 "found_records": "Encontre {total} registro(s).",
                 "total_label": "Total: {value}",
@@ -6195,6 +6678,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             for col in columns
             if str(col.get("column_name") or "").strip()
         }
+        glossary = self._load_tenant_glossary_overrides(
+            context=context,
+            schema_name=schema_name,
+            table_name=table_name,
+        )
         llm_map = self._suggest_column_enrichment_with_llm(
             source_type=source_type,
             schema_name=schema_name,
@@ -6210,9 +6698,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 col_name = str(col_meta.get("column_name") or key or "").strip()
                 classification = str(item.get("classification") or "").strip().lower() or "attribute"
                 desc = str(item.get("description_text") or "").strip()
+                override_desc = glossary.get(f"{table_name.lower()}.{col_name.lower()}") or glossary.get(col_name.lower())
+                if override_desc:
+                    desc = override_desc
                 source_desc = str(col_meta.get("source_description_text") or "").strip()
                 if not desc and source_desc:
                     desc = source_desc
+                if not desc:
+                    remembered = self._load_confirmed_description_memory(
+                        context=context,
+                        table_name=table_name,
+                        column_name=col_name,
+                    )
+                    if remembered:
+                        desc = remembered
                 if (not desc) or self._is_generic_column_description(desc, column_name=col_name, schema_name=schema_name, table_name=table_name):
                     desc = self._build_contextual_column_description(
                         column_name=col_name,
@@ -6231,7 +6730,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 )
                 item["classification"] = classification
                 item["description_text"] = desc
-            return llm_map
+            return self._deduplicate_column_descriptions(
+                suggestions=llm_map,
+                table_name=table_name,
+                schema_name=schema_name,
+                columns_index=columns_index,
+                language_code=language_code,
+            )
         result: dict[str, dict[str, str]] = {}
         for col in columns:
             name = str(col.get("column_name") or "").strip()
@@ -6253,7 +6758,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             elif "int" in data_type or "decimal" in data_type or "numeric" in data_type:
                 classification = "measure"
             source_desc = str(col.get("source_description_text") or "").strip()
-            description_text = source_desc or self._build_contextual_column_description(
+            override_desc = glossary.get(f"{table_name.lower()}.{name.lower()}") or glossary.get(name.lower())
+            remembered = self._load_confirmed_description_memory(
+                context=context,
+                table_name=table_name,
+                column_name=name,
+            )
+            description_text = override_desc or source_desc or remembered or self._build_contextual_column_description(
                 column_name=name,
                 schema_name=schema_name,
                 table_name=table_name,
@@ -6272,7 +6783,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "classification": classification,
                 "description_text": description_text,
             }
-        return result
+        return self._deduplicate_column_descriptions(
+            suggestions=result,
+            table_name=table_name,
+            schema_name=schema_name,
+            columns_index=columns_index,
+            language_code=language_code,
+        )
 
     @staticmethod
     def _is_generic_column_description(description_text: str, *, column_name: str, schema_name: str, table_name: str) -> bool:
@@ -6285,6 +6802,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if desc.startswith("campo ") or desc.startswith("coluna "):
             if " da tabela " in desc:
                 return True
+        if desc.startswith("informacao de ") or desc.startswith("information of ") or desc.startswith("informacion de "):
+            return True
+        if desc in {"data de referencia", "reference date", "fecha de referencia", "valor financeiro", "financial amount", "valor financiero"}:
+            return True
         if desc.startswith("field ") and " table " in desc:
             return True
         if col and desc in {
@@ -6317,6 +6838,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         data_t = str(data_type or "").strip().lower()
         lang = IAOpsAPIHandler._language_bucket(language_code)
 
+        temporal_named: dict[str, tuple[str, str, str]] = {
+            "data_pagamento": ("Data do pagamento", "Payment date", "Fecha de pago"),
+            "data_vencimento": ("Data de vencimento", "Due date", "Fecha de vencimiento"),
+            "data_venda": ("Data da venda", "Sale date", "Fecha de venta"),
+            "data_emissao": ("Data de emissao", "Issue date", "Fecha de emision"),
+            "data_cadastro": ("Data de cadastro", "Registration date", "Fecha de registro"),
+            "created_at": ("Data e hora de criacao", "Creation date and time", "Fecha y hora de creacion"),
+            "updated_at": ("Data e hora de atualizacao", "Update date and time", "Fecha y hora de actualizacion"),
+        }
+        if col in temporal_named:
+            values = temporal_named[col]
+            return values[0] if lang == "pt" else (values[1] if lang == "en" else values[2])
+
         if col == "rental_date":
             if lang == "en":
                 return "Rental date"
@@ -6335,6 +6869,24 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             if lang == "es":
                 return "Valor recibido"
             return "Valor recebido"
+        if col in {"valor_venda", "sale_value"}:
+            if lang == "en":
+                return "Sale amount"
+            if lang == "es":
+                return "Valor de la venta"
+            return "Valor da venda"
+        if col in {"valor_total", "total_value"}:
+            if lang == "en":
+                return "Total amount"
+            if lang == "es":
+                return "Valor total"
+            return "Valor total"
+        if col in {"valor_pago", "paid_amount"}:
+            if lang == "en":
+                return "Paid amount"
+            if lang == "es":
+                return "Valor pagado"
+            return "Valor pago"
         if col == "payment_date":
             if lang == "en":
                 return "Payment date"
@@ -6516,6 +7068,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lang = IAOpsAPIHandler._language_bucket(language_code)
         if not desc:
             return desc
+        if col in {"data_pagamento", "payment_date"}:
+            return "Payment date" if lang == "en" else ("Fecha de pago" if lang == "es" else "Data do pagamento")
+        if col == "data_vencimento":
+            return "Due date" if lang == "en" else ("Fecha de vencimiento" if lang == "es" else "Data de vencimento")
+        if col in {"data_venda", "sale_date"}:
+            return "Sale date" if lang == "en" else ("Fecha de venta" if lang == "es" else "Data da venda")
+        if col in {"valor_venda", "sale_value"}:
+            return "Sale amount" if lang == "en" else ("Valor de la venta" if lang == "es" else "Valor da venda")
+        if col in {"valor_total", "total_value"}:
+            return "Total amount" if lang == "en" else ("Valor total" if lang == "es" else "Valor total")
         match = re.match(r"^(codigo de|code of|code for) ([a-zA-Z0-9_ ]+)\.?$", desc.strip(), re.IGNORECASE)
         if match:
             entity = str(match.group(2) or "").strip().lower().replace(" ", "_")
@@ -6553,6 +7115,140 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if code.startswith("es"):
             return "es"
         return "pt"
+
+    def _load_tenant_glossary_overrides(self, *, context: dict, schema_name: str, table_name: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        try:
+            src_result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "source.list_tenant",
+                    "input": {},
+                }
+            )
+            if src_result.get("status") != "success":
+                return result
+            for src in ((src_result.get("data") or {}).get("sources") or []):
+                if not bool(src.get("rag_enabled")):
+                    continue
+                text = str(src.get("rag_context_text") or "").strip()
+                if not text:
+                    continue
+                parsed = self._parse_glossary_text(text=text, schema_name=schema_name, table_name=table_name)
+                result.update(parsed)
+        except Exception:
+            return result
+        return result
+
+    @staticmethod
+    def _parse_glossary_text(*, text: str, schema_name: str, table_name: str) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        schema = str(schema_name or "").strip().lower()
+        table = str(table_name or "").strip().lower()
+        lines = str(text or "").splitlines()
+        for raw in lines:
+            line = str(raw or "").strip()
+            if not line or line.startswith("#"):
+                continue
+            separator = "=" if "=" in line else (":" if ":" in line else None)
+            if not separator:
+                continue
+            left, right = line.split(separator, 1)
+            key = str(left or "").strip().lower()
+            val = str(right or "").strip()
+            if not key or not val:
+                continue
+            if "." in key:
+                parts = [p for p in key.split(".") if p]
+                if len(parts) == 3 and parts[0] == schema and parts[1] == table:
+                    mapping[f"{table}.{parts[2]}"] = val
+                elif len(parts) == 2 and parts[0] == table:
+                    mapping[key] = val
+            else:
+                mapping[key] = val
+        return mapping
+
+    def _load_confirmed_description_memory(self, *, context: dict, table_name: str, column_name: str) -> str | None:
+        if not self._is_db_enabled():
+            return None
+        tenant_id = int(context.get("tenant_id") or 0)
+        if tenant_id <= 0:
+            return None
+        schema = self.signup_schema
+        sql = f"""
+            SELECT mc.description_text
+            FROM {schema}.monitored_column mc
+            JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mt.tenant_id = %(tenant_id)s
+              AND LOWER(mc.column_name) = LOWER(%(column_name)s)
+              AND COALESCE(NULLIF(TRIM(mc.description_text), ''), '') <> ''
+            ORDER BY
+              CASE WHEN LOWER(mt.table_name) = LOWER(%(table_name)s) THEN 0 ELSE 1 END,
+              COALESCE(mc.llm_confirmed_at, mt.created_at) DESC
+            LIMIT 1
+        """
+        try:
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    {
+                        "tenant_id": tenant_id,
+                        "table_name": str(table_name or "").strip(),
+                        "column_name": str(column_name or "").strip(),
+                    },
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            return str(row[0] or "").strip() or None
+        except Exception:
+            return None
+
+    def _deduplicate_column_descriptions(
+        self,
+        *,
+        suggestions: dict[str, dict[str, str]],
+        table_name: str,
+        schema_name: str,
+        columns_index: dict[str, dict[str, object]],
+        language_code: str,
+    ) -> dict[str, dict[str, str]]:
+        groups: dict[str, list[str]] = {}
+        for key, item in suggestions.items():
+            desc = str(item.get("description_text") or "").strip().lower()
+            if not desc:
+                continue
+            groups.setdefault(desc, []).append(key)
+        for _, keys in groups.items():
+            if len(keys) <= 1:
+                continue
+            for idx, key in enumerate(keys):
+                col_name = str((columns_index.get(key) or {}).get("column_name") or key)
+                if idx == 0 and not self._is_generic_column_description(
+                    str((suggestions.get(key) or {}).get("description_text") or ""),
+                    column_name=col_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                ):
+                    continue
+                item = suggestions.get(key) or {}
+                rebuilt = self._build_contextual_column_description(
+                    column_name=col_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    classification=str(item.get("classification") or "attribute"),
+                    data_type=str((columns_index.get(key) or {}).get("data_type") or ""),
+                    language_code=language_code,
+                )
+                item["description_text"] = self._normalize_business_description(
+                    description_text=rebuilt,
+                    column_name=col_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    language_code=language_code,
+                )
+                suggestions[key] = item
+        return suggestions
 
     def _suggest_column_enrichment_with_llm(
         self,

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 export default function McpToolPolicyModal({ open, policy, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [isEnabled, setIsEnabled] = useState(Boolean(policy?.is_enabled));
   const [maxRows, setMaxRows] = useState(policy?.max_rows ?? 1000);
   const [maxCalls, setMaxCalls] = useState(policy?.max_calls_per_minute ?? 120);
@@ -104,4 +106,3 @@ export default function McpToolPolicyModal({ open, policy, onClose, onSubmit }) 
     </div>
   );
 }
-

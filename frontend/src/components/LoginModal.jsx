@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
-export default function LoginModal({ open, labels, onLogin, onVerifyMfa }) {
+export default function LoginModal({ open, labels, onLogin, onVerifyMfa, onClose }) {
+  useModalBehavior({ open, onClose });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [otpCode, setOtpCode] = useState("");

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const DEFAULT_STATE = {
   connection_name: "",
@@ -9,6 +10,7 @@ const DEFAULT_STATE = {
 };
 
 export default function McpConnectionModal({ open, initialData, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(DEFAULT_STATE);
 
   useEffect(() => {
@@ -111,4 +113,3 @@ export default function McpConnectionModal({ open, initialData, onClose, onSubmi
     </div>
   );
 }
-

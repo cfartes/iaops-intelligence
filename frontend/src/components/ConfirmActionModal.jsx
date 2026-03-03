@@ -1,15 +1,8 @@
-import { useEffect } from "react";
 import { createPortal } from "react-dom";
+import useModalBehavior from "./useModalBehavior";
 
 export default function ConfirmActionModal({ open, title, message, confirmLabel, onConfirm, onClose, loading }) {
-  useEffect(() => {
-    if (!open) return undefined;
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = prevOverflow;
-    };
-  }, [open]);
+  useModalBehavior({ open, onClose });
 
   if (!open) return null;
 

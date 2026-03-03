@@ -23,6 +23,28 @@ import DataSourceFormModal from "../components/DataSourceFormModal";
 import MonitoredTableFormModal from "../components/MonitoredTableFormModal";
 import { tUi } from "../i18n/uiText";
 
+function parseSourceLocation(connSecretRef) {
+  const raw = String(connSecretRef || "").trim();
+  if (!raw) return "-";
+  let parsed = null;
+  try {
+    if (raw.startsWith("json:")) {
+      parsed = JSON.parse(raw.slice(5));
+    } else if (raw.startsWith("{") && raw.endsWith("}")) {
+      parsed = JSON.parse(raw);
+    }
+  } catch (_) {
+    return "-";
+  }
+  if (!parsed || typeof parsed !== "object") return "-";
+  const db = String(parsed.database || parsed.dbname || parsed.db || "").trim();
+  const schema = String(parsed.schema || parsed.owner || "").trim();
+  if (db && schema) return `${db}.${schema}`;
+  if (db) return db;
+  if (schema) return schema;
+  return "-";
+}
+
 export default function OnboardingPanel({ onSystemMessage }) {
   const [sources, setSources] = useState([]);
   const [tenantSources, setTenantSources] = useState([]);
@@ -40,6 +62,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
   const [selectedTableIdForColumns, setSelectedTableIdForColumns] = useState("");
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [discoveringColumns, setDiscoveringColumns] = useState(false);
+  const [exportingSourceId, setExportingSourceId] = useState(null);
   const [pendingAction, setPendingAction] = useState(null);
   const [actionLoading, setActionLoading] = useState(false);
 
@@ -277,6 +300,68 @@ export default function OnboardingPanel({ onSystemMessage }) {
     }
   };
 
+  const downloadTextFile = (filename, content, mimeType = "text/plain;charset=utf-8") => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportSourceRag = async (source) => {
+    if (!source?.id || !source?.conn_secret_ref) return;
+    setExportingSourceId(source.id);
+    try {
+      const discovered = await discoverDataSourceTables({
+        source_type: source.source_type,
+        conn_secret_ref: source.conn_secret_ref,
+      });
+      const tables = Array.isArray(discovered?.tables) ? discovered.tables : [];
+      const lines = [];
+      lines.push(`# Base RAG - ${source.source_name || source.source_type} (#${source.id})`);
+      lines.push(`source_type=${source.source_type}`);
+      lines.push(`generated_at=${new Date().toISOString()}`);
+      lines.push("");
+      for (const table of tables) {
+        const schemaName = String(table.schema_name || "public").trim();
+        const tableName = String(table.table_name || "").trim();
+        if (!tableName) continue;
+        lines.push(`## ${schemaName}.${tableName}`);
+        try {
+          const colsResp = await discoverDataSourceColumns({
+            source_type: source.source_type,
+            conn_secret_ref: source.conn_secret_ref,
+            schema_name: schemaName,
+            table_name: tableName,
+          });
+          const cols = Array.isArray(colsResp?.columns) ? colsResp.columns : [];
+          for (const col of cols) {
+            const colName = String(col.column_name || "").trim();
+            const dataType = String(col.data_type || "").trim() || "unknown";
+            if (!colName) continue;
+            lines.push(`- ${colName} (${dataType})`);
+          }
+        } catch (_) {
+          lines.push("- erro_ao_carregar_colunas");
+        }
+        lines.push("");
+      }
+      const safeSource = String(source.source_name || source.source_type || "fonte")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "_");
+      downloadTextFile(`rag_metadata_${safeSource}_${source.id}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
+      onSystemMessage("success", "Exportacao concluida", `Arquivo RAG gerado com ${tables.length} tabela(s).`);
+    } catch (error) {
+      onSystemMessage("error", "Falha na exportacao RAG", error.message);
+    } finally {
+      setExportingSourceId(null);
+    }
+  };
+
   const handleRegisterMonitoredTable = async (payload) => {
     setTableSaving(true);
     try {
@@ -450,7 +535,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                   <th>Fonte</th>
                   <th>Tipo</th>
                   <th>RAG</th>
-                  <th>Secret Ref</th>
+                  <th>Database/Schema</th>
                   <th>Status</th>
                   <th>Acoes</th>
                 </tr>
@@ -462,7 +547,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                     <td>{item.source_name || item.source_type}</td>
                     <td>{item.source_type}</td>
                     <td>{item.rag_enabled ? "Ativo" : "Inativo"}</td>
-                    <td>{item.conn_secret_ref}</td>
+                    <td>{parseSourceLocation(item.conn_secret_ref)}</td>
                     <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
                     <td>
                       <div className="chip-row">
@@ -482,6 +567,14 @@ export default function OnboardingPanel({ onSystemMessage }) {
                           onClick={() => openStatusAction(item, !item.is_active)}
                         >
                           {item.is_active ? tUi("onboarding.action.deactivate", "Inativar") : tUi("onboarding.action.activate", "Ativar")}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() => handleExportSourceRag(item)}
+                          disabled={exportingSourceId === item.id}
+                        >
+                          {exportingSourceId === item.id ? "Exportando..." : "Exportar RAG"}
                         </button>
                         <button type="button" className="btn btn-small btn-secondary" onClick={() => openDeleteAction(item)}>
                           {tUi("common.remove", "Remover")}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   data_source_id: "",
@@ -8,6 +9,7 @@ const INITIAL_FORM = {
 };
 
 export default function MonitoredTableFormModal({ open, sources, defaultSourceId, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
 
   useEffect(() => {

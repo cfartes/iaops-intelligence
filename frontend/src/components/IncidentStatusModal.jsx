@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const NEXT_OPTIONS = {
   open: ["ack", "resolved"],
@@ -8,6 +9,7 @@ const NEXT_OPTIONS = {
 };
 
 export default function IncidentStatusModal({ open, incident, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [status, setStatus] = useState("ack");
   const availableStatuses = incident ? NEXT_OPTIONS[incident.status] || [] : [];
 

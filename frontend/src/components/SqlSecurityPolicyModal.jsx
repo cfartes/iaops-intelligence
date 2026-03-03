@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 export default function SqlSecurityPolicyModal({ open, policy, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [maxRows, setMaxRows] = useState(policy?.max_rows ?? 200);
   const [maxCalls, setMaxCalls] = useState(policy?.max_calls_per_minute ?? 30);
   const [requireMasking, setRequireMasking] = useState(policy?.require_masking ?? true);

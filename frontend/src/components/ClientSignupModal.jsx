@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const FORM_TEMPLATE = {
   trade_name: "",
@@ -21,6 +22,7 @@ const PLAN_OPTIONS = [
 ];
 
 export default function ClientSignupModal({ open, onClose, onSignup, onConfirm, labels }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(FORM_TEMPLATE);
   const [phase, setPhase] = useState("signup");
   const [token, setToken] = useState("");
@@ -185,4 +187,3 @@ export default function ClientSignupModal({ open, onClose, onSignup, onConfirm, 
     </div>
   );
 }
-

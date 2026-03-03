@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   monitored_table_id: "",
@@ -18,6 +19,7 @@ export default function MonitoredColumnFormModal({
   onClose,
   onSubmit,
 }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
   const [manualColumn, setManualColumn] = useState(false);
   const currentColumnOptions = useMemo(() => {

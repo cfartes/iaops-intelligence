@@ -1,3 +1,5 @@
+import useModalBehavior from "./useModalBehavior";
+
 export const ASSISTANT_STEPS = [
   {
     key: "onboarding",
@@ -37,6 +39,7 @@ export default function SetupAssistantModal({
   stepStatusByKey = {},
   uiText,
 }) {
+  useModalBehavior({ open, onClose });
   if (!open) return null;
 
   const completedSet = new Set(completedStepKeys);

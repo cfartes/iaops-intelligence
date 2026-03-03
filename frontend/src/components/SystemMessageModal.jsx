@@ -1,3 +1,5 @@
+import useModalBehavior from "./useModalBehavior";
+
 const MESSAGE_TONE_LABEL = {
   info: "Aviso",
   warning: "Alerta",
@@ -6,6 +8,7 @@ const MESSAGE_TONE_LABEL = {
 };
 
 export default function SystemMessageModal({ state, onClose }) {
+  useModalBehavior({ open: Boolean(state?.open), onClose });
   if (!state?.open) return null;
 
   const tone = state.tone || "info";

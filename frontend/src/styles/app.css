@@ -467,16 +467,17 @@ select {
   inset: 0;
   background: #0b162090;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   overflow: auto;
-  padding: 16px;
+  padding: 20px 16px;
   z-index: 999;
 }
 
 .modal-card {
   width: min(720px, 100%);
   max-height: calc(100vh - 32px);
+  margin-top: 0;
   background: #fff;
   border-radius: 14px;
   overflow: auto;
@@ -533,6 +534,25 @@ select {
   background: #fff;
   resize: vertical;
   font: inherit;
+}
+
+.form-note {
+  border: 1px solid #d8e4ee;
+  background: #f8fbfd;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #1d2f3d;
+}
+
+.form-note strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.form-note ul {
+  margin: 0 0 8px 18px;
+  padding: 0;
 }
 
 .modal-actions {

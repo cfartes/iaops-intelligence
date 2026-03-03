@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   source_type: "",
@@ -95,6 +96,263 @@ const PROFILE_BY_TYPE = {
   },
 };
 
+const ALLOWED_CLASSIFICATIONS = new Set(["identifier", "sensitive", "financial", "temporal", "attribute", "metric"]);
+
+function validateRagText(rawText) {
+  const text = String(rawText || "");
+  if (!text.trim()) {
+    return { errors: [], warnings: [] };
+  }
+  const lines = text.split(/\r?\n/);
+  const errors = [];
+  const warnings = [];
+  let inTableBlock = false;
+  let inRulesBlock = false;
+  let currentColumn = "";
+  let foundStructuredBlock = false;
+  let foundKeyValue = false;
+
+  const pushError = (line, message) => errors.push(`Linha ${line}: ${message}`);
+  const pushWarning = (line, message) => warnings.push(`Linha ${line}: ${message}`);
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const lineNo = idx + 1;
+    const line = lines[idx];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("# ")) continue;
+
+    if (trimmed.startsWith("##")) {
+      inTableBlock = false;
+      inRulesBlock = false;
+      currentColumn = "";
+      const tableHeader = /^##\s*tabela\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(trimmed);
+      if (tableHeader) {
+        inTableBlock = true;
+        foundStructuredBlock = true;
+        continue;
+      }
+      if (/^##\s*regras_negocio\s*$/i.test(trimmed)) {
+        inRulesBlock = true;
+        foundStructuredBlock = true;
+        continue;
+      }
+      pushWarning(lineNo, "Cabecalho nao reconhecido. Use '## tabela: schema.tabela' ou '## regras_negocio'.");
+      continue;
+    }
+
+    if (/^-\s*coluna\s*:/i.test(trimmed)) {
+      foundStructuredBlock = true;
+      if (!inTableBlock) {
+        pushError(lineNo, "Item de coluna fora de bloco de tabela.");
+        continue;
+      }
+      const col = trimmed.split(":").slice(1).join(":").trim();
+      if (!col || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) {
+        pushError(lineNo, "Nome de coluna invalido.");
+        continue;
+      }
+      currentColumn = col;
+      continue;
+    }
+
+    if (/^-\s+/.test(trimmed)) {
+      if (!inRulesBlock && !inTableBlock) {
+        pushWarning(lineNo, "Item de lista sem bloco definido.");
+      }
+      continue;
+    }
+
+    const kvMatch = /^([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*(.+)$/.exec(trimmed);
+    if (kvMatch) {
+      foundKeyValue = true;
+      const key = String(kvMatch[1] || "").toLowerCase();
+      const value = String(kvMatch[2] || "").trim();
+      if (!value) {
+        pushError(lineNo, "Valor vazio na definicao de chave.");
+        continue;
+      }
+      if (key === "classificacao") {
+        if (!currentColumn) {
+          pushWarning(lineNo, "Classificacao sem coluna ativa no bloco atual.");
+        }
+        if (!ALLOWED_CLASSIFICATIONS.has(value.toLowerCase())) {
+          pushError(
+            lineNo,
+            `Classificacao invalida '${value}'. Use: ${Array.from(ALLOWED_CLASSIFICATIONS).join(", ")}.`
+          );
+        }
+      }
+      if ((key === "descricao" || key === "description") && !currentColumn && !inTableBlock) {
+        pushWarning(lineNo, "Descricao fora de bloco de tabela.");
+      }
+      continue;
+    }
+
+    pushError(lineNo, "Formato nao reconhecido para RAG.");
+  }
+
+  if (!foundStructuredBlock && !foundKeyValue) {
+    pushWarning(1, "Texto sem estrutura detectada. Use o template RAG para melhor qualidade.");
+  }
+  return { errors, warnings };
+}
+
+function normalizeRagText(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return "";
+  const lines = text.split(/\r?\n/);
+  const tables = new Map();
+  const rules = [];
+  const extras = [];
+  let currentTableKey = "";
+  let currentColumnName = "";
+  let inRulesBlock = false;
+
+  const ensureTable = (schemaName, tableName) => {
+    const key = `${schemaName}.${tableName}`;
+    if (!tables.has(key)) {
+      tables.set(key, {
+        schema: schemaName,
+        table: tableName,
+        description: "",
+        columns: new Map(),
+      });
+    }
+    return tables.get(key);
+  };
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "");
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("# ")) continue;
+
+    const tableHeader = /^##\s*tabela\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(trimmed);
+    if (tableHeader) {
+      const schema = tableHeader[1];
+      const table = tableHeader[2];
+      currentTableKey = `${schema}.${table}`;
+      currentColumnName = "";
+      inRulesBlock = false;
+      ensureTable(schema, table);
+      continue;
+    }
+    if (/^##\s*regras_negocio\s*$/i.test(trimmed)) {
+      currentTableKey = "";
+      currentColumnName = "";
+      inRulesBlock = true;
+      continue;
+    }
+    if (/^-\s*coluna\s*:/i.test(trimmed)) {
+      if (!currentTableKey) {
+        extras.push(trimmed);
+        continue;
+      }
+      const col = trimmed.split(":").slice(1).join(":").trim();
+      if (!col) continue;
+      const table = tables.get(currentTableKey);
+      if (!table.columns.has(col)) {
+        table.columns.set(col, { name: col, description: "", classification: "" });
+      }
+      currentColumnName = col;
+      continue;
+    }
+    if (/^-\s+/.test(trimmed)) {
+      const value = trimmed.replace(/^-+\s*/, "").trim();
+      if (!value) continue;
+      if (inRulesBlock) {
+        rules.push(value);
+      } else {
+        extras.push(value);
+      }
+      continue;
+    }
+    const kvMatch = /^([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*(.+)$/.exec(trimmed);
+    if (!kvMatch) {
+      extras.push(trimmed);
+      continue;
+    }
+    const key = String(kvMatch[1] || "").toLowerCase();
+    const value = String(kvMatch[2] || "").trim();
+    if (!value) continue;
+    if (key === "descricao" || key === "description") {
+      if (currentTableKey && currentColumnName) {
+        const table = tables.get(currentTableKey);
+        const col = table.columns.get(currentColumnName);
+        col.description = value;
+      } else if (currentTableKey) {
+        tables.get(currentTableKey).description = value;
+      } else {
+        rules.push(value);
+      }
+      continue;
+    }
+    if (key === "classificacao" || key === "classification") {
+      if (currentTableKey && currentColumnName) {
+        const normalized = value.toLowerCase();
+        const table = tables.get(currentTableKey);
+        const col = table.columns.get(currentColumnName);
+        col.classification = ALLOWED_CLASSIFICATIONS.has(normalized) ? normalized : "";
+      } else {
+        extras.push(`${key}: ${value}`);
+      }
+      continue;
+    }
+    if (key.split(".").length === 3) {
+      const [schema, table, column] = key.split(".");
+      const tab = ensureTable(schema, table);
+      if (!tab.columns.has(column)) {
+        tab.columns.set(column, { name: column, description: value, classification: "" });
+      } else if (!tab.columns.get(column).description) {
+        tab.columns.get(column).description = value;
+      }
+      continue;
+    }
+    if (key === "regra" || key === "rule") {
+      rules.push(value);
+      continue;
+    }
+    extras.push(`${key}: ${value}`);
+  }
+
+  if (tables.size === 0 && rules.length === 0 && extras.length === 0) {
+    return text;
+  }
+
+  const out = [];
+  out.push("# Template RAG - IAOps");
+  out.push("# Ajustado automaticamente");
+  out.push("");
+  for (const table of tables.values()) {
+    out.push(`## tabela: ${table.schema}.${table.table}`);
+    if (table.description) {
+      out.push(`descricao: ${table.description}`);
+      out.push("");
+    }
+    for (const col of table.columns.values()) {
+      out.push(`- coluna: ${col.name}`);
+      if (col.description) {
+        out.push(`  descricao: ${col.description}`);
+      }
+      if (col.classification) {
+        out.push(`  classificacao: ${col.classification}`);
+      }
+      out.push("");
+    }
+  }
+  out.push("## regras_negocio");
+  if (rules.length === 0 && extras.length === 0) {
+    out.push("- Definir regras de negocio para melhorar o entendimento da LLM.");
+  } else {
+    for (const rule of rules) {
+      out.push(`- ${rule}`);
+    }
+    for (const extra of extras) {
+      out.push(`- Observacao: ${extra}`);
+    }
+  }
+  return out.join("\n").trim();
+}
+
 function parseSecretRef(connSecretRef) {
   const raw = String(connSecretRef || "").trim();
   if (!raw) return {};
@@ -142,12 +400,19 @@ export default function DataSourceFormModal({
   onClose,
   onSubmit,
 }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
+  const [loadingRagFile, setLoadingRagFile] = useState(false);
+  const [ragUploadMode, setRagUploadMode] = useState("replace");
+  const [ragPreview, setRagPreview] = useState("");
   const sourceTypeKey = String(form.source_type || "").trim().toLowerCase();
   const profileDef = PROFILE_BY_TYPE[sourceTypeKey] || PROFILE_BY_TYPE.default;
+  const ragValidation = useMemo(() => validateRagText(form.rag_context_text), [form.rag_context_text]);
 
   useEffect(() => {
     if (!open) return;
+    setRagUploadMode("replace");
+    setRagPreview("");
     if (initialData) {
       const parsedSecret = parseSecretRef(initialData.conn_secret_ref);
       setForm({
@@ -171,12 +436,15 @@ export default function DataSourceFormModal({
 
   const canSubmit = useMemo(() => {
     if (!form.source_type.trim()) return false;
-    return profileDef.fields.every((field) => {
+    const profileOk = profileDef.fields.every((field) => {
       if (!field.required) return true;
       const value = String(form.profile?.[field.key] || "").trim();
       return value.length > 0;
     });
-  }, [form.source_type, form.profile, profileDef.fields]);
+    if (!profileOk) return false;
+    if (Boolean(form.rag_enabled) && ragValidation.errors.length > 0) return false;
+    return true;
+  }, [form.source_type, form.profile, profileDef.fields, form.rag_enabled, ragValidation.errors.length]);
 
   if (!open) return null;
 
@@ -207,6 +475,77 @@ export default function DataSourceFormModal({
       rag_enabled: Boolean(form.rag_enabled),
       rag_context_text: String(form.rag_context_text || "").trim() || null,
     });
+  };
+
+  const handleRagFileUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setLoadingRagFile(true);
+    try {
+      const text = await file.text();
+      const cleanText = String(text || "").trim();
+      setForm((prev) => ({
+        ...prev,
+        rag_context_text:
+          ragUploadMode === "append" && String(prev.rag_context_text || "").trim()
+            ? `${String(prev.rag_context_text || "").trim()}\n\n${cleanText}`
+            : cleanText,
+        rag_enabled: true,
+      }));
+      setRagPreview(cleanText.slice(0, 3000));
+    } finally {
+      setLoadingRagFile(false);
+      event.target.value = "";
+    }
+  };
+
+  const handleDownloadRagTemplate = () => {
+    const template = [
+      "# Template RAG - IAOps",
+      "# Use este arquivo para descrever tabelas, colunas e regras de negocio.",
+      "",
+      "## tabela: vendas.vendas",
+      "descricao: Registra as vendas realizadas por cliente.",
+      "",
+      "- coluna: id",
+      "  descricao: Identificador unico da venda",
+      "  classificacao: identifier",
+      "",
+      "- coluna: cliente_id",
+      "  descricao: Codigo do cliente (FK da tabela vendas.cliente)",
+      "  classificacao: identifier",
+      "",
+      "- coluna: data_venda",
+      "  descricao: Data da venda",
+      "  classificacao: temporal",
+      "",
+      "- coluna: valor_total",
+      "  descricao: Valor total da venda",
+      "  classificacao: financial",
+      "",
+      "## regras_negocio",
+      "- Considerar apenas registros com status='ativo' para analises gerenciais.",
+      "- Datas em timezone America/Sao_Paulo.",
+    ].join("\n");
+    const blob = new Blob([template], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "rag_template_iaops.md";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleAutoFixRag = () => {
+    const normalized = normalizeRagText(form.rag_context_text);
+    setForm((prev) => ({
+      ...prev,
+      rag_context_text: normalized,
+      rag_enabled: true,
+    }));
+    setRagPreview(normalized.slice(0, 3000));
   };
 
   return (
@@ -282,9 +621,57 @@ export default function DataSourceFormModal({
               }
             />
           </label>
+          <label>
+            Upload de arquivo RAG
+            <input type="file" accept=".txt,.md,.csv,.json,text/plain,application/json" onChange={handleRagFileUpload} />
+            <small>{loadingRagFile ? "Carregando arquivo..." : "O arquivo preenche o contexto RAG automaticamente."}</small>
+          </label>
+          <label>
+            Estrategia de importacao RAG
+            <select value={ragUploadMode} onChange={(e) => setRagUploadMode(e.target.value)}>
+              <option value="replace">Substituir contexto atual</option>
+              <option value="append">Anexar ao contexto atual</option>
+            </select>
+          </label>
+          {ragPreview ? (
+            <label>
+              Preview do arquivo RAG
+              <textarea rows={6} value={ragPreview} readOnly />
+            </label>
+          ) : null}
+          {Boolean(form.rag_enabled) && (ragValidation.errors.length > 0 || ragValidation.warnings.length > 0) ? (
+            <div className="form-note">
+              {ragValidation.errors.length > 0 ? (
+                <>
+                  <strong>Erros de formato RAG</strong>
+                  <ul>
+                    {ragValidation.errors.slice(0, 8).map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
+              {ragValidation.warnings.length > 0 ? (
+                <>
+                  <strong>Avisos RAG</strong>
+                  <ul>
+                    {ragValidation.warnings.slice(0, 8).map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
+            </div>
+          ) : null}
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>
               Cancelar
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={handleDownloadRagTemplate}>
+              Baixar template RAG
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={handleAutoFixRag} disabled={!String(form.rag_context_text || "").trim()}>
+              Corrigir automaticamente
             </button>
             <button
               type="button"

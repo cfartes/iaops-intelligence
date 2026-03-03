@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   use_app_default_llm: false,
@@ -18,6 +19,7 @@ export default function TenantLlmConfigModal({
   onSubmit,
   onRefreshCatalog,
 }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
   const [useCustomModel, setUseCustomModel] = useState(false);
 

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   name: "",
@@ -6,6 +7,7 @@ const INITIAL_FORM = {
 };
 
 export default function TenantFormModal({ open, onClose, onSubmit, loading }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
   const canSubmit = useMemo(() => form.name.trim().length > 1 && form.slug.trim().length > 1, [form]);
 

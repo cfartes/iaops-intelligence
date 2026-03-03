@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const buildFormTemplate = (defaultLanguage = "pt-BR") => ({
   clientName: "",
@@ -33,6 +34,7 @@ export default function EntityFormModal({
   labels = DEFAULT_LABELS,
   languageOptions = DEFAULT_LANGUAGE_OPTIONS,
 }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(() => buildFormTemplate(defaultLanguage));
 
   const canSubmit = useMemo(

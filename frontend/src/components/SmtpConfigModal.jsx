@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
   host: "",
@@ -11,6 +12,7 @@ const INITIAL_FORM = {
 };
 
 export default function SmtpConfigModal({ open, initialConfig, loading, onClose, onSubmit, onTest }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(INITIAL_FORM);
   const [testEmail, setTestEmail] = useState("");
 

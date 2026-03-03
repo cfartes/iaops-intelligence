@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import useModalBehavior from "./useModalBehavior";
 
 const EMPTY_FORM = {
   title: "",
@@ -7,6 +8,7 @@ const EMPTY_FORM = {
 };
 
 export default function IncidentFormModal({ open, onClose, onSubmit }) {
+  useModalBehavior({ open, onClose });
   const [form, setForm] = useState(EMPTY_FORM);
 
   const canSubmit = useMemo(() => form.title.trim().length > 2, [form.title]);
