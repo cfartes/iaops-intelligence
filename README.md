@@ -79,6 +79,11 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - `query.execute_safe_sql`
 - `security_sql.get_policy`
 - `security_sql.update_policy`
+- `security_mcp.list_policies`
+- `security_mcp.update_policy`
+- `mcp_client.list_connections`
+- `mcp_client.upsert_connection`
+- `mcp_client.update_status`
 - `incident.create`
 - `incident.list`
 - `incident.update_status`

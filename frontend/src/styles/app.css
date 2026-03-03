@@ -82,6 +82,12 @@ select {
   color: #0f2d46;
 }
 
+.menu-item-logout {
+  margin-top: 12px;
+  font-weight: 700;
+  border: 1px solid rgba(231, 244, 255, 0.35);
+}
+
 .content-area {
   padding: 32px;
 }

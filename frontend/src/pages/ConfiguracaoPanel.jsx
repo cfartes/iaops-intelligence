@@ -4,35 +4,48 @@ import {
   disableMfa,
   enableMfa,
   getAdminLlmConfig,
+  getAdminSmtpConfig,
   getMfaStatus,
   getUserTenantPreference,
   getTenantLlmConfig,
   getAuthContext,
+  listAdminLlmModels,
   listAdminLlmProviders,
   listAuthSessions,
+  listTenantLlmModels,
   listTenantLlmProviders,
   revokeAuthSession,
   updateUserTenantPreference,
   updateTenantLlmConfig,
   updateAdminLlmConfig,
+  updateAdminSmtpConfig,
+  sendAdminSmtpTestEmail,
+  testAdminSmtpConfig,
 } from "../api/mcpApi";
 import AppLlmConfigModal from "../components/AppLlmConfigModal";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import MfaCodeModal from "../components/MfaCodeModal";
+import SmtpConfigModal from "../components/SmtpConfigModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
 import { tUi } from "../i18n/uiText";
 
 export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied, onSessionRevokedCurrent }) {
+  const auth = getAuthContext();
+  const isGlobalSuperadmin = Boolean(auth?.is_superadmin) && Number(auth?.tenant_id || 0) <= 0;
   const [mfa, setMfa] = useState(null);
   const [loading, setLoading] = useState(false);
   const [setupInfo, setSetupInfo] = useState(null);
   const [modalMode, setModalMode] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [llmProviders, setLlmProviders] = useState([]);
+  const [llmModelsByProvider, setLlmModelsByProvider] = useState({});
   const [llmConfig, setLlmConfig] = useState(null);
   const [llmDenied, setLlmDenied] = useState(false);
   const [llmModalOpen, setLlmModalOpen] = useState(false);
+  const [smtpConfig, setSmtpConfig] = useState(null);
+  const [smtpModalOpen, setSmtpModalOpen] = useState(false);
   const [tenantLlmProviders, setTenantLlmProviders] = useState([]);
+  const [tenantLlmModelsByProvider, setTenantLlmModelsByProvider] = useState({});
   const [tenantLlmConfig, setTenantLlmConfig] = useState(null);
   const [tenantLlmModalOpen, setTenantLlmModalOpen] = useState(false);
   const [userPref, setUserPref] = useState(null);
@@ -58,15 +71,21 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
   useEffect(() => {
     loadStatus();
     loadLlmAdmin();
-    loadTenantLlmConfig();
-    loadUserPreference();
-    loadSessions();
-  }, []);
+    if (isGlobalSuperadmin) {
+      loadSmtpConfig();
+    } else {
+      loadTenantLlmConfig();
+      loadUserPreference();
+      loadSessions();
+    }
+  }, [isGlobalSuperadmin]);
 
   const loadLlmAdmin = async () => {
     try {
       const [providersData, configData] = await Promise.all([listAdminLlmProviders(), getAdminLlmConfig()]);
-      setLlmProviders(providersData.providers || []);
+      const providers = providersData.providers || [];
+      setLlmProviders(providers);
+      await loadAdminModelsCatalog(providers);
       setLlmConfig(configData.config || null);
       setLlmDenied(false);
     } catch (error) {
@@ -74,14 +93,55 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
     }
   };
 
+  const loadSmtpConfig = async () => {
+    try {
+      const data = await getAdminSmtpConfig();
+      setSmtpConfig(data.config || null);
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar SMTP", error.message);
+    }
+  };
+
   const loadTenantLlmConfig = async () => {
     try {
       const [providersData, cfgData] = await Promise.all([listTenantLlmProviders(), getTenantLlmConfig()]);
-      setTenantLlmProviders(providersData.providers || []);
+      const providers = providersData.providers || [];
+      setTenantLlmProviders(providers);
+      await loadTenantModelsCatalog(providers);
       setTenantLlmConfig(cfgData.config || null);
     } catch (error) {
       onSystemMessage("error", tUi("config.fail.tenantLlm", "Falha ao carregar LLM do tenant"), error.message);
     }
+  };
+
+  const loadAdminModelsCatalog = async (providers) => {
+    const safeProviders = Array.isArray(providers) ? providers : [];
+    const rows = await Promise.all(
+      safeProviders.map(async (item) => {
+        try {
+          const data = await listAdminLlmModels(item.code);
+          return [item.code, Array.isArray(data.models) ? data.models : []];
+        } catch (_) {
+          return [item.code, []];
+        }
+      })
+    );
+    setLlmModelsByProvider(Object.fromEntries(rows));
+  };
+
+  const loadTenantModelsCatalog = async (providers) => {
+    const safeProviders = Array.isArray(providers) ? providers : [];
+    const rows = await Promise.all(
+      safeProviders.map(async (item) => {
+        try {
+          const data = await listTenantLlmModels(item.code);
+          return [item.code, Array.isArray(data.models) ? data.models : []];
+        } catch (_) {
+          return [item.code, []];
+        }
+      })
+    );
+    setTenantLlmModelsByProvider(Object.fromEntries(rows));
   };
 
   const loadUserPreference = async () => {
@@ -161,6 +221,37 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       );
     } catch (error) {
       onSystemMessage("error", tUi("config.fail.appLlm", "Falha ao atualizar LLM do app"), error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitSmtpConfig = async (payload) => {
+    setSubmitting(true);
+    try {
+      const data = await updateAdminSmtpConfig(payload);
+      setSmtpConfig(data.config || null);
+      setSmtpModalOpen(false);
+      onSystemMessage("success", "SMTP atualizado", "Configuracao SMTP salva com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao atualizar SMTP", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const validateSmtpConfig = async (payload, options = {}) => {
+    setSubmitting(true);
+    try {
+      if (options?.sendMail) {
+        const data = await sendAdminSmtpTestEmail(payload);
+        onSystemMessage("success", "E-mail de teste enviado", data?.message || "Envio de teste realizado com sucesso.");
+      } else {
+        await testAdminSmtpConfig(payload);
+        onSystemMessage("success", "SMTP validado", "Conexao SMTP validada com sucesso.");
+      }
+    } catch (error) {
+      onSystemMessage("error", options?.sendMail ? "Falha no envio de teste" : "Falha na validacao SMTP", error.message);
     } finally {
       setSubmitting(false);
     }
@@ -254,6 +345,34 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
     }
   };
 
+  const revokeAllMySessions = async () => {
+    const current = getAuthContext();
+    const mySessions = (sessions || []).filter((item) => Number(item.user_id) === Number(current?.user_id));
+    if (mySessions.length === 0) {
+      onSystemMessage("warning", "Sessoes", "Nenhuma sessao ativa encontrada para seu usuario.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const nonCurrent = mySessions.filter((item) => !item.is_current);
+      for (const item of nonCurrent) {
+        await revokeAuthSession({ session_token: item.session_token });
+      }
+      const currentSession = mySessions.find((item) => item.is_current);
+      if (currentSession) {
+        await revokeAuthSession({ session_token: currentSession.session_token });
+        onSessionRevokedCurrent?.();
+        return;
+      }
+      await loadSessions();
+      onSystemMessage("success", "Sessoes encerradas", "Todas as sessoes do seu usuario foram encerradas.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao encerrar sessoes", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -294,6 +413,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
         </>
       )}
 
+      {!isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.pref.title", "Preferencias Usuario + Tenant")}</h3>
@@ -338,13 +458,20 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           </button>
         </div>
       </section>
+      )}
 
+      {!isGlobalSuperadmin && (
       <section className="catalog-block">
         <div className="section-header">
           <h3>{tUi("config.sessions.title", "Sessoes do usuario")}</h3>
-          <button type="button" className="btn btn-secondary btn-small" onClick={loadSessions} disabled={submitting}>
-            {tUi("common.refresh", "Atualizar")}
-          </button>
+          <div className="chip-row">
+            <button type="button" className="btn btn-secondary btn-small" onClick={loadSessions} disabled={submitting}>
+              {tUi("common.refresh", "Atualizar")}
+            </button>
+            <button type="button" className="btn btn-secondary btn-small" onClick={revokeAllMySessions} disabled={submitting}>
+              Encerrar todas
+            </button>
+          </div>
         </div>
         {sessionsLoading ? (
           <p className="empty-state">{tUi("config.sessions.loading", "Carregando sessoes...")}</p>
@@ -391,7 +518,9 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           </div>
         )}
       </section>
+      )}
 
+      {!isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.tenantLlm.title", "LLM do Tenant")}</h3>
@@ -418,6 +547,11 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
             </tbody>
           </table>
         </div>
+        {!tenantLlmConfig?.use_app_default_llm && !tenantLlmConfig?.provider_name && !tenantLlmConfig?.model_code ? (
+          <p className="empty-state">
+            Nenhuma LLM selecionada para o tenant. Clique em "Configurar LLM do Tenant" e escolha "Usar LLM padrao do app" ou configure uma LLM propria.
+          </p>
+        ) : null}
         <div className="page-actions">
           <button type="button" className="btn btn-primary" onClick={() => setTenantLlmModalOpen(true)} disabled={submitting}>
             {tUi("config.tenantLlm.configure", "Configurar LLM do Tenant")}
@@ -427,7 +561,55 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           </button>
         </div>
       </section>
+      )}
 
+      {isGlobalSuperadmin && (
+      <section className="catalog-block">
+        <header>
+          <h3>SMTP do App (Superadmin)</h3>
+        </header>
+        <div className="table-wrap">
+          <table className="data-table">
+            <tbody>
+              <tr>
+                <th>Host</th>
+                <td>{smtpConfig?.host || "-"}</td>
+              </tr>
+              <tr>
+                <th>Porta</th>
+                <td>{smtpConfig?.port || "-"}</td>
+              </tr>
+              <tr>
+                <th>Usuario</th>
+                <td>{smtpConfig?.user || "-"}</td>
+              </tr>
+              <tr>
+                <th>Remetente</th>
+                <td>{smtpConfig?.from_email || "-"}</td>
+              </tr>
+              <tr>
+                <th>STARTTLS</th>
+                <td>{smtpConfig?.starttls ? "Sim" : "Nao"}</td>
+              </tr>
+              <tr>
+                <th>Senha configurada</th>
+                <td>{smtpConfig?.password_set ? "Sim" : "Nao"}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div className="page-actions">
+          <button type="button" className="btn btn-primary" onClick={() => setSmtpModalOpen(true)} disabled={submitting}>
+            Configurar SMTP
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadSmtpConfig}>
+            Atualizar SMTP
+          </button>
+        </div>
+      </section>
+      )}
+
+      {isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.appLlm.title", "LLM Padrao do App (Superadmin)")}</h3>
@@ -469,6 +651,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           </>
         )}
       </section>
+      )}
 
       <MfaCodeModal
         open={modalMode === "enable"}
@@ -499,19 +682,34 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       <AppLlmConfigModal
         open={llmModalOpen}
         providers={llmProviders}
+        modelsByProvider={llmModelsByProvider}
         initialConfig={llmConfig}
         loading={submitting}
+        onRefreshCatalog={loadLlmAdmin}
         onClose={() => {
           if (!submitting) setLlmModalOpen(false);
         }}
         onSubmit={submitLlmConfig}
       />
 
+      <SmtpConfigModal
+        open={smtpModalOpen}
+        initialConfig={smtpConfig}
+        loading={submitting}
+        onClose={() => {
+          if (!submitting) setSmtpModalOpen(false);
+        }}
+        onSubmit={submitSmtpConfig}
+        onTest={validateSmtpConfig}
+      />
+
       <TenantLlmConfigModal
         open={tenantLlmModalOpen}
         providers={tenantLlmProviders}
+        modelsByProvider={tenantLlmModelsByProvider}
         initialConfig={tenantLlmConfig}
         loading={submitting}
+        onRefreshCatalog={loadTenantLlmConfig}
         onClose={() => {
           if (!submitting) setTenantLlmModalOpen(false);
         }}

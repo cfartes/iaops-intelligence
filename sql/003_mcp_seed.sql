@@ -53,8 +53,8 @@ BEGIN
         t.min_role,
         t.risk_level,
         t.timeout_ms,
-        t.input_schema_json,
-        t.output_schema_json,
+        t.input_schema_json::jsonb,
+        t.output_schema_json::jsonb,
         TRUE
     FROM (
         VALUES
@@ -401,6 +401,46 @@ BEGIN
                 5000,
                 '{"type":"object","properties":{"max_rows":{"type":"integer"},"max_calls_per_minute":{"type":"integer"},"require_masking":{"type":"boolean"},"allowed_schema_patterns":{"type":"array"}}}',
                 '{"type":"object","properties":{"policy":{"type":"object"}}}'
+            ),
+            (
+                'security_mcp.list_policies',
+                'viewer',
+                'low',
+                5000,
+                '{"type":"object","properties":{}}',
+                '{"type":"object","properties":{"policies":{"type":"array"}}}'
+            ),
+            (
+                'security_mcp.update_policy',
+                'admin',
+                'high',
+                5000,
+                '{"type":"object","required":["tool_name"],"properties":{"tool_name":{"type":"string"},"is_enabled":{"type":"boolean"},"max_rows":{"type":["integer","null"]},"max_calls_per_minute":{"type":["integer","null"]},"require_masking":{"type":"boolean"},"allowed_schema_patterns":{"type":"array"}}}',
+                '{"type":"object","properties":{"policy":{"type":"object"}}}'
+            ),
+            (
+                'mcp_client.list_connections',
+                'viewer',
+                'low',
+                5000,
+                '{"type":"object","properties":{}}',
+                '{"type":"object","properties":{"connections":{"type":"array"}}}'
+            ),
+            (
+                'mcp_client.upsert_connection',
+                'admin',
+                'high',
+                5000,
+                '{"type":"object","required":["connection_name","transport_type"],"properties":{"connection_name":{"type":"string"},"transport_type":{"type":"string"},"endpoint_url":{"type":["string","null"]},"auth_secret_ref":{"type":["string","null"]},"is_active":{"type":"boolean"}}}',
+                '{"type":"object","properties":{"connection":{"type":"object"}}}'
+            ),
+            (
+                'mcp_client.update_status',
+                'admin',
+                'medium',
+                5000,
+                '{"type":"object","required":["connection_id","is_active"],"properties":{"connection_id":{"type":"integer"},"is_active":{"type":"boolean"}}}',
+                '{"type":"object","properties":{"connection":{"type":"object"}}}'
             ),
             (
                 'ops.get_health_summary',

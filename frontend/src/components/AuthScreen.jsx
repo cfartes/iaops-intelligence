@@ -117,6 +117,14 @@ export default function AuthScreen({
     try {
       const data = await onPasswordResetRequest({ email_access: resetEmail.trim() });
       setResetHint(data?.delivery || "");
+      if (data?.signup_pending) {
+        setSignupPhase("confirm");
+        setTab("signup");
+        if (data?.confirm_token) {
+          setConfirmToken(data.confirm_token);
+        }
+        return;
+      }
       if (data?.reset_token) {
         setResetToken(data.reset_token);
       }

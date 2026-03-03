@@ -28,7 +28,6 @@ import {
   getTenantLlmConfig,
   getUserTenantPreference,
   listAccessUsers,
-  listOnboardingMonitoredColumns,
   listOnboardingMonitoredTables,
   listTenantDataSources,
   getSetupProgress,
@@ -199,7 +198,6 @@ const UI_TEXT = {
       reasons: {
         onboarding_no_source: "Cadastre pelo menos uma fonte de dados no tenant.",
         onboarding_no_table: "Cadastre ao menos uma tabela monitorada.",
-        onboarding_no_column: "Cadastre ao menos uma coluna monitorada.",
         acesso_no_users: "Cadastre pelo menos um usuario.",
         configuracao_missing: "Configure LLM do tenant/app ou ative MFA.",
         operacao_missing_channels: "Configure ao menos um canal de notificacao.",
@@ -207,7 +205,7 @@ const UI_TEXT = {
       steps: {
         onboarding: {
           title: "Configurar Tenant e Fontes",
-          description: "Cadastre tenant, fontes de dados, tabelas e colunas monitoradas.",
+          description: "Cadastre tenant e fontes, e sincronize tabelas/colunas automaticamente.",
         },
         acesso: {
           title: "Cadastrar Usuarios e Acesso",
@@ -378,7 +376,6 @@ const UI_TEXT = {
       reasons: {
         onboarding_no_source: "Register at least one tenant data source.",
         onboarding_no_table: "Register at least one monitored table.",
-        onboarding_no_column: "Register at least one monitored column.",
         acesso_no_users: "Register at least one user.",
         configuracao_missing: "Configure tenant/app LLM or enable MFA.",
         operacao_missing_channels: "Configure at least one notification channel.",
@@ -386,7 +383,7 @@ const UI_TEXT = {
       steps: {
         onboarding: {
           title: "Configure Tenant and Sources",
-          description: "Register tenant, data sources, monitored tables and columns.",
+          description: "Register tenant and data sources, then auto-sync monitored tables/columns.",
         },
         acesso: {
           title: "Configure Users and Access",
@@ -557,7 +554,6 @@ const UI_TEXT = {
       reasons: {
         onboarding_no_source: "Registre al menos una fuente de datos del tenant.",
         onboarding_no_table: "Registre al menos una tabla monitoreada.",
-        onboarding_no_column: "Registre al menos una columna monitoreada.",
         acesso_no_users: "Registre al menos un usuario.",
         configuracao_missing: "Configure LLM del tenant/app o habilite MFA.",
         operacao_missing_channels: "Configure al menos un canal de notificacion.",
@@ -565,7 +561,7 @@ const UI_TEXT = {
       steps: {
         onboarding: {
           title: "Configurar Tenant y Fuentes",
-          description: "Registre tenant, fuentes de datos, tablas y columnas monitoreadas.",
+          description: "Registre tenant y fuentes y sincronice tablas/columnas automaticamente.",
         },
         acesso: {
           title: "Configurar Usuarios y Acceso",
@@ -628,13 +624,20 @@ export default function App() {
   }, [uiLanguage]);
 
   const uiText = useMemo(() => UI_TEXT[languageBucket], [languageBucket]);
+  const isGlobalSuperadmin = useMemo(
+    () => Boolean(authContext?.is_superadmin) && Number(authContext?.tenant_id || 0) <= 0,
+    [authContext?.is_superadmin, authContext?.tenant_id]
+  );
   const localizedNavItems = useMemo(
     () =>
-      NAV_ITEMS.map((item) => ({
+      NAV_ITEMS.filter((item) => {
+        if (!isGlobalSuperadmin) return true;
+        return ["configuracao", "faturamento", "parcelas"].includes(item.key);
+      }).map((item) => ({
         ...item,
         label: uiText.nav[item.key] || item.label,
       })),
-    [uiText]
+    [isGlobalSuperadmin, uiText]
   );
   const localizedSubtitleByPage = useMemo(() => uiText.subtitles || {}, [uiText]);
 
@@ -664,8 +667,7 @@ export default function App() {
       const reason = setupPendingReasons[step.key] || "";
       const isPartial =
         step.key === "onboarding" &&
-        (reason === uiText.setupWizard.reasons.onboarding_no_table ||
-          reason === uiText.setupWizard.reasons.onboarding_no_column);
+        reason === uiText.setupWizard.reasons.onboarding_no_table;
       status[step.key] = isPartial ? "partial" : reason ? "blocked" : "pending";
     }
     return status;
@@ -683,7 +685,7 @@ export default function App() {
     setMessageModal({ open: true, tone, title, message });
   };
 
-  const performLogout = ({ dueToInactivity = false } = {}) => {
+  const performLogout = ({ dueToInactivity = false, dueToInvalidSession = false, invalidSessionMessage = "" } = {}) => {
     const current = getStoredAuthContext();
     if (current?.refresh_token || current?.session_token) {
       logoutSession({
@@ -698,8 +700,19 @@ export default function App() {
     setIsSetupAssistantOpen(false);
     if (dueToInactivity) {
       openSystemMessage("warning", uiText.inactivityLogoutTitle, uiText.inactivityLogoutMessage);
+    } else if (dueToInvalidSession) {
+      openSystemMessage("warning", uiText.loginModal.fail_title, invalidSessionMessage || "Sessao invalida ou expirada.");
     }
   };
+
+  useEffect(() => {
+    const onInvalidSession = (event) => {
+      const message = event?.detail?.message || "Sessao invalida ou expirada.";
+      performLogout({ dueToInvalidSession: true, invalidSessionMessage: message });
+    };
+    window.addEventListener("iaops:invalid-session", onInvalidSession);
+    return () => window.removeEventListener("iaops:invalid-session", onInvalidSession);
+  }, [uiText.loginModal.fail_title]);
 
   useEffect(() => {
     if (!authContext) {
@@ -774,6 +787,13 @@ export default function App() {
 
   useEffect(() => {
     if (!authContext) return;
+    if (isGlobalSuperadmin) {
+      setCompletedSetupSteps([]);
+      setValidatedSetupSteps([]);
+      setSetupPendingReasons({});
+      setIsSetupAssistantOpen(false);
+      return;
+    }
     const rawCompleted = window.localStorage.getItem(SETUP_PROGRESS_STORAGE_KEY);
     const rawDeferred = window.localStorage.getItem(SETUP_DEFER_UNTIL_STORAGE_KEY);
     const rawCollapsed = window.localStorage.getItem(SETUP_MINI_CHECKLIST_COLLAPSED_KEY);
@@ -801,19 +821,21 @@ export default function App() {
     loadSetupProgressFromBackend();
     evaluateSetupProgress();
     loadUserPreference();
-  }, [authContext]);
+  }, [authContext, isGlobalSuperadmin]);
 
   useEffect(() => {
     if (!authContext) return;
+    if (isGlobalSuperadmin) return;
     if (isSetupAssistantOpen) {
       evaluateSetupProgress();
     }
-  }, [authContext, isSetupAssistantOpen]);
+  }, [authContext, isSetupAssistantOpen, isGlobalSuperadmin]);
 
   useEffect(() => {
     if (!authContext) return;
+    if (isGlobalSuperadmin) return;
     evaluateSetupProgress();
-  }, [authContext, languageBucket]);
+  }, [authContext, languageBucket, isGlobalSuperadmin]);
 
   useEffect(() => {
     document.documentElement.setAttribute("lang", uiLanguage || "pt-BR");
@@ -883,13 +905,7 @@ export default function App() {
         if (tables.length === 0) {
           reasons.onboarding = reasonText.onboarding_no_table;
         } else {
-          const columnsData = await listOnboardingMonitoredColumns();
-          const columns = columnsData?.columns || [];
-          if (columns.length === 0) {
-            reasons.onboarding = reasonText.onboarding_no_column;
-          } else {
-            steps.push("onboarding");
-          }
+          steps.push("onboarding");
         }
       }
 
@@ -953,6 +969,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authContext) return;
+    if (isGlobalSuperadmin) return;
     const snapshot = {
       completed_steps: effectiveCompletedSetupSteps,
       validated_steps: validatedSetupSteps,
@@ -977,12 +994,20 @@ export default function App() {
     authContext,
     activePage,
     effectiveCompletedSetupSteps,
+    isGlobalSuperadmin,
     setupPendingReasons,
     setupStatusCounts,
     setupStepStatusByKey,
     uiLanguage,
     validatedSetupSteps,
   ]);
+
+  useEffect(() => {
+    if (!authContext) return;
+    if (!localizedNavItems.some((item) => item.key === activePage)) {
+      setActivePage(localizedNavItems[0]?.key || "configuracao");
+    }
+  }, [activePage, authContext, localizedNavItems]);
 
   const handleEntityFormSubmit = (payload) => {
     const selectedLanguage = payload.languageCode || "pt-BR";
@@ -1001,14 +1026,24 @@ export default function App() {
   };
 
   const handleClientSignup = async (payload) => {
-    const data = await signupClient(payload);
-    openSystemMessage("success", uiText.signupModal.ok_signup_title, uiText.signupModal.ok_signup_message);
-    return data;
+    try {
+      const data = await signupClient(payload);
+      openSystemMessage("success", uiText.signupModal.ok_signup_title, uiText.signupModal.ok_signup_message);
+      return data;
+    } catch (error) {
+      openSystemMessage("error", uiText.signupModal.title, error.message);
+      throw error;
+    }
   };
 
   const handleClientSignupConfirm = async (payload) => {
-    await confirmClientSignup(payload);
-    openSystemMessage("success", uiText.signupModal.ok_confirm_title, uiText.signupModal.ok_confirm_message);
+    try {
+      await confirmClientSignup(payload);
+      openSystemMessage("success", uiText.signupModal.ok_confirm_title, uiText.signupModal.ok_confirm_message);
+    } catch (error) {
+      openSystemMessage("error", uiText.signupModal.title, error.message);
+      throw error;
+    }
   };
 
   const handlePasswordResetRequest = async (payload) => {
@@ -1134,7 +1169,13 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <SideMenu items={localizedNavItems} activeKey={activePage} onSelect={setActivePage} />
+      <SideMenu
+        items={localizedNavItems}
+        activeKey={activePage}
+        onSelect={setActivePage}
+        logoutLabel={uiText.signOut}
+        onLogout={() => performLogout()}
+      />
 
       <main className="content-area">
         <div className="page-actions">
@@ -1143,27 +1184,24 @@ export default function App() {
               .replace("{email}", authContext.email || "-")
               .replace("{role}", authContext.role || "viewer")}
           </span>
-          <button
-            type="button"
-            className="btn btn-secondary btn-small"
-            onClick={() => performLogout()}
-          >
-            {uiText.signOut}
-          </button>
-          <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSetupAssistantOpen(true)}>
-            {uiText.setupAssistant}
-          </button>
-          <button
-            type="button"
-            className="btn btn-secondary btn-small"
-            onClick={() => {
-              if (pendingSetupStep) setActivePage(pendingSetupStep.targetPage);
-            }}
-            disabled={!pendingSetupStep}
-          >
-            {uiText.setupWizard.nextPending}
-          </button>
-          {currentSetupStep && !effectiveCompletedSetupSteps.includes(currentSetupStep.key) && (
+          {!isGlobalSuperadmin && (
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => setIsSetupAssistantOpen(true)}>
+              {uiText.setupAssistant}
+            </button>
+          )}
+          {!isGlobalSuperadmin && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={() => {
+                if (pendingSetupStep) setActivePage(pendingSetupStep.targetPage);
+              }}
+              disabled={!pendingSetupStep}
+            >
+              {uiText.setupWizard.nextPending}
+            </button>
+          )}
+          {!isGlobalSuperadmin && currentSetupStep && !effectiveCompletedSetupSteps.includes(currentSetupStep.key) && (
             <button
               type="button"
               className="btn btn-primary btn-small"
@@ -1172,33 +1210,38 @@ export default function App() {
               {uiText.setupWizard.completeCurrent}
             </button>
           )}
-          <button
-            type="button"
-            className="btn btn-secondary btn-small"
-            onClick={() =>
-              setMiniChecklistCollapsed((prev) => {
-                const next = !prev;
-                window.localStorage.setItem(SETUP_MINI_CHECKLIST_COLLAPSED_KEY, next ? "1" : "0");
-                return next;
-              })
-            }
-          >
-            {miniChecklistCollapsed ? uiText.setupWizard.expand : uiText.setupWizard.collapse}
-          </button>
+          {!isGlobalSuperadmin && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={() =>
+                setMiniChecklistCollapsed((prev) => {
+                  const next = !prev;
+                  window.localStorage.setItem(SETUP_MINI_CHECKLIST_COLLAPSED_KEY, next ? "1" : "0");
+                  return next;
+                })
+              }
+            >
+              {miniChecklistCollapsed ? uiText.setupWizard.expand : uiText.setupWizard.collapse}
+            </button>
+          )}
         </div>
-        <div className="setup-status-summary">
-          <span className="chip chip-step-done">
-            {uiText.setupWizard.statusSummary.done.replace("{count}", String(setupStatusCounts.done))}
-          </span>
-          <span className="chip chip-step-partial">
-            {uiText.setupWizard.statusSummary.partial.replace("{count}", String(setupStatusCounts.partial))}
-          </span>
-          <span className="chip chip-step-blocked">
-            {uiText.setupWizard.statusSummary.blocked.replace("{count}", String(setupStatusCounts.blocked))}
-          </span>
-        </div>
-        <div className={`setup-mini-checklist-wrap ${miniChecklistCollapsed ? "collapsed" : ""}`} aria-hidden={miniChecklistCollapsed}>
-          <div className="setup-mini-checklist" role="navigation" aria-label={uiText.setupAssistant}>
+        {!isGlobalSuperadmin && (
+          <div className="setup-status-summary">
+            <span className="chip chip-step-done">
+              {uiText.setupWizard.statusSummary.done.replace("{count}", String(setupStatusCounts.done))}
+            </span>
+            <span className="chip chip-step-partial">
+              {uiText.setupWizard.statusSummary.partial.replace("{count}", String(setupStatusCounts.partial))}
+            </span>
+            <span className="chip chip-step-blocked">
+              {uiText.setupWizard.statusSummary.blocked.replace("{count}", String(setupStatusCounts.blocked))}
+            </span>
+          </div>
+        )}
+        {!isGlobalSuperadmin && (
+          <div className={`setup-mini-checklist-wrap ${miniChecklistCollapsed ? "collapsed" : ""}`} aria-hidden={miniChecklistCollapsed}>
+            <div className="setup-mini-checklist" role="navigation" aria-label={uiText.setupAssistant}>
             {ASSISTANT_STEPS.map((step, index) => {
               const status = setupStepStatusByKey[step.key] || "pending";
               const label = uiText.setupWizard.steps?.[step.key]?.title || step.title;
@@ -1221,10 +1264,11 @@ export default function App() {
                   <span className="mini-step-text">{label}</span>
                   <span className="mini-step-status">{statusText}</span>
                 </button>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
+        )}
 
         {activePage === "onboarding" ? (
           <OnboardingPanel onSystemMessage={openSystemMessage} />

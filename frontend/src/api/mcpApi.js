@@ -9,14 +9,20 @@ function readStoredAuthContext() {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
-    if (!parsed.client_id || !parsed.tenant_id || !parsed.user_id) return null;
+    const clientId = Number(parsed.client_id);
+    const tenantId = Number(parsed.tenant_id);
+    const userId = Number(parsed.user_id);
+    if (!Number.isFinite(clientId) || clientId < 0) return null;
+    if (!Number.isFinite(tenantId) || tenantId < 0) return null;
+    if (!Number.isFinite(userId) || userId <= 0) return null;
     return {
-      client_id: Number(parsed.client_id),
-      tenant_id: Number(parsed.tenant_id),
-      user_id: Number(parsed.user_id),
+      client_id: clientId,
+      tenant_id: tenantId,
+      user_id: userId,
       email: parsed.email || "",
       full_name: parsed.full_name || "",
       role: parsed.role || "",
+      is_superadmin: Boolean(parsed.is_superadmin),
       tenant_name: parsed.tenant_name || "",
       session_token: parsed.session_token || "",
       refresh_token: parsed.refresh_token || "",
@@ -66,12 +72,33 @@ function buildHeaders(overrides = {}) {
 }
 
 async function parseResponse(response) {
-  const data = await response.json();
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    const message = raw || `Falha HTTP ${response.status}`;
+    const error = new Error(message);
+    error.code = "invalid_json_response";
+    throw error;
+  }
+  if (!data || typeof data !== "object") {
+    const error = new Error(`Resposta invalida do servidor (HTTP ${response.status})`);
+    error.code = "invalid_response";
+    throw error;
+  }
   if (!response.ok || data.status !== "success") {
     const message = data?.error?.message || "Falha na chamada MCP";
     const error = new Error(message);
     error.code = data?.error?.code || "mcp_error";
     error.details = data?.data || {};
+    if (error.code === "invalid_session") {
+      try {
+        window.dispatchEvent(new CustomEvent("iaops:invalid-session", { detail: { message } }));
+      } catch (_) {
+        // no-op
+      }
+    }
     throw error;
   }
   return data.data;
@@ -219,6 +246,33 @@ export async function testDataSourceConnection(payload) {
   return parseResponse(response);
 }
 
+export async function discoverDataSourceTables(payload) {
+  const response = await fetch("/api/data-sources/discover-tables", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function discoverDataSourceColumns(payload) {
+  const response = await fetch("/api/data-sources/discover-columns", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function enrichMonitoredColumns(payload) {
+  const response = await fetch("/api/onboarding/monitored-columns/enrich", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function createIncident(payload) {
   const response = await fetch("/api/incidents", {
     method: "POST",
@@ -291,6 +345,23 @@ export async function getSqlSecurityPolicy() {
 
 export async function updateSqlSecurityPolicy(payload) {
   const response = await fetch("/api/security-sql/policy", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listMcpToolPolicies() {
+  const response = await fetch("/api/security-mcp/policies", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function updateMcpToolPolicy(payload) {
+  const response = await fetch("/api/security-mcp/policies", {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),
@@ -409,8 +480,52 @@ export async function getAdminLlmConfig() {
   return parseResponse(response);
 }
 
+export async function listAdminLlmModels(providerName) {
+  const query = providerName ? `?provider_name=${encodeURIComponent(providerName)}` : "";
+  const response = await fetch(`/api/admin/llm/models${query}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
 export async function updateAdminLlmConfig(payload) {
   const response = await fetch("/api/admin/llm/config", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function getAdminSmtpConfig() {
+  const response = await fetch("/api/admin/smtp/config", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function updateAdminSmtpConfig(payload) {
+  const response = await fetch("/api/admin/smtp/config", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function testAdminSmtpConfig(payload) {
+  const response = await fetch("/api/admin/smtp/test", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function sendAdminSmtpTestEmail(payload) {
+  const response = await fetch("/api/admin/smtp/send-test", {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),
@@ -428,6 +543,15 @@ export async function listTenantLlmProviders() {
 
 export async function getTenantLlmConfig() {
   const response = await fetch("/api/tenant-llm/config", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function listTenantLlmModels(providerName) {
+  const query = providerName ? `?provider_name=${encodeURIComponent(providerName)}` : "";
+  const response = await fetch(`/api/tenant-llm/models${query}`, {
     method: "GET",
     headers: buildHeaders(),
   });
@@ -812,6 +936,32 @@ export async function getObservabilityMetrics() {
   const response = await fetch("/api/observability/metrics", {
     method: "GET",
     headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function listMcpConnections() {
+  const response = await fetch("/api/mcp/connections", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertMcpConnection(payload) {
+  const response = await fetch("/api/mcp/connections", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function updateMcpConnectionStatus(payload) {
+  const response = await fetch("/api/mcp/connections/status", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
   });
   return parseResponse(response);
 }

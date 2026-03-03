@@ -26,11 +26,13 @@ class MCPGateway:
         "channel.set_active_tenant",
         "channel.get_active_tenant",
         "llm_admin.list_providers",
+        "llm_admin.list_models",
         "llm_admin.get_app_config",
         "llm_admin.update_app_config",
     }
     _SUPERADMIN_TOOLS = {
         "llm_admin.list_providers",
+        "llm_admin.list_models",
         "llm_admin.get_app_config",
         "llm_admin.update_app_config",
     }
@@ -53,7 +55,9 @@ class MCPGateway:
             "tenant_llm.get_config": self._handle_tenant_llm_get_config,
             "tenant_llm.update_config": self._handle_tenant_llm_update_config,
             "tenant_llm.list_providers": self._handle_tenant_llm_list_providers,
+            "tenant_llm.list_models": self._handle_tenant_llm_list_models,
             "llm_admin.list_providers": self._handle_llm_admin_list_providers,
+            "llm_admin.list_models": self._handle_llm_admin_list_models,
             "llm_admin.get_app_config": self._handle_llm_admin_get_app_config,
             "llm_admin.update_app_config": self._handle_llm_admin_update_app_config,
             "access.list_users": self._handle_access_list_users,
@@ -81,6 +85,11 @@ class MCPGateway:
             "query.execute_safe_sql": self._handle_execute_safe_sql,
             "security_sql.get_policy": self._handle_security_sql_get_policy,
             "security_sql.update_policy": self._handle_security_sql_update_policy,
+            "security_mcp.list_policies": self._handle_security_mcp_list_policies,
+            "security_mcp.update_policy": self._handle_security_mcp_update_policy,
+            "mcp_client.list_connections": self._handle_mcp_client_list_connections,
+            "mcp_client.upsert_connection": self._handle_mcp_client_upsert_connection,
+            "mcp_client.update_status": self._handle_mcp_client_update_status,
             "incident.create": self._handle_incident_create,
             "incident.list": self._handle_incident_list,
             "incident.update_status": self._handle_incident_update_status,
@@ -113,6 +122,11 @@ class MCPGateway:
             result = ToolExecutionResult("error", {}, "tool_not_found", "Tool nao registrada")
             return self._finalize_log(context, tool_name or "unknown", payload, result, start)
 
+        is_superadmin_actor = self.repository.is_superadmin(context.user_id)
+        if tool_name in self._SUPERADMIN_TOOLS and not is_superadmin_actor:
+            result = ToolExecutionResult("denied", {}, "superadmin_required", "Acesso restrito a superadmin")
+            return self._finalize_log(context, tool_name, payload, result, start)
+
         tenant_ok = self.repository.is_tenant_operational(context.client_id, context.tenant_id)
         if not tenant_ok and tool_name not in self._CLIENT_SCOPE_TOOLS:
             result = ToolExecutionResult("denied", {}, "tenant_blocked", "Tenant inativo, bloqueado ou inadimplente")
@@ -121,23 +135,23 @@ class MCPGateway:
         max_rows: int | None = None
         if tool_name not in self._CHANNEL_TOOLS:
             policy = self.repository.get_tool_policy(context.tenant_id, tool_name)
-            if policy is None or not policy.is_enabled:
-                result = ToolExecutionResult("denied", {}, "tool_disabled", "Tool nao habilitada para o tenant")
-                return self._finalize_log(context, tool_name, payload, result, start)
-            max_rows = policy.max_rows
+            if tool_name in self._SUPERADMIN_TOOLS and is_superadmin_actor:
+                # Superadmin global nao depende de policy/role por tenant para tools administrativas do app.
+                max_rows = policy.max_rows if policy is not None else None
+            else:
+                if policy is None or not policy.is_enabled:
+                    result = ToolExecutionResult("denied", {}, "tool_disabled", "Tool nao habilitada para o tenant")
+                    return self._finalize_log(context, tool_name, payload, result, start)
+                max_rows = policy.max_rows
 
-            role = self.repository.get_user_role(context.tenant_id, context.user_id)
-            if role is None:
-                result = ToolExecutionResult("denied", {}, "user_not_scoped", "Usuario sem escopo no tenant")
-                return self._finalize_log(context, tool_name, payload, result, start)
+                role = self.repository.get_user_role(context.tenant_id, context.user_id)
+                if role is None:
+                    result = ToolExecutionResult("denied", {}, "user_not_scoped", "Usuario sem escopo no tenant")
+                    return self._finalize_log(context, tool_name, payload, result, start)
 
-            if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
-                result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
-                return self._finalize_log(context, tool_name, payload, result, start)
-
-        if tool_name in self._SUPERADMIN_TOOLS and not self.repository.is_superadmin(context.user_id):
-            result = ToolExecutionResult("denied", {}, "superadmin_required", "Acesso restrito a superadmin")
-            return self._finalize_log(context, tool_name, payload, result, start)
+                if ROLE_ORDER[role] < ROLE_ORDER[policy.min_role]:
+                    result = ToolExecutionResult("denied", {}, "insufficient_role", "Permissao insuficiente para a tool")
+                    return self._finalize_log(context, tool_name, payload, result, start)
 
         try:
             data = self._handlers[tool_name](context, tool_input, max_rows)
@@ -248,6 +262,21 @@ class MCPGateway:
             rows = rows[:max_rows]
         return {"providers": rows}
 
+    def _handle_llm_admin_list_models(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context
+        provider_name = str(tool_input.get("provider_name", "")).strip().lower()
+        if not provider_name:
+            raise ValueError("provider_name obrigatorio")
+        rows = self.repository.list_supported_llm_models(provider_name)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"provider_name": provider_name, "models": rows}
+
     def _handle_llm_admin_get_app_config(
         self,
         context: RequestContext,
@@ -291,6 +320,21 @@ class MCPGateway:
         if max_rows is not None:
             rows = rows[:max_rows]
         return {"providers": rows}
+
+    def _handle_tenant_llm_list_models(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = context
+        provider_name = str(tool_input.get("provider_name", "")).strip().lower()
+        if not provider_name:
+            raise ValueError("provider_name obrigatorio")
+        rows = self.repository.list_supported_llm_models(provider_name)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"provider_name": provider_name, "models": rows}
 
     def _handle_tenant_llm_get_config(
         self,
@@ -873,6 +917,88 @@ class MCPGateway:
             allowed_schema_patterns=normalized,
         )
         return {"policy": policy}
+
+    def _handle_security_mcp_list_policies(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = tool_input
+        rows = self.repository.list_tenant_tool_policies(context.tenant_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"policies": rows}
+
+    def _handle_security_mcp_update_policy(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        tool_name = str(tool_input.get("tool_name", "")).strip()
+        if not tool_name:
+            raise ValueError("tool_name obrigatorio")
+        is_enabled = bool(tool_input.get("is_enabled", True))
+        max_rows_input = tool_input.get("max_rows")
+        max_calls_input = tool_input.get("max_calls_per_minute")
+        policy = self.repository.upsert_tenant_tool_policy(
+            context.tenant_id,
+            tool_name=tool_name,
+            is_enabled=is_enabled,
+            max_rows=int(max_rows_input) if max_rows_input is not None else None,
+            max_calls_per_minute=int(max_calls_input) if max_calls_input is not None else None,
+            require_masking=bool(tool_input.get("require_masking", True)),
+            allowed_schema_patterns=[
+                str(item).strip()
+                for item in (tool_input.get("allowed_schema_patterns") or [])
+                if str(item).strip()
+            ],
+        )
+        return {"policy": policy}
+
+    def _handle_mcp_client_list_connections(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = tool_input
+        rows = self.repository.list_mcp_client_connections(context.tenant_id)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"connections": rows}
+
+    def _handle_mcp_client_upsert_connection(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        connection_name = str(tool_input.get("connection_name", "")).strip()
+        transport_type = str(tool_input.get("transport_type", "")).strip().lower()
+        endpoint_url = str(tool_input.get("endpoint_url", "")).strip() or None
+        auth_secret_ref = str(tool_input.get("auth_secret_ref", "")).strip() or None
+        is_active = bool(tool_input.get("is_active", True))
+        if not connection_name:
+            raise ValueError("connection_name obrigatorio")
+        if transport_type not in {"stdio", "http", "websocket"}:
+            raise ValueError("transport_type invalido")
+        if transport_type in {"http", "websocket"} and not endpoint_url:
+            raise ValueError("endpoint_url obrigatorio para este transport_type")
+        connection = self.repository.upsert_mcp_client_connection(
+            context.tenant_id,
+            connection_name=connection_name,
+            transport_type=transport_type,
+            endpoint_url=endpoint_url,
+            auth_secret_ref=auth_secret_ref,
+            is_active=is_active,
+        )
+        return {"connection": connection}
+
+    def _handle_mcp_client_update_status(
+        self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("connection_id") is None:
+            raise ValueError("connection_id obrigatorio")
+        is_active = bool(tool_input.get("is_active", True))
+        connection = self.repository.update_mcp_client_connection_status(
+            context.tenant_id,
+            connection_id=int(tool_input.get("connection_id")),
+            is_active=is_active,
+        )
+        return {"connection": connection}
 
     def _handle_incident_create(self, context: RequestContext, tool_input: dict[str, Any], max_rows: int | None) -> dict[str, Any]:
         _ = max_rows

@@ -1,4 +1,4 @@
-export default function SideMenu({ items, activeKey, onSelect }) {
+export default function SideMenu({ items, activeKey, onSelect, logoutLabel, onLogout }) {
   return (
     <aside className="side-menu">
       <div className="brand">
@@ -16,6 +16,11 @@ export default function SideMenu({ items, activeKey, onSelect }) {
             {item.label}
           </button>
         ))}
+        {onLogout ? (
+          <button type="button" className="menu-item menu-item-logout" onClick={onLogout}>
+            {logoutLabel || "Sair"}
+          </button>
+        ) : null}
       </nav>
     </aside>
   );

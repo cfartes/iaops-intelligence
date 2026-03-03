@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   deleteDataSource,
+  discoverDataSourceColumns,
+  discoverDataSourceTables,
   deleteMonitoredColumn,
   deleteMonitoredTable,
+  enrichMonitoredColumns,
   listOnboardingMonitoredColumns,
   listOnboardingMonitoredTables,
   listSourceCatalog,
@@ -16,18 +19,8 @@ import {
 } from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
 import DataSourceFormModal from "../components/DataSourceFormModal";
-import MonitoredColumnFormModal from "../components/MonitoredColumnFormModal";
 import MonitoredTableFormModal from "../components/MonitoredTableFormModal";
 import { tUi } from "../i18n/uiText";
-
-const CATEGORY_LABEL = {
-  relational: "Relacionais",
-  nosql: "NoSQL",
-  warehouse: "Data Warehouses",
-  lake_storage: "Data Lakes/Object Storage",
-  bi_semantic: "BI Semantico",
-  lakehouse_semantic: "Lakehouse/Semantico",
-};
 
 export default function OnboardingPanel({ onSystemMessage }) {
   const [sources, setSources] = useState([]);
@@ -45,19 +38,9 @@ export default function OnboardingPanel({ onSystemMessage }) {
   const [monitoredColumns, setMonitoredColumns] = useState([]);
   const [selectedTableIdForColumns, setSelectedTableIdForColumns] = useState("");
   const [columnsLoading, setColumnsLoading] = useState(false);
-  const [isColumnModalOpen, setIsColumnModalOpen] = useState(false);
-  const [columnSaving, setColumnSaving] = useState(false);
+  const [discoveringColumns, setDiscoveringColumns] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
   const [actionLoading, setActionLoading] = useState(false);
-
-  const grouped = useMemo(() => {
-    return sources.reduce((acc, item) => {
-      const key = item.category || "outros";
-      if (!acc[key]) acc[key] = [];
-      acc[key].push(item);
-      return acc;
-    }, {});
-  }, [sources]);
 
   const loadCatalog = async () => {
     setLoading(true);
@@ -90,12 +73,55 @@ export default function OnboardingPanel({ onSystemMessage }) {
     }
   };
 
-  const loadMonitoredTables = async (sourceIdRaw) => {
+  const loadMonitoredTables = async (sourceIdRaw, options = {}) => {
+    const { attemptSync = true, forceSync = false } = options;
     const sourceId = sourceIdRaw || selectedSourceIdForTables || undefined;
     setTablesLoading(true);
     try {
       const data = await listOnboardingMonitoredTables(sourceId ? Number(sourceId) : undefined);
       const rows = data.tables || [];
+      if (sourceId && (forceSync || (attemptSync && rows.length === 0))) {
+        const source = tenantSources.find((item) => String(item.id) === String(sourceId));
+        if (source && source.conn_secret_ref) {
+          const discovered = await discoverDataSourceTables({
+            source_type: source.source_type,
+            conn_secret_ref: source.conn_secret_ref,
+          });
+          const discoveredTables = Array.isArray(discovered.tables) ? discovered.tables : [];
+          if (discoveredTables.length > 0) {
+            for (const item of discoveredTables.slice(0, 500)) {
+              try {
+                await registerMonitoredTable({
+                  data_source_id: Number(sourceId),
+                  schema_name: item.schema_name || "public",
+                  table_name: item.table_name,
+                  is_active: true,
+                });
+              } catch (_) {
+                // ignora tabela ja cadastrada ou erro pontual para seguir com a sincronizacao
+              }
+            }
+            const refreshed = await listOnboardingMonitoredTables(Number(sourceId));
+            const refreshedRows = refreshed.tables || [];
+            setMonitoredTables(refreshedRows);
+            if (refreshedRows.length > 0) {
+              const tableExists = refreshedRows.some((item) => String(item.id) === String(selectedTableIdForColumns));
+              if (!selectedTableIdForColumns || !tableExists) {
+                setSelectedTableIdForColumns(String(refreshedRows[0].id));
+              }
+            }
+            for (const table of refreshedRows.slice(0, 300)) {
+              try {
+                await syncColumnsForTable(table);
+              } catch (_) {
+                // segue sincronizacao parcial
+              }
+            }
+            onSystemMessage("success", "Tabelas sincronizadas", `${refreshedRows.length} tabela(s) carregada(s) da fonte.`);
+            return;
+          }
+        }
+      }
       setMonitoredTables(rows);
       if (rows.length === 0) {
         setSelectedTableIdForColumns("");
@@ -113,7 +139,50 @@ export default function OnboardingPanel({ onSystemMessage }) {
     }
   };
 
-  const loadMonitoredColumns = async (tableIdRaw) => {
+  const syncColumnsForTable = async (table) => {
+    if (!table) return 0;
+    const source = tenantSources.find((item) => Number(item.id) === Number(table.data_source_id));
+    if (!source || !source.conn_secret_ref) return 0;
+    const discovered = await discoverDataSourceColumns({
+      source_type: source.source_type,
+      conn_secret_ref: source.conn_secret_ref,
+      schema_name: table.schema_name,
+      table_name: table.table_name,
+    });
+    const columns = Array.isArray(discovered.columns) ? discovered.columns : [];
+    let synced = 0;
+    for (const col of columns) {
+      const columnName = String(col.column_name || "").trim();
+      if (!columnName) continue;
+      try {
+        await registerMonitoredColumn({
+          monitored_table_id: Number(table.id),
+          column_name: columnName,
+          data_type: col.data_type || null,
+          classification: null,
+          description_text: null,
+        });
+        synced += 1;
+      } catch (_) {
+        // ignora colunas ja existentes
+      }
+    }
+    try {
+      await enrichMonitoredColumns({
+        monitored_table_id: Number(table.id),
+        source_type: source.source_type,
+        conn_secret_ref: source.conn_secret_ref,
+        schema_name: table.schema_name,
+        table_name: table.table_name,
+      });
+    } catch (_) {
+      // enriquecimento e best effort; nao bloqueia sincronizacao
+    }
+    return synced;
+  };
+
+  const loadMonitoredColumns = async (tableIdRaw, options = {}) => {
+    const { attemptSync = true, forceSync = false } = options;
     const tableId = tableIdRaw || selectedTableIdForColumns || undefined;
     if (!tableId) {
       setMonitoredColumns([]);
@@ -122,7 +191,21 @@ export default function OnboardingPanel({ onSystemMessage }) {
     setColumnsLoading(true);
     try {
       const data = await listOnboardingMonitoredColumns(Number(tableId));
-      setMonitoredColumns(data.columns || []);
+      let rows = data.columns || [];
+      const table = monitoredTables.find((item) => String(item.id) === String(tableId));
+      if (table && (forceSync || (attemptSync && rows.length === 0))) {
+        setDiscoveringColumns(true);
+        try {
+          await syncColumnsForTable(table);
+          const refreshed = await listOnboardingMonitoredColumns(Number(tableId));
+          rows = refreshed.columns || [];
+        } catch (error) {
+          onSystemMessage("warning", "Colunas nao detectadas automaticamente", error.message);
+        } finally {
+          setDiscoveringColumns(false);
+        }
+      }
+      setMonitoredColumns(rows);
     } catch (error) {
       onSystemMessage("error", tUi("onboarding.fail.columns", "Erro ao carregar colunas monitoradas"), error.message);
     } finally {
@@ -153,7 +236,11 @@ export default function OnboardingPanel({ onSystemMessage }) {
     try {
       const data = await testDataSourceConnection(payload);
       if (data.ok) {
-        onSystemMessage("success", "Conexao validada", data.message || "Conexao testada com sucesso.");
+        onSystemMessage(
+          "success",
+          "Conexao validada",
+          `${data.message || "Conexao testada com sucesso."} Clique em "Atualizar" na secao de tabelas para sincronizacao automatica.`
+        );
       } else {
         onSystemMessage("warning", "Falha na conexao", data.message || "Nao foi possivel validar a conexao.");
       }
@@ -202,24 +289,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
       onSystemMessage("error", tUi("onboarding.fail.tableCreate", "Falha no cadastro da tabela monitorada"), error.message);
     } finally {
       setTableSaving(false);
-    }
-  };
-
-  const handleRegisterMonitoredColumn = async (payload) => {
-    setColumnSaving(true);
-    try {
-      const data = await registerMonitoredColumn(payload);
-      setIsColumnModalOpen(false);
-      onSystemMessage(
-        "success",
-        tUi("onboarding.ok.columnCreated.title", "Coluna monitorada cadastrada"),
-        `Coluna ${data.column.column_name} cadastrada com sucesso.`
-      );
-      await loadMonitoredColumns(String(payload.monitored_table_id));
-    } catch (error) {
-      onSystemMessage("error", tUi("onboarding.fail.columnCreate", "Falha no cadastro da coluna monitorada"), error.message);
-    } finally {
-      setColumnSaving(false);
     }
   };
 
@@ -336,20 +405,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
 
       {loading && <p className="empty-state">{tUi("onboarding.loading.sources", "Carregando fontes...")}</p>}
 
-      {!loading &&
-        Object.entries(grouped).map(([category, items]) => (
-          <section key={category} className="catalog-block">
-            <h3>{CATEGORY_LABEL[category] || category}</h3>
-            <div className="chip-row">
-              {items.map((item) => (
-                <span key={item.code} className="chip">
-                  {item.name}
-                </span>
-              ))}
-            </div>
-          </section>
-        ))}
-
       <section className="catalog-block">
         <h3>{tUi("onboarding.sources.title", "Fontes cadastradas no tenant")}</h3>
         {tenantSources.length === 0 ? (
@@ -414,7 +469,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
             <button type="button" className="btn btn-primary btn-small" onClick={() => setIsTableModalOpen(true)}>
               {tUi("onboarding.create.table", "Cadastrar Tabela")}
             </button>
-            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredTables()}>
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredTables(undefined, { forceSync: true })}>
               {tUi("common.refresh", "Atualizar")}
             </button>
           </div>
@@ -441,8 +496,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>ID</th>
-                  <th>Fonte</th>
                   <th>Schema</th>
                   <th>Tabela</th>
                   <th>Status</th>
@@ -452,8 +505,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
               <tbody>
                 {monitoredTables.map((item) => (
                   <tr key={item.id}>
-                    <td>{item.id}</td>
-                    <td>{item.source_name || item.source_type}</td>
                     <td>{item.schema_name}</td>
                     <td>{item.table_name}</td>
                     <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
@@ -495,11 +546,8 @@ export default function OnboardingPanel({ onSystemMessage }) {
         <div className="section-header">
           <h3>{tUi("onboarding.columns.title", "Colunas monitoradas por tabela")}</h3>
           <div className="chip-row">
-            <button type="button" className="btn btn-primary btn-small" onClick={() => setIsColumnModalOpen(true)}>
-              {tUi("onboarding.create.column", "Cadastrar Coluna")}
-            </button>
-            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns()}>
-              {tUi("common.refresh", "Atualizar")}
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns(undefined, { forceSync: true })}>
+              {discoveringColumns ? "Sincronizando..." : "Sincronizar colunas"}
             </button>
           </div>
         </div>
@@ -607,16 +655,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
           if (!tableSaving) setIsTableModalOpen(false);
         }}
         onSubmit={handleRegisterMonitoredTable}
-      />
-
-      <MonitoredColumnFormModal
-        open={isColumnModalOpen}
-        tables={monitoredTables}
-        defaultTableId={selectedTableIdForColumns ? Number(selectedTableIdForColumns) : undefined}
-        onClose={() => {
-          if (!columnSaving) setIsColumnModalOpen(false);
-        }}
-        onSubmit={handleRegisterMonitoredColumn}
       />
     </section>
   );

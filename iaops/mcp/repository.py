@@ -8,6 +8,59 @@ from iaops.security.totp import generate_base32_secret, provisioning_uri, verify
 
 from .models import ToolPolicy
 
+DEFAULT_LLM_MODELS: dict[str, list[dict[str, Any]]] = {
+    "openai": [
+        {"code": "gpt-5", "name": "GPT-5"},
+        {"code": "gpt-5-mini", "name": "GPT-5 Mini"},
+        {"code": "gpt-5-nano", "name": "GPT-5 Nano"},
+        {"code": "gpt-4.1", "name": "GPT-4.1"},
+        {"code": "gpt-4.1-mini", "name": "GPT-4.1 Mini"},
+        {"code": "gpt-4.1-nano", "name": "GPT-4.1 Nano"},
+        {"code": "o4-mini", "name": "o4-mini"},
+    ],
+    "azure_openai": [
+        {"code": "gpt-5", "name": "GPT-5"},
+        {"code": "gpt-5-mini", "name": "GPT-5 Mini"},
+        {"code": "gpt-5-nano", "name": "GPT-5 Nano"},
+        {"code": "gpt-4.1", "name": "GPT-4.1"},
+        {"code": "gpt-4.1-mini", "name": "GPT-4.1 Mini"},
+        {"code": "gpt-4.1-nano", "name": "GPT-4.1 Nano"},
+    ],
+    "anthropic": [
+        {"code": "claude-3-7-sonnet-latest", "name": "Claude 3.7 Sonnet"},
+        {"code": "claude-3-5-sonnet-latest", "name": "Claude 3.5 Sonnet"},
+        {"code": "claude-3-5-haiku-latest", "name": "Claude 3.5 Haiku"},
+        {"code": "claude-3-opus-latest", "name": "Claude 3 Opus"},
+    ],
+    "google_gemini": [
+        {"code": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+        {"code": "gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
+        {"code": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite"},
+        {"code": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro Preview"},
+        {"code": "gemini-3.1-pro-preview-customtools", "name": "Gemini 3.1 Pro Preview (Custom Tools)"},
+        {"code": "gemini-3-flash-preview", "name": "Gemini 3 Flash Preview"},
+    ],
+    "mistral": [
+        {"code": "mistral-large-latest", "name": "Mistral Large Latest"},
+        {"code": "mistral-small-latest", "name": "Mistral Small Latest"},
+        {"code": "ministral-8b-latest", "name": "Ministral 8B Latest"},
+        {"code": "open-mistral-nemo", "name": "Open Mistral Nemo"},
+    ],
+    "groq": [
+        {"code": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B Versatile"},
+        {"code": "llama-3.1-8b-instant", "name": "Llama 3.1 8B Instant"},
+        {"code": "mixtral-8x7b-32768", "name": "Mixtral 8x7B 32k"},
+        {"code": "gemma2-9b-it", "name": "Gemma2 9B IT"},
+    ],
+    "ollama": [
+        {"code": "llama3.2", "name": "Llama 3.2"},
+        {"code": "llama3.1", "name": "Llama 3.1"},
+        {"code": "qwen2.5", "name": "Qwen 2.5"},
+        {"code": "mistral", "name": "Mistral"},
+        {"code": "gemma3", "name": "Gemma 3"},
+    ],
+}
+
 
 class MCPRepository(ABC):
     @abstractmethod
@@ -101,6 +154,10 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_supported_llm_models(self, provider_name: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
     def get_app_default_llm_config(self) -> dict[str, Any] | None:
         raise NotImplementedError
 
@@ -161,6 +218,45 @@ class MCPRepository(ABC):
 
     @abstractmethod
     def get_tool_policy(self, tenant_id: int, tool_name: str) -> ToolPolicy | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_tenant_tool_policies(self, tenant_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_tenant_tool_policy(
+        self,
+        tenant_id: int,
+        *,
+        tool_name: str,
+        is_enabled: bool,
+        max_rows: int | None,
+        max_calls_per_minute: int | None,
+        require_masking: bool,
+        allowed_schema_patterns: list[str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_mcp_client_connections(self, tenant_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_mcp_client_connection(
+        self,
+        tenant_id: int,
+        *,
+        connection_name: str,
+        transport_type: str,
+        endpoint_url: str | None,
+        auth_secret_ref: str | None,
+        is_active: bool,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_mcp_client_connection_status(self, tenant_id: int, connection_id: int, is_active: bool) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -405,7 +501,9 @@ class InMemoryMCPRepository(MCPRepository):
             (10, "tenant_llm.get_config"): ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
             (10, "tenant_llm.update_config"): ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
             (10, "tenant_llm.list_providers"): ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
+            (10, "tenant_llm.list_models"): ToolPolicy("tenant_llm.list_models", "viewer", True, 500, 120, True, None),
             (10, "llm_admin.list_providers"): ToolPolicy("llm_admin.list_providers", "owner", True, 200, 120, True, None),
+            (10, "llm_admin.list_models"): ToolPolicy("llm_admin.list_models", "owner", True, 500, 120, True, None),
             (10, "llm_admin.get_app_config"): ToolPolicy("llm_admin.get_app_config", "owner", True, None, 120, True, None),
             (10, "llm_admin.update_app_config"): ToolPolicy("llm_admin.update_app_config", "owner", True, None, 60, True, None),
             (10, "channel.list_user_tenants"): ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
@@ -437,6 +535,26 @@ class InMemoryMCPRepository(MCPRepository):
                 10,
                 "security_sql.update_policy",
             ): ToolPolicy("security_sql.update_policy", "admin", True, 200, 120, True, ["public", "analytics"]),
+            (
+                10,
+                "security_mcp.list_policies",
+            ): ToolPolicy("security_mcp.list_policies", "viewer", True, 500, 120, True, ["public", "analytics"]),
+            (
+                10,
+                "security_mcp.update_policy",
+            ): ToolPolicy("security_mcp.update_policy", "admin", True, 500, 120, True, ["public", "analytics"]),
+            (
+                10,
+                "mcp_client.list_connections",
+            ): ToolPolicy("mcp_client.list_connections", "viewer", True, 200, 120, True, None),
+            (
+                10,
+                "mcp_client.upsert_connection",
+            ): ToolPolicy("mcp_client.upsert_connection", "admin", True, 200, 120, True, None),
+            (
+                10,
+                "mcp_client.update_status",
+            ): ToolPolicy("mcp_client.update_status", "admin", True, 200, 120, True, None),
             (10, "ops.get_health_summary"): ToolPolicy("ops.get_health_summary", "viewer", True, None, 120, True, None),
             (10, "setup.get_progress"): ToolPolicy("setup.get_progress", "admin", True, None, 120, True, None),
             (10, "setup.upsert_progress"): ToolPolicy("setup.upsert_progress", "admin", True, None, 120, True, None),
@@ -493,6 +611,22 @@ class InMemoryMCPRepository(MCPRepository):
         self._columns_by_table: dict[tuple[int, int], list[dict[str, Any]]] = {
             (10, 501): [*self._columns[(10, "public", "orders")]],
         }
+        self._mcp_connections: dict[int, list[dict[str, Any]]] = {
+            10: [
+                {
+                    "id": 1,
+                    "tenant_id": 10,
+                    "connection_name": "mcp-itsm",
+                    "transport_type": "http",
+                    "endpoint_url": "https://mcp.example.local/itsm",
+                    "auth_secret_ref": "secret://tenant-10/mcp/itsm",
+                    "is_active": True,
+                    "health_status": "unknown",
+                    "last_healthcheck_at": None,
+                }
+            ]
+        }
+        self._mcp_connection_seq = 2
         self._monitored_column_seq = 7004
         self._incident_seq = 1
         self._incidents: list[dict[str, Any]] = []
@@ -777,6 +911,11 @@ class InMemoryMCPRepository(MCPRepository):
     def list_supported_llm_providers(self) -> list[dict[str, Any]]:
         return [*self._supported_llm_providers]
 
+    def list_supported_llm_models(self, provider_name: str) -> list[dict[str, Any]]:
+        key = str(provider_name or "").strip().lower()
+        rows = DEFAULT_LLM_MODELS.get(key, [])
+        return [dict(item) for item in rows]
+
     def get_app_default_llm_config(self) -> dict[str, Any] | None:
         return dict(self._app_llm_config) if self._app_llm_config else None
 
@@ -948,6 +1087,104 @@ class InMemoryMCPRepository(MCPRepository):
 
     def get_tool_policy(self, tenant_id: int, tool_name: str) -> ToolPolicy | None:
         return self._tool_policies.get((tenant_id, tool_name))
+
+    def list_tenant_tool_policies(self, tenant_id: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for (item_tenant_id, tool_name), policy in self._tool_policies.items():
+            if int(item_tenant_id) != int(tenant_id):
+                continue
+            rows.append(
+                {
+                    "tool_name": tool_name,
+                    "min_role": policy.min_role,
+                    "is_enabled": policy.is_enabled,
+                    "max_rows": policy.max_rows,
+                    "max_calls_per_minute": policy.max_calls_per_minute,
+                    "require_masking": policy.require_masking,
+                    "allowed_schema_patterns": policy.allowed_schema_patterns or [],
+                }
+            )
+        return sorted(rows, key=lambda item: item["tool_name"])
+
+    def upsert_tenant_tool_policy(
+        self,
+        tenant_id: int,
+        *,
+        tool_name: str,
+        is_enabled: bool,
+        max_rows: int | None,
+        max_calls_per_minute: int | None,
+        require_masking: bool,
+        allowed_schema_patterns: list[str],
+    ) -> dict[str, Any]:
+        base = self._tool_policies.get((tenant_id, tool_name))
+        min_role = base.min_role if base else "admin"
+        self._tool_policies[(tenant_id, tool_name)] = ToolPolicy(
+            tool_name=tool_name,
+            min_role=min_role,
+            is_enabled=bool(is_enabled),
+            max_rows=max_rows,
+            max_calls_per_minute=max_calls_per_minute,
+            require_masking=bool(require_masking),
+            allowed_schema_patterns=list(allowed_schema_patterns or []),
+        )
+        policy = self._tool_policies[(tenant_id, tool_name)]
+        return {
+            "tool_name": policy.tool_name,
+            "min_role": policy.min_role,
+            "is_enabled": policy.is_enabled,
+            "max_rows": policy.max_rows,
+            "max_calls_per_minute": policy.max_calls_per_minute,
+            "require_masking": policy.require_masking,
+            "allowed_schema_patterns": policy.allowed_schema_patterns or [],
+        }
+
+    def list_mcp_client_connections(self, tenant_id: int) -> list[dict[str, Any]]:
+        rows = self._mcp_connections.get(tenant_id, [])
+        return sorted(rows, key=lambda item: item["connection_name"])
+
+    def upsert_mcp_client_connection(
+        self,
+        tenant_id: int,
+        *,
+        connection_name: str,
+        transport_type: str,
+        endpoint_url: str | None,
+        auth_secret_ref: str | None,
+        is_active: bool,
+    ) -> dict[str, Any]:
+        if transport_type not in {"stdio", "http", "websocket"}:
+            raise ValueError("transport_type invalido")
+        rows = self._mcp_connections.setdefault(tenant_id, [])
+        for row in rows:
+            if row["connection_name"] == connection_name:
+                row["transport_type"] = transport_type
+                row["endpoint_url"] = endpoint_url
+                row["auth_secret_ref"] = auth_secret_ref
+                row["is_active"] = bool(is_active)
+                return dict(row)
+        row = {
+            "id": self._mcp_connection_seq,
+            "tenant_id": tenant_id,
+            "connection_name": connection_name,
+            "transport_type": transport_type,
+            "endpoint_url": endpoint_url,
+            "auth_secret_ref": auth_secret_ref,
+            "is_active": bool(is_active),
+            "health_status": "unknown",
+            "last_healthcheck_at": None,
+        }
+        self._mcp_connection_seq += 1
+        rows.append(row)
+        return dict(row)
+
+    def update_mcp_client_connection_status(self, tenant_id: int, connection_id: int, is_active: bool) -> dict[str, Any]:
+        rows = self._mcp_connections.get(tenant_id, [])
+        for row in rows:
+            if int(row["id"]) == int(connection_id):
+                row["is_active"] = bool(is_active)
+                return dict(row)
+        raise ValueError("conexao MCP nao encontrada")
 
     def list_source_catalog(self) -> list[dict[str, Any]]:
         return [

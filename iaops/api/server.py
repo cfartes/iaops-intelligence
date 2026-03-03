@@ -5,6 +5,8 @@ import os
 import re
 import csv
 import io
+import datetime as dt
+import decimal
 import socket
 import smtplib
 import unicodedata
@@ -17,13 +19,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from secrets import token_hex
 from time import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from functions import handle_request
 from iaops.jobs import get_job_queue
 from iaops.jobs.pipeline import search_rag_documents
-from iaops.security.crypto import decrypt_text
-from iaops.security.totp import verify_totp
+from iaops.security.crypto import decrypt_text, encrypt_text
+from iaops.security.totp import generate_base32_secret, provisioning_uri, verify_totp
 try:
     from psycopg import connect
 except Exception:  # pragma: no cover - depende de ambiente
@@ -71,6 +73,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     jobs_rate_limit_window_seconds = 60
     jobs_rate_limit_max_calls = 15
     jobs_rate_limit_lock_seconds = 60
+    local_env_loaded = False
+    smtp_runtime_config: dict[str, object] = {}
+
+    @staticmethod
+    def _build_signup_confirm_link(confirm_token: str) -> str:
+        base = (os.getenv("IAOPS_SIGNUP_CONFIRM_URL_BASE") or "http://127.0.0.1:8000/api/auth/confirm-link").strip()
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}confirm_token={quote_plus(str(confirm_token or '').strip())}"
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json(HTTPStatus.NO_CONTENT, {})
@@ -113,6 +123,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/security-sql/policy":
             self._handle_security_sql_policy_get()
             return
+        if parsed.path == "/api/security-mcp/policies":
+            self._handle_security_mcp_policies_list()
+            return
         if parsed.path == "/api/access/users":
             self._handle_access_users_list()
             return
@@ -128,11 +141,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/admin/llm/providers":
             self._handle_admin_llm_providers_list()
             return
+        if parsed.path == "/api/admin/llm/models":
+            self._handle_admin_llm_models_list(parsed.query)
+            return
         if parsed.path == "/api/admin/llm/config":
             self._handle_admin_llm_config_get()
             return
+        if parsed.path == "/api/admin/smtp/config":
+            self._handle_admin_smtp_config_get()
+            return
         if parsed.path == "/api/tenant-llm/providers":
             self._handle_tenant_llm_providers_list()
+            return
+        if parsed.path == "/api/tenant-llm/models":
+            self._handle_tenant_llm_models_list(parsed.query)
             return
         if parsed.path == "/api/tenant-llm/config":
             self._handle_tenant_llm_config_get()
@@ -145,6 +167,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/auth/sessions":
             self._handle_auth_sessions_list()
+            return
+        if parsed.path == "/api/auth/confirm-link":
+            self._handle_auth_confirm_link(parsed.query)
             return
         if parsed.path == "/api/lgpd/policy":
             self._handle_lgpd_policy_get()
@@ -175,6 +200,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/observability/metrics":
             self._handle_observability_metrics()
+            return
+        if parsed.path == "/api/mcp/connections":
+            self._handle_mcp_connections_list()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -231,6 +259,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/data-sources/test-connection":
             self._handle_data_source_test_connection()
             return
+        if parsed.path == "/api/data-sources/discover-tables":
+            self._handle_data_source_discover_tables()
+            return
+        if parsed.path == "/api/data-sources/discover-columns":
+            self._handle_data_source_discover_columns()
+            return
         if parsed.path == "/api/onboarding/monitored-tables":
             self._handle_onboarding_monitored_table_create()
             return
@@ -240,11 +274,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/onboarding/monitored-columns":
             self._handle_onboarding_monitored_column_create()
             return
+        if parsed.path == "/api/onboarding/monitored-columns/enrich":
+            self._handle_onboarding_monitored_columns_enrich()
+            return
         if parsed.path == "/api/onboarding/monitored-columns/delete":
             self._handle_onboarding_monitored_column_delete()
             return
         if parsed.path == "/api/security-sql/policy":
             self._handle_security_sql_policy_update()
+            return
+        if parsed.path == "/api/security-mcp/policies":
+            self._handle_security_mcp_policy_update()
             return
         if parsed.path == "/api/chat-bi/query":
             self._handle_chat_bi_query()
@@ -269,6 +309,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/admin/llm/config":
             self._handle_admin_llm_config_update()
+            return
+        if parsed.path == "/api/admin/smtp/config":
+            self._handle_admin_smtp_config_update()
+            return
+        if parsed.path == "/api/admin/smtp/test":
+            self._handle_admin_smtp_test()
+            return
+        if parsed.path == "/api/admin/smtp/send-test":
+            self._handle_admin_smtp_send_test()
             return
         if parsed.path == "/api/tenant-llm/config":
             self._handle_tenant_llm_config_update()
@@ -332,6 +381,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/jobs/retry":
             self._handle_jobs_retry()
+            return
+        if parsed.path == "/api/mcp/connections":
+            self._handle_mcp_connection_upsert()
+            return
+        if parsed.path == "/api/mcp/connections/status":
+            self._handle_mcp_connection_status_update()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -544,6 +599,111 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_onboarding_monitored_columns_enrich(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_db_enabled():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "db_unavailable", "message": "Banco nao configurado para enriquecimento."},
+                },
+            )
+            return
+
+        body = self._read_json_body()
+        monitored_table_id = body.get("monitored_table_id")
+        source_type = str(body.get("source_type") or "").strip().lower()
+        schema_name = str(body.get("schema_name") or "").strip()
+        table_name = str(body.get("table_name") or "").strip()
+        conn_secret_ref = str(body.get("conn_secret_ref") or "").strip()
+        if monitored_table_id is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "monitored_table_id obrigatorio"},
+                },
+            )
+            return
+        if not source_type or not table_name or not conn_secret_ref:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "source_type, table_name e conn_secret_ref obrigatorios"},
+                },
+            )
+            return
+
+        try:
+            profile = self._extract_connection_profile(conn_secret_ref=conn_secret_ref, secret_payload=body.get("secret_payload"))
+            discovered = self._discover_source_columns(
+                source_type=source_type,
+                profile=profile,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+            sample_rows = self._sample_source_table_rows(
+                source_type=source_type,
+                profile=profile,
+                schema_name=schema_name,
+                table_name=table_name,
+                limit=25,
+            )
+            enriched = self._db_enrich_monitored_columns(
+                tenant_id=int(context["tenant_id"]),
+                monitored_table_id=int(monitored_table_id),
+                source_type=source_type,
+                schema_name=schema_name or "public",
+                table_name=table_name,
+                discovered_columns=discovered,
+                sample_rows=sample_rows,
+                context=context,
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": enriched,
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.enrich_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "enrich_error", "message": str(exc)},
+                },
+            )
+
     def _handle_incident_create(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -627,6 +787,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_security_mcp_policies_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "security_mcp.list_policies",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_access_users_list(self) -> None:
         payload = {
             "context": self._request_context(),
@@ -636,8 +804,34 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         self._dispatch_mcp(payload)
 
     def _handle_mfa_status_get(self) -> None:
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            try:
+                mfa = self._db_get_user_mfa_status_global(user_id=int(context.get("user_id") or 0))
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "tool": "security.mfa.get_status",
+                        "correlation_id": str(uuid.uuid4()),
+                        "data": {"mfa": mfa},
+                        "error": None,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "security.mfa.get_status",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "mfa_error", "message": str(exc)},
+                    },
+                )
+            return
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "security.mfa.get_status",
             "input": {},
         }
@@ -645,8 +839,37 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_mfa_setup_begin(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            try:
+                setup = self._db_begin_user_mfa_setup_global(
+                    user_id=int(context.get("user_id") or 0),
+                    issuer=str(body.get("issuer", "IAOps Governance")),
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "tool": "security.mfa.begin_setup",
+                        "correlation_id": str(uuid.uuid4()),
+                        "data": {"setup": setup},
+                        "error": None,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "security.mfa.begin_setup",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "mfa_error", "message": str(exc)},
+                    },
+                )
+            return
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "security.mfa.begin_setup",
             "input": {
                 "issuer": body.get("issuer", "IAOps Governance"),
@@ -656,8 +879,37 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_mfa_enable(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            try:
+                mfa = self._db_enable_user_mfa_global(
+                    user_id=int(context.get("user_id") or 0),
+                    otp_code=str(body.get("otp_code") or "").strip(),
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "tool": "security.mfa.enable",
+                        "correlation_id": str(uuid.uuid4()),
+                        "data": {"mfa": mfa},
+                        "error": None,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "security.mfa.enable",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "mfa_error", "message": str(exc)},
+                    },
+                )
+            return
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "security.mfa.enable",
             "input": {
                 "otp_code": body.get("otp_code"),
@@ -667,8 +919,37 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_mfa_disable(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            try:
+                mfa = self._db_disable_user_mfa_global(
+                    user_id=int(context.get("user_id") or 0),
+                    otp_code=str(body.get("otp_code") or "").strip(),
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "tool": "security.mfa.disable_self",
+                        "correlation_id": str(uuid.uuid4()),
+                        "data": {"mfa": mfa},
+                        "error": None,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "security.mfa.disable_self",
+                        "correlation_id": None,
+                        "data": {},
+                        "error": {"code": "mfa_error", "message": str(exc)},
+                    },
+                )
+            return
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "security.mfa.disable_self",
             "input": {
                 "otp_code": body.get("otp_code"),
@@ -735,6 +1016,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_admin_llm_models_list(self, query: str) -> None:
+        qs = parse_qs(query)
+        provider_name = qs.get("provider_name", [""])[0]
+        payload = {
+            "context": self._request_context(),
+            "tool": "llm_admin.list_models",
+            "input": {
+                "provider_name": provider_name,
+            },
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_admin_llm_config_get(self) -> None:
         payload = {
             "context": self._request_context(),
@@ -757,11 +1050,350 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_admin_smtp_config_get(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.get_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.get_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "admin.smtp.get_config",
+                "correlation_id": str(uuid.uuid4()),
+                "data": {"config": self._smtp_public_config()},
+                "error": None,
+            },
+        )
+
+    def _handle_admin_smtp_config_update(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            updated = self._update_smtp_runtime_config(body if isinstance(body, dict) else {})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.smtp.update_config",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"config": updated},
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+
+    def _handle_data_source_discover_tables(self) -> None:
+        body = self._read_json_body()
+        source_type = str(body.get("source_type") or "").strip().lower()
+        if not source_type:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.discover_tables",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "source_type obrigatorio"},
+                },
+            )
+            return
+        try:
+            profile = self._extract_connection_profile(
+                conn_secret_ref=str(body.get("conn_secret_ref") or ""),
+                secret_payload=body.get("secret_payload"),
+            )
+            tables = self._discover_source_tables(source_type=source_type, profile=profile)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "source.discover_tables",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {
+                        "source_type": source_type,
+                        "tables": tables,
+                        "total": len(tables),
+                    },
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.discover_tables",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "error",
+                    "tool": "source.discover_tables",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "discover_failed", "message": str(exc)},
+                },
+            )
+
+    def _handle_data_source_discover_columns(self) -> None:
+        body = self._read_json_body()
+        source_type = str(body.get("source_type") or "").strip().lower()
+        schema_name = str(body.get("schema_name") or "").strip()
+        table_name = str(body.get("table_name") or "").strip()
+        if not source_type:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.discover_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "source_type obrigatorio"},
+                },
+            )
+            return
+        if not table_name:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.discover_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "table_name obrigatorio"},
+                },
+            )
+            return
+        try:
+            profile = self._extract_connection_profile(
+                conn_secret_ref=str(body.get("conn_secret_ref") or ""),
+                secret_payload=body.get("secret_payload"),
+            )
+            columns = self._discover_source_columns(
+                source_type=source_type,
+                profile=profile,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "source.discover_columns",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {
+                        "source_type": source_type,
+                        "schema_name": schema_name,
+                        "table_name": table_name,
+                        "columns": columns,
+                        "total": len(columns),
+                    },
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "source.discover_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "error",
+                    "tool": "source.discover_columns",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "discover_failed", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_smtp_test(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            result = self._test_smtp_config(body if isinstance(body, dict) else {})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.smtp.test",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": result,
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "smtp_test_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_smtp_send_test(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.send_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.send_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            result = self._send_test_smtp_email(body if isinstance(body, dict) else {})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.smtp.send_test",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": result,
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.smtp.send_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "smtp_send_error", "message": str(exc)},
+                },
+            )
+
     def _handle_tenant_llm_providers_list(self) -> None:
         payload = {
             "context": self._request_context(),
             "tool": "tenant_llm.list_providers",
             "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_tenant_llm_models_list(self, query: str) -> None:
+        qs = parse_qs(query)
+        provider_name = qs.get("provider_name", [""])[0]
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant_llm.list_models",
+            "input": {
+                "provider_name": provider_name,
+            },
         }
         self._dispatch_mcp(payload)
 
@@ -1445,7 +2077,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             return
         reset_token: str | None = None
+        pending_signup: dict | None = None
         user_record = self._find_user_for_password_reset(email_access=email_access)
+        if not user_record:
+            pending_signup = self._find_pending_signup_for_email(email_access=email_access)
         if user_record:
             reset_token = self._create_password_reset_request(user_record=user_record)
         delivered = False
@@ -1456,9 +2091,21 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 display_name=str(user_record.get("full_name") or user_record.get("email") or email_access),
                 reset_token=reset_token,
             )
+        elif pending_signup:
+            delivered, detail = self._send_signup_email(
+                to_email=email_access,
+                trade_name=str(pending_signup.get("trade_name") or email_access),
+                confirm_token=str(pending_signup.get("confirm_token") or ""),
+            )
+            if delivered:
+                detail = f"Cadastro pendente localizado. {detail}"
         data = {"delivery": detail}
         if user_record and reset_token and not delivered:
             data["reset_token"] = reset_token
+        if pending_signup and not delivered:
+            data["confirm_token"] = str(pending_signup.get("confirm_token") or "")
+        if pending_signup:
+            data["signup_pending"] = True
         self._send_json(
             HTTPStatus.OK,
             {
@@ -1468,6 +2115,34 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "data": data,
                 "error": None,
             },
+        )
+
+    def _handle_auth_confirm_link(self, query: str) -> None:
+        qs = parse_qs(query)
+        confirm_token = str(qs.get("confirm_token", [""])[0] or "").strip()
+        if not confirm_token:
+            self._send_html(
+                HTTPStatus.BAD_REQUEST,
+                "<h2>Token de confirmacao ausente</h2><p>Use o link completo enviado por e-mail.</p>",
+            )
+            return
+        result = self._confirm_pending_signup_db(confirm_token=confirm_token)
+        if isinstance(result, dict):
+            self._send_html(
+                HTTPStatus.OK,
+                "<h2>Cadastro confirmado</h2><p>Seu acesso foi ativado com sucesso. Volte ao app e faca login.</p>",
+            )
+            return
+        messages = {
+            "expired_token": "O token expirou. Solicite novo cadastro ou use 'Esqueci a senha' para reenviar validacao.",
+            "invalid_token": "Token invalido.",
+            "already_exists": "Cadastro ja confirmado para este cliente/e-mail.",
+            "plan_not_found": "Plano nao encontrado para este cadastro.",
+            "db_unavailable": "Falha ao confirmar cadastro no banco.",
+        }
+        self._send_html(
+            HTTPStatus.BAD_REQUEST,
+            f"<h2>Nao foi possivel confirmar</h2><p>{messages.get(str(result), 'Token invalido ou inexistente.')}</p>",
         )
 
     def _handle_auth_password_reset(self) -> None:
@@ -1924,7 +2599,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     FROM {schema}.app_user u
                     JOIN {schema}.client c ON c.id = u.client_id
                     WHERE LOWER(u.email) = %(email)s
+                      AND COALESCE(u.is_active, FALSE) = TRUE
                       AND COALESCE(c.status, '') = 'active'
+                      AND c.email_confirmed_at IS NOT NULL
                     LIMIT 1
                     """,
                     {"email": email},
@@ -1937,6 +2614,50 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "client_id": int(row[1]),
                 "email": str(row[2] or email),
                 "full_name": str(row[3] or row[2] or email),
+            }
+        except Exception:
+            return None
+
+    def _find_pending_signup_for_email(self, *, email_access: str) -> dict | None:
+        email = str(email_access or "").strip().lower()
+        if not email:
+            return None
+        if not self._is_db_enabled():
+            for token, value in self.pending_signups.items():
+                if str(value.get("email_access") or "").strip().lower() != email:
+                    continue
+                if int(value.get("expires_at_epoch") or 0) < int(time()):
+                    continue
+                status = str(value.get("status") or "pending")
+                if status not in {"pending", "pending_email_confirmation"}:
+                    continue
+                return {
+                    "confirm_token": token,
+                    "trade_name": str(value.get("trade_name") or ""),
+                }
+            return None
+        try:
+            self._ensure_signup_tables()
+            schema = self.signup_schema
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT confirm_token, trade_name
+                    FROM {schema}.client_signup_pending
+                    WHERE LOWER(email_access) = %(email)s
+                      AND status = 'pending'
+                      AND expires_at > NOW()
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    {"email": email},
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "confirm_token": str(row[0] or ""),
+                "trade_name": str(row[1] or ""),
             }
         except Exception:
             return None
@@ -2091,14 +2812,186 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             if refresh_token:
                 self.refresh_sessions.pop(refresh_token, None)
 
+    @classmethod
+    def _smtp_effective_config(cls) -> dict[str, object]:
+        runtime = cls.smtp_runtime_config or {}
+        host = str(runtime.get("host") or os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST") or "").strip()
+        user = str(runtime.get("user") or os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or "").strip()
+        from_email = str(runtime.get("from_email") or os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or user).strip()
+
+        raw_port = runtime.get("port")
+        if raw_port in (None, ""):
+            raw_port = os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587"
+        try:
+            port = int(raw_port)
+        except Exception:
+            port = 587
+
+        runtime_has_password = "password" in runtime
+        if runtime_has_password:
+            password = str(runtime.get("password") or "")
+        else:
+            password = str(os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or "")
+
+        raw_tls = runtime.get("starttls")
+        if raw_tls is None:
+            raw_tls = os.getenv("IAOPS_SMTP_STARTTLS") or "1"
+        starttls = str(raw_tls).strip().lower() not in {"0", "false", "no", "off"}
+
+        return {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "from_email": from_email,
+            "starttls": bool(starttls),
+            "password_set": bool(password),
+        }
+
+    @classmethod
+    def _smtp_public_config(cls) -> dict[str, object]:
+        cfg = cls._smtp_effective_config()
+        return {
+            "host": cfg["host"],
+            "port": cfg["port"],
+            "user": cfg["user"],
+            "from_email": cfg["from_email"],
+            "starttls": cfg["starttls"],
+            "password_set": cfg["password_set"],
+        }
+
+    @classmethod
+    def _update_smtp_runtime_config(cls, payload: dict[str, object]) -> dict[str, object]:
+        host = str(payload.get("host") or "").strip()
+        user = str(payload.get("user") or "").strip()
+        from_email = str(payload.get("from_email") or "").strip()
+        raw_port = payload.get("port")
+        raw_tls = payload.get("starttls")
+        password = payload.get("password")
+        clear_password = bool(payload.get("clear_password"))
+
+        if host:
+            cls.smtp_runtime_config["host"] = host
+        if user or "user" in payload:
+            cls.smtp_runtime_config["user"] = user
+        if from_email or "from_email" in payload:
+            cls.smtp_runtime_config["from_email"] = from_email
+        if raw_port not in (None, ""):
+            try:
+                port = int(raw_port)
+            except Exception as exc:
+                raise ValueError("port invalida") from exc
+            if port <= 0 or port > 65535:
+                raise ValueError("port deve estar entre 1 e 65535")
+            cls.smtp_runtime_config["port"] = port
+        if raw_tls is not None:
+            cls.smtp_runtime_config["starttls"] = bool(raw_tls)
+        if clear_password:
+            cls.smtp_runtime_config["password"] = ""
+        elif password is not None and str(password).strip():
+            cls.smtp_runtime_config["password"] = str(password)
+        return cls._smtp_public_config()
+
+    @classmethod
+    def _test_smtp_config(cls, overrides: dict[str, object]) -> dict[str, object]:
+        cfg = cls._smtp_effective_config()
+        host = str(overrides.get("host") or cfg.get("host") or "").strip()
+        user = str(overrides.get("user") or cfg.get("user") or "").strip()
+        from_email = str(overrides.get("from_email") or cfg.get("from_email") or "").strip()
+        raw_port = overrides.get("port")
+        if raw_port in (None, ""):
+            raw_port = cfg.get("port") or 587
+        try:
+            port = int(raw_port)
+        except Exception as exc:
+            raise ValueError("port invalida para teste SMTP") from exc
+        starttls = bool(overrides.get("starttls")) if "starttls" in overrides else bool(cfg.get("starttls"))
+        password = str(overrides.get("password") or "") if "password" in overrides else str(cfg.get("password") or "")
+        if not host:
+            raise ValueError("host SMTP obrigatorio para teste")
+        if not from_email:
+            raise ValueError("from_email obrigatorio para teste")
+        try:
+            with smtplib.SMTP(host, port, timeout=15) as smtp:
+                smtp.ehlo()
+                if starttls:
+                    smtp.starttls()
+                    smtp.ehlo()
+                if user:
+                    smtp.login(user, password)
+            return {
+                "ok": True,
+                "message": "Conexao SMTP validada com sucesso.",
+                "config": {
+                    "host": host,
+                    "port": port,
+                    "user": user,
+                    "from_email": from_email,
+                    "starttls": starttls,
+                },
+            }
+        except Exception as exc:
+            raise ValueError(f"Falha ao validar SMTP: {exc}") from exc
+
+    @classmethod
+    def _send_test_smtp_email(cls, payload: dict[str, object]) -> dict[str, object]:
+        to_email = str(payload.get("to_email") or "").strip()
+        if not to_email:
+            raise ValueError("to_email obrigatorio para envio de teste")
+        cfg = cls._smtp_effective_config()
+        host = str(payload.get("host") or cfg.get("host") or "").strip()
+        user = str(payload.get("user") or cfg.get("user") or "").strip()
+        from_email = str(payload.get("from_email") or cfg.get("from_email") or "").strip()
+        raw_port = payload.get("port")
+        if raw_port in (None, ""):
+            raw_port = cfg.get("port") or 587
+        try:
+            port = int(raw_port)
+        except Exception as exc:
+            raise ValueError("port invalida para teste SMTP") from exc
+        starttls = bool(payload.get("starttls")) if "starttls" in payload else bool(cfg.get("starttls"))
+        password = str(payload.get("password") or "") if "password" in payload else str(cfg.get("password") or "")
+        if not host:
+            raise ValueError("host SMTP obrigatorio para envio de teste")
+        if not from_email:
+            raise ValueError("from_email obrigatorio para envio de teste")
+
+        subject = "IAOps Governance - Teste de SMTP"
+        body = (
+            "Este e-mail confirma que o envio SMTP do IAOps foi executado com sucesso.\n\n"
+            f"Host: {host}\n"
+            f"Porta: {port}\n"
+            f"STARTTLS: {'sim' if starttls else 'nao'}\n"
+            f"Remetente: {from_email}\n"
+        )
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = from_email
+        message["To"] = to_email
+        message.set_content(body)
+
+        try:
+            with smtplib.SMTP(host, port, timeout=20) as smtp:
+                smtp.ehlo()
+                if starttls:
+                    smtp.starttls()
+                    smtp.ehlo()
+                if user:
+                    smtp.login(user, password)
+                smtp.send_message(message)
+            return {"ok": True, "message": f"E-mail de teste enviado para {to_email}."}
+        except Exception as exc:
+            raise ValueError(f"Falha ao enviar e-mail de teste: {exc}") from exc
+
     @staticmethod
     def _send_password_reset_email(*, to_email: str, display_name: str, reset_token: str) -> tuple[bool, str]:
-        smtp_host = os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST")
-        smtp_port = int(os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
-        smtp_user = os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or ""
-        smtp_pass = os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or ""
-        smtp_from = os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or smtp_user
-        smtp_tls = str(os.getenv("IAOPS_SMTP_STARTTLS") or "1").strip() not in {"0", "false", "False"}
+        smtp = IAOpsAPIHandler._smtp_effective_config()
+        smtp_host = str(smtp.get("host") or "")
+        smtp_port = int(smtp.get("port") or 587)
+        smtp_user = str(smtp.get("user") or "")
+        smtp_pass = str(smtp.get("password") or "")
+        smtp_from = str(smtp.get("from_email") or "")
+        smtp_tls = bool(smtp.get("starttls"))
         if not smtp_host or not smtp_from:
             return False, "SMTP nao configurado no ambiente."
         subject = "IAOps Governance - Redefinicao de senha"
@@ -2122,8 +3015,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     smtp.login(smtp_user, smtp_pass)
                 smtp.send_message(message)
             return True, f"Instrucoes de redefinicao enviadas para {to_email}."
-        except Exception:
-            return False, "Falha no envio por SMTP. Token retornado no payload para uso em desenvolvimento."
+        except Exception as exc:
+            return False, f"Falha no envio por SMTP: {exc}. Token retornado no payload para uso em desenvolvimento."
 
     def _login_user(self, *, email: str, password: str, tenant_id: int | None) -> dict:
         if not self._is_db_enabled():
@@ -2141,7 +3034,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         u.password_hash,
                         u.is_active,
                         c.status AS client_status,
-                        c.email_confirmed_at
+                        c.email_confirmed_at,
+                        COALESCE(u.is_superadmin, FALSE) AS is_superadmin
                     FROM {schema}.app_user u
                     JOIN {schema}.client c ON c.id = u.client_id
                     WHERE LOWER(u.email) = %(email)s
@@ -2160,22 +3054,42 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     return {"error_code": "email_unconfirmed", "message": "E-mail do cliente nao confirmado."}
                 if not self._verify_password_hash(password, str(user[4] or "")):
                     return {"error_code": "invalid_credentials", "message": "Credenciais invalidas."}
+                is_superadmin = bool(user[8])
 
-                role_and_tenant = self._resolve_login_tenant(cur=cur, client_id=int(user[1]), user_id=int(user[0]), tenant_id=tenant_id)
-                if not role_and_tenant:
-                    return {"error_code": "tenant_not_found", "message": "Nenhum tenant ativo vinculado ao usuario."}
-                resolved_tenant_id, tenant_name, role = role_and_tenant
+                resolved_tenant_id = 0
+                tenant_name = "Global"
+                role = "owner"
+                if not is_superadmin:
+                    role_and_tenant = self._resolve_login_tenant(
+                        cur=cur,
+                        client_id=int(user[1]),
+                        user_id=int(user[0]),
+                        tenant_id=tenant_id,
+                    )
+                    if not role_and_tenant:
+                        return {"error_code": "tenant_not_found", "message": "Nenhum tenant ativo vinculado ao usuario."}
+                    resolved_tenant_id, tenant_name, role = role_and_tenant
 
-                cur.execute(
-                    f"""
-                    SELECT is_enabled, totp_secret_ciphertext
-                    FROM {schema}.user_mfa_config
-                    WHERE user_id = %(user_id)s
-                    LIMIT 1
-                    """,
-                    {"user_id": int(user[0])},
-                )
-                mfa_row = cur.fetchone()
+                mfa_row = None
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT is_enabled, totp_secret_ciphertext
+                        FROM {schema}.user_mfa_config
+                        WHERE user_id = %(user_id)s
+                        LIMIT 1
+                        """,
+                        {"user_id": int(user[0])},
+                    )
+                    mfa_row = cur.fetchone()
+                except Exception:
+                    # Ambiente pode estar sem as tabelas de MFA (migração não aplicada).
+                    # Neste caso, permite login sem MFA em vez de falhar genericamente.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    mfa_row = None
                 mfa_enabled = bool(mfa_row and mfa_row[0])
                 if mfa_enabled:
                     challenge_token = token_hex(18)
@@ -2186,6 +3100,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "email": str(user[2]),
                         "full_name": str(user[3] or ""),
                         "role": role,
+                        "is_superadmin": is_superadmin,
                         "tenant_name": tenant_name,
                         "totp_secret_ciphertext": str(mfa_row[1] or ""),
                         "expires_at_epoch": int(time()) + (5 * 60),
@@ -2203,6 +3118,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     email=str(user[2]),
                     full_name=str(user[3] or ""),
                     role=role,
+                    is_superadmin=is_superadmin,
                     tenant_name=tenant_name,
                 )
                 return {
@@ -2216,6 +3132,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "email": str(user[2]),
                         "full_name": str(user[3] or ""),
                         "role": role,
+                        "is_superadmin": is_superadmin,
                         "tenant_name": tenant_name,
                     },
                     "session": session_data,
@@ -2247,6 +3164,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             email=str(challenge["email"]),
             full_name=str(challenge["full_name"] or ""),
             role=str(challenge["role"] or "viewer"),
+            is_superadmin=bool(challenge.get("is_superadmin")),
             tenant_name=str(challenge["tenant_name"] or ""),
         )
         return {
@@ -2260,6 +3178,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "email": str(challenge["email"]),
                 "full_name": str(challenge["full_name"] or ""),
                 "role": str(challenge["role"] or "viewer"),
+                "is_superadmin": bool(challenge.get("is_superadmin")),
                 "tenant_name": str(challenge["tenant_name"] or ""),
             },
             "session": session_data,
@@ -2340,6 +3259,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         email: str,
         full_name: str,
         role: str,
+        is_superadmin: bool,
         tenant_name: str,
     ) -> dict:
         now_epoch = int(time())
@@ -2354,6 +3274,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "email": str(email),
             "full_name": str(full_name or ""),
             "role": str(role or "viewer"),
+            "is_superadmin": bool(is_superadmin),
             "tenant_name": str(tenant_name or ""),
             "session_token": session_token,
             "refresh_token": refresh_token,
@@ -2391,6 +3312,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             email=str(current["email"]),
             full_name=str(current.get("full_name") or ""),
             role=str(current.get("role") or "viewer"),
+            is_superadmin=bool(current.get("is_superadmin")),
             tenant_name=str(current.get("tenant_name") or ""),
         )
         return {
@@ -2403,6 +3325,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "email": str(current["email"]),
                 "full_name": str(current.get("full_name") or ""),
                 "role": str(current.get("role") or "viewer"),
+                "is_superadmin": bool(current.get("is_superadmin")),
                 "tenant_name": str(current.get("tenant_name") or ""),
             },
             "session": session_data,
@@ -3918,6 +4841,57 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_security_mcp_policy_update(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "security_mcp.update_policy",
+            "input": {
+                "tool_name": body.get("tool_name"),
+                "is_enabled": body.get("is_enabled", True),
+                "max_rows": body.get("max_rows"),
+                "max_calls_per_minute": body.get("max_calls_per_minute"),
+                "require_masking": body.get("require_masking", True),
+                "allowed_schema_patterns": body.get("allowed_schema_patterns", []),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mcp_connections_list(self) -> None:
+        payload = {
+            "context": self._request_context(),
+            "tool": "mcp_client.list_connections",
+            "input": {},
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mcp_connection_upsert(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "mcp_client.upsert_connection",
+            "input": {
+                "connection_name": body.get("connection_name"),
+                "transport_type": body.get("transport_type"),
+                "endpoint_url": body.get("endpoint_url"),
+                "auth_secret_ref": body.get("auth_secret_ref"),
+                "is_active": body.get("is_active", True),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_mcp_connection_status_update(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "mcp_client.update_status",
+            "input": {
+                "connection_id": body.get("connection_id"),
+                "is_active": body.get("is_active", True),
+            },
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_chat_bi_query(self) -> None:
         body = self._read_json_body()
         request_context = self._request_context()
@@ -4146,6 +5120,29 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         days = int(qs.get("days", ["30"])[0])
         tenant_qs = qs.get("tenant_id", [None])[0]
         tenant_id = int(tenant_qs) if tenant_qs not in (None, "") else int(context["tenant_id"])
+        if tenant_id <= 0:
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing.llm_usage",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {
+                        "summary": {
+                            "days": max(1, min(days, 365)),
+                            "calls": 0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "amount_cents": 0,
+                        },
+                        "by_feature": [],
+                        "recent": [],
+                    },
+                    "error": None,
+                },
+            )
+            return
         if not self._can_access_tenant_billing_usage(
             user_id=int(context["user_id"]),
             client_id=int(context["client_id"]),
@@ -4190,6 +5187,24 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         days = int(qs.get("days", ["30"])[0])
         tenant_qs = qs.get("tenant_id", [None])[0]
         tenant_id = int(tenant_qs) if tenant_qs not in (None, "") else int(context["tenant_id"])
+        if tenant_id <= 0:
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["section", "feature_code", "provider_name", "model_code", "calls", "input_tokens", "output_tokens", "total_tokens", "amount_cents", "created_at"])
+            payload = output.getvalue().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="llm-usage-tenant-global-{days}d.csv"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, X-Client-Id, X-Tenant-Id, X-User-Id, X-Correlation-Id, X-Session-Token",
+            )
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if not self._can_access_tenant_billing_usage(
             user_id=int(context["user_id"]),
             client_id=int(context["client_id"]),
@@ -4468,7 +5483,30 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
 
     @staticmethod
+    def _load_local_env_file() -> None:
+        if IAOpsAPIHandler.local_env_loaded:
+            return
+        IAOpsAPIHandler.local_env_loaded = True
+        env_path = os.path.join(os.getcwd(), ".env")
+        if not os.path.exists(env_path):
+            return
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if not key or key in os.environ:
+                        continue
+                    os.environ[key] = value.strip().strip("\"").strip("'")
+        except Exception:
+            return
+
+    @staticmethod
     def _get_db_dsn() -> str | None:
+        IAOpsAPIHandler._load_local_env_file()
         explicit = os.getenv("IAOPS_DB_DSN")
         if explicit:
             return explicit
@@ -4616,6 +5654,468 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "message": f"Teste de conexao ainda nao implementado para {kind}.",
         }
 
+    def _discover_source_tables(self, *, source_type: str, profile: dict) -> list[dict[str, str]]:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._discover_postgres_tables(profile)
+        if kind in {"mysql"}:
+            return self._discover_mysql_tables(profile)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._discover_sqlserver_tables(profile)
+        if kind in {"oracle"}:
+            return self._discover_oracle_tables(profile)
+        raise ValueError(f"Descoberta de tabelas ainda nao implementada para {kind}.")
+
+    def _discover_source_columns(
+        self,
+        *,
+        source_type: str,
+        profile: dict,
+        schema_name: str,
+        table_name: str,
+    ) -> list[dict[str, str]]:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._discover_postgres_columns(profile, schema_name=schema_name, table_name=table_name)
+        if kind in {"mysql"}:
+            return self._discover_mysql_columns(profile, schema_name=schema_name, table_name=table_name)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._discover_sqlserver_columns(profile, schema_name=schema_name, table_name=table_name)
+        if kind in {"oracle"}:
+            return self._discover_oracle_columns(profile, schema_name=schema_name, table_name=table_name)
+        raise ValueError(f"Descoberta de colunas ainda nao implementada para {kind}.")
+
+    def _sample_source_table_rows(
+        self,
+        *,
+        source_type: str,
+        profile: dict,
+        schema_name: str,
+        table_name: str,
+        limit: int = 25,
+    ) -> list[dict[str, object]]:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._sample_postgres_rows(profile, schema_name=schema_name, table_name=table_name, limit=limit)
+        if kind in {"mysql"}:
+            return self._sample_mysql_rows(profile, schema_name=schema_name, table_name=table_name, limit=limit)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._sample_sqlserver_rows(profile, schema_name=schema_name, table_name=table_name, limit=limit)
+        if kind in {"oracle"}:
+            return self._sample_oracle_rows(profile, schema_name=schema_name, table_name=table_name, limit=limit)
+        return []
+
+    @staticmethod
+    def _safe_identifier(value: str) -> str:
+        ident = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ident):
+            raise ValueError(f"identificador invalido: {ident}")
+        return ident
+
+    @staticmethod
+    def _sample_value_as_text(value: object) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        return text[:120]
+
+    def _sample_postgres_rows(self, profile: dict, *, schema_name: str, table_name: str, limit: int) -> list[dict[str, object]]:
+        if connect is None:
+            return []
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                return []
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        schema = self._safe_identifier(schema_name or str(profile.get("schema") or "public"))
+        table = self._safe_identifier(table_name)
+        sql = f'SELECT * FROM "{schema}"."{table}" LIMIT %(limit)s'
+        with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"limit": int(max(1, min(limit, 100)))})
+            cols = [str(item[0]) for item in (cur.description or [])]
+            rows = cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    def _sample_mysql_rows(self, profile: dict, *, schema_name: str, table_name: str, limit: int) -> list[dict[str, object]]:
+        if pymysql is None:
+            return []
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            return []
+        schema = self._safe_identifier(schema_name or database)
+        table = self._safe_identifier(table_name)
+        sql = f"SELECT * FROM `{schema}`.`{table}` LIMIT %s"
+        with pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database or schema,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            charset="utf8mb4",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(max(1, min(limit, 100))),))
+                cols = [str(item[0]) for item in (cur.description or [])]
+                rows = cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    def _sample_sqlserver_rows(self, profile: dict, *, schema_name: str, table_name: str, limit: int) -> list[dict[str, object]]:
+        if pyodbc is None:
+            return []
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            return []
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                "Encrypt=yes;TrustServerCertificate=yes;"
+            )
+        schema = self._safe_identifier(schema_name or "dbo")
+        table = self._safe_identifier(table_name)
+        sql = f"SELECT TOP {int(max(1, min(limit, 100)))} * FROM [{schema}].[{table}]"
+        with pyodbc.connect(conn_str, timeout=timeout) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            cols = [str(item[0]) for item in (cur.description or [])]
+            rows = cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    def _sample_oracle_rows(self, profile: dict, *, schema_name: str, table_name: str, limit: int) -> list[dict[str, object]]:
+        if oracledb is None:
+            return []
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        if not host or not user:
+            return []
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        owner = self._safe_identifier((schema_name or profile.get("owner") or user).upper())
+        table = self._safe_identifier(table_name.upper())
+        sql = f'SELECT * FROM "{owner}"."{table}" FETCH FIRST {int(max(1, min(limit, 100)))} ROWS ONLY'
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                cols = [str(item[0]) for item in (cur.description or [])]
+                rows = cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    def _db_enrich_monitored_columns(
+        self,
+        *,
+        tenant_id: int,
+        monitored_table_id: int,
+        source_type: str,
+        schema_name: str,
+        table_name: str,
+        discovered_columns: list[dict[str, object]],
+        sample_rows: list[dict[str, object]],
+        context: dict,
+    ) -> dict[str, object]:
+        dsn = self._get_db_dsn()
+        if not dsn or connect is None:
+            raise ValueError("Banco indisponivel para enriquecimento.")
+        schema = self.signup_schema
+        upsert_sql = f"""
+            INSERT INTO {schema}.monitored_column (
+                tenant_id,
+                monitored_table_id,
+                column_name,
+                data_type
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(monitored_table_id)s,
+                %(column_name)s,
+                %(data_type)s
+            )
+            ON CONFLICT (monitored_table_id, column_name)
+            DO UPDATE SET data_type = COALESCE(EXCLUDED.data_type, {schema}.monitored_column.data_type)
+        """
+        fetch_sql = f"""
+            SELECT mc.column_name, mc.data_type, mc.classification, mc.description_text
+            FROM {schema}.monitored_column mc
+            JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mt.tenant_id = %(tenant_id)s
+              AND mt.id = %(monitored_table_id)s
+            ORDER BY mc.column_name
+        """
+        update_sql = f"""
+            UPDATE {schema}.monitored_column mc
+               SET classification = CASE
+                     WHEN COALESCE(NULLIF(TRIM(mc.classification), ''), '') = '' THEN %(classification)s
+                     ELSE mc.classification
+                   END,
+                   description_text = CASE
+                     WHEN COALESCE(NULLIF(TRIM(mc.description_text), ''), '') = '' THEN %(description_text)s
+                     ELSE mc.description_text
+                   END
+            FROM {schema}.monitored_table mt
+            WHERE mc.monitored_table_id = mt.id
+              AND mt.tenant_id = %(tenant_id)s
+              AND mt.id = %(monitored_table_id)s
+              AND mc.column_name = %(column_name)s
+        """
+        with connect(dsn) as conn, conn.cursor() as cur:
+            for col in discovered_columns:
+                col_name = str(col.get("column_name") or "").strip()
+                if not col_name:
+                    continue
+                cur.execute(
+                    upsert_sql,
+                    {
+                        "tenant_id": tenant_id,
+                        "monitored_table_id": monitored_table_id,
+                        "column_name": col_name,
+                        "data_type": str(col.get("data_type") or "").strip() or None,
+                    },
+                )
+            cur.execute(fetch_sql, {"tenant_id": tenant_id, "monitored_table_id": monitored_table_id})
+            rows = cur.fetchall()
+            existing = [
+                {
+                    "column_name": str(item[0]),
+                    "data_type": str(item[1] or ""),
+                    "classification": str(item[2] or "").strip() or None,
+                    "description_text": str(item[3] or "").strip() or None,
+                }
+                for item in rows
+            ]
+            suggestions = self._suggest_column_enrichment(
+                source_type=source_type,
+                schema_name=schema_name,
+                table_name=table_name,
+                columns=existing,
+                sample_rows=sample_rows,
+                context=context,
+            )
+            updated = 0
+            for item in existing:
+                col_name = item["column_name"]
+                current_class = item["classification"]
+                current_desc = item["description_text"]
+                proposed = suggestions.get(col_name.lower()) or {}
+                classification = str(proposed.get("classification") or "").strip() or None
+                description_text = str(proposed.get("description_text") or "").strip() or None
+                if (current_class and current_class.strip()) and (current_desc and current_desc.strip()):
+                    continue
+                if not classification and not description_text:
+                    continue
+                cur.execute(
+                    update_sql,
+                    {
+                        "tenant_id": tenant_id,
+                        "monitored_table_id": monitored_table_id,
+                        "column_name": col_name,
+                        "classification": classification,
+                        "description_text": description_text,
+                    },
+                )
+                if cur.rowcount:
+                    updated += 1
+            conn.commit()
+        return {
+            "tenant_id": tenant_id,
+            "monitored_table_id": monitored_table_id,
+            "discovered_columns": len(discovered_columns),
+            "sample_rows": len(sample_rows),
+            "updated_columns": updated,
+        }
+
+    def _suggest_column_enrichment(
+        self,
+        *,
+        source_type: str,
+        schema_name: str,
+        table_name: str,
+        columns: list[dict[str, object]],
+        sample_rows: list[dict[str, object]],
+        context: dict,
+    ) -> dict[str, dict[str, str]]:
+        llm_map = self._suggest_column_enrichment_with_llm(
+            source_type=source_type,
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            sample_rows=sample_rows,
+            context=context,
+        )
+        if llm_map:
+            return llm_map
+        result: dict[str, dict[str, str]] = {}
+        for col in columns:
+            name = str(col.get("column_name") or "").strip()
+            if not name:
+                continue
+            data_type = str(col.get("data_type") or "").strip().lower()
+            lower = name.lower()
+            classification = "attribute"
+            if any(token in lower for token in ["id", "codigo", "code", "uuid"]):
+                classification = "identifier"
+            elif any(token in lower for token in ["email", "mail", "telefone", "phone", "celular"]):
+                classification = "contact"
+            elif any(token in lower for token in ["cpf", "cnpj", "document", "doc", "rg"]):
+                classification = "sensitive"
+            elif any(token in lower for token in ["valor", "price", "amount", "total", "saldo"]):
+                classification = "financial"
+            elif "date" in data_type or "time" in data_type:
+                classification = "temporal"
+            elif "int" in data_type or "decimal" in data_type or "numeric" in data_type:
+                classification = "measure"
+            description_text = f"Campo {name} da tabela {schema_name}.{table_name}."
+            result[lower] = {
+                "classification": classification,
+                "description_text": description_text,
+            }
+        return result
+
+    def _suggest_column_enrichment_with_llm(
+        self,
+        *,
+        source_type: str,
+        schema_name: str,
+        table_name: str,
+        columns: list[dict[str, object]],
+        sample_rows: list[dict[str, object]],
+        context: dict,
+    ) -> dict[str, dict[str, str]]:
+        try:
+            cfg_result = self._call_mcp(
+                {
+                    "context": context,
+                    "tool": "tenant_llm.get_config",
+                    "input": {},
+                }
+            )
+            if cfg_result.get("status") != "success":
+                return {}
+            cfg = (cfg_result.get("data") or {}).get("config") or {}
+            provider_name = str(cfg.get("provider_name") or "").strip().lower()
+            model_code = str(cfg.get("model_code") or "").strip()
+            endpoint_url = str(cfg.get("endpoint_url") or "").strip()
+            secret_ref = str(cfg.get("secret_ref") or "").strip()
+            if not provider_name or not model_code:
+                return {}
+            if not endpoint_url:
+                endpoint_url = "https://api.openai.com/v1" if provider_name != "google_gemini" else "https://generativelanguage.googleapis.com/v1beta"
+            api_key = self._resolve_secret_value(secret_ref)
+            if not api_key:
+                return {}
+            sample_by_col: dict[str, list[str]] = {}
+            for col in columns:
+                col_name = str(col.get("column_name") or "").strip()
+                if not col_name:
+                    continue
+                vals: list[str] = []
+                for row in sample_rows:
+                    val = self._sample_value_as_text((row or {}).get(col_name))
+                    if val:
+                        vals.append(val)
+                    if len(vals) >= 5:
+                        break
+                sample_by_col[col_name] = vals
+            payload = {
+                "task": "metadata_enrichment",
+                "instructions": "Classifique e descreva colunas de dados. Responda APENAS JSON no formato {'columns':[{'column_name':'','classification':'','description_text':''}]}.",
+                "source_type": source_type,
+                "table": {"schema_name": schema_name, "table_name": table_name},
+                "columns": [
+                    {
+                        "column_name": str(col.get("column_name") or ""),
+                        "data_type": str(col.get("data_type") or ""),
+                        "samples": sample_by_col.get(str(col.get("column_name") or ""), []),
+                    }
+                    for col in columns
+                ],
+                "classification_allowed": [
+                    "identifier",
+                    "sensitive",
+                    "contact",
+                    "financial",
+                    "temporal",
+                    "measure",
+                    "attribute",
+                ],
+            }
+            llm_output = self._invoke_llm_json(
+                provider_name=provider_name,
+                model_code=model_code,
+                endpoint_url=endpoint_url,
+                api_key=api_key,
+                prompt_payload=payload,
+            )
+            if not isinstance(llm_output, dict):
+                return {}
+            if bool(cfg.get("use_app_default_llm")):
+                try:
+                    self._record_app_llm_usage(
+                        tenant_id=int(context.get("tenant_id") or 0),
+                        feature_code="metadata_enrichment",
+                        prompt_payload=payload,
+                        llm_output=llm_output,
+                    )
+                except Exception:
+                    pass
+            rows = llm_output.get("columns")
+            if not isinstance(rows, list):
+                return {}
+            result: dict[str, dict[str, str]] = {}
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                col_name = str(item.get("column_name") or "").strip()
+                if not col_name:
+                    continue
+                classification = str(item.get("classification") or "").strip()
+                description_text = str(item.get("description_text") or "").strip()
+                if not classification and not description_text:
+                    continue
+                result[col_name.lower()] = {
+                    "classification": classification,
+                    "description_text": description_text,
+                }
+            return result
+        except Exception:
+            return {}
+
     @staticmethod
     def _test_postgres_connection(profile: dict) -> dict:
         if connect is None:
@@ -4643,6 +6143,68 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"ok": True, "source_type": "postgres", "message": "Conexao PostgreSQL validada com sucesso."}
         except Exception as exc:
             return {"ok": False, "source_type": "postgres", "message": f"Falha na conexao PostgreSQL: {exc}"}
+
+    @staticmethod
+    def _discover_postgres_tables(profile: dict) -> list[dict[str, str]]:
+        if connect is None:
+            raise ValueError("Driver PostgreSQL indisponivel (psycopg).")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                raise ValueError("Informe dsn ou host/user/password/dbname no secret_payload.")
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        schema_name = str(profile.get("schema") or "").strip()
+        sql = """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema NOT IN ('information_schema', 'pg_catalog')
+        """
+        params: list[object] = []
+        if schema_name:
+            sql += " AND table_schema = %s"
+            params.append(schema_name)
+        sql += " ORDER BY table_schema, table_name"
+        with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [{"schema_name": str(row[0]), "table_name": str(row[1])} for row in rows]
+
+    @staticmethod
+    def _discover_postgres_columns(profile: dict, *, schema_name: str, table_name: str) -> list[dict[str, str]]:
+        if connect is None:
+            raise ValueError("Driver PostgreSQL indisponivel (psycopg).")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                raise ValueError("Informe dsn ou host/user/password/dbname no secret_payload.")
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        schema = schema_name or str(profile.get("schema") or "public").strip()
+        sql = """
+            SELECT column_name, data_type, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s
+            ORDER BY ordinal_position
+        """
+        with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+            cur.execute(sql, [schema, table_name])
+            rows = cur.fetchall()
+        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
 
     @staticmethod
     def _test_sqlserver_connection(profile: dict) -> dict:
@@ -4693,6 +6255,84 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"ok": False, "source_type": "sqlserver", "message": f"Falha na conexao SQL Server: {exc}"}
 
     @staticmethod
+    def _discover_sqlserver_tables(profile: dict) -> list[dict[str, str]]:
+        if pyodbc is None:
+            raise ValueError("Driver pyodbc nao instalado para descoberta SQL Server.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                f"Encrypt=yes;TrustServerCertificate=yes;Connection Timeout={timeout};"
+            )
+        sql = """
+            SELECT TABLE_SCHEMA, TABLE_NAME
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_TYPE = 'BASE TABLE'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+        """
+        with pyodbc.connect(conn_str, timeout=timeout) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+        return [{"schema_name": str(row[0]), "table_name": str(row[1])} for row in rows]
+
+    @staticmethod
+    def _discover_sqlserver_columns(profile: dict, *, schema_name: str, table_name: str) -> list[dict[str, str]]:
+        if pyodbc is None:
+            raise ValueError("Driver pyodbc nao instalado para descoberta SQL Server.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                f"Encrypt=yes;TrustServerCertificate=yes;Connection Timeout={timeout};"
+            )
+        schema = schema_name or "dbo"
+        sql = """
+            SELECT COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION
+        """
+        with pyodbc.connect(conn_str, timeout=timeout) as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (schema, table_name))
+            rows = cur.fetchall()
+        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
+
+    @staticmethod
     def _test_mysql_connection(profile: dict) -> dict:
         host = str(profile.get("host") or profile.get("server") or "").strip()
         port = int(profile.get("port") or 3306)
@@ -4729,6 +6369,94 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"ok": True, "source_type": "mysql", "message": "Conexao MySQL validada com sucesso."}
         except Exception as exc:
             return {"ok": False, "source_type": "mysql", "message": f"Falha na conexao MySQL: {exc}"}
+
+    @staticmethod
+    def _discover_mysql_tables(profile: dict) -> list[dict[str, str]]:
+        if pymysql is None:
+            raise ValueError("Driver pymysql nao instalado para descoberta MySQL.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        with pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database or None,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            charset="utf8mb4",
+        ) as conn:
+            with conn.cursor() as cur:
+                if database:
+                    cur.execute(
+                        """
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_type = 'BASE TABLE'
+                          AND table_schema = %s
+                        ORDER BY table_schema, table_name
+                        """,
+                        (database,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_type = 'BASE TABLE'
+                          AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+                        ORDER BY table_schema, table_name
+                        """
+                    )
+                rows = cur.fetchall()
+        return [{"schema_name": str(row[0]), "table_name": str(row[1])} for row in rows]
+
+    @staticmethod
+    def _discover_mysql_columns(profile: dict, *, schema_name: str, table_name: str) -> list[dict[str, str]]:
+        if pymysql is None:
+            raise ValueError("Driver pymysql nao instalado para descoberta MySQL.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        schema = schema_name or database
+        if not schema:
+            raise ValueError("schema_name ou database obrigatorio para MySQL.")
+        with pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database or schema,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            charset="utf8mb4",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name, data_type, ordinal_position
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = %s
+                    ORDER BY ordinal_position
+                    """,
+                    (schema, table_name),
+                )
+                rows = cur.fetchall()
+        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
 
     @staticmethod
     def _test_oracle_connection(profile: dict) -> dict:
@@ -4770,6 +6498,78 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"ok": True, "source_type": "oracle", "message": "Conexao Oracle validada com sucesso."}
         except Exception as exc:
             return {"ok": False, "source_type": "oracle", "message": f"Falha na conexao Oracle: {exc}"}
+
+    @staticmethod
+    def _discover_oracle_tables(profile: dict) -> list[dict[str, str]]:
+        if oracledb is None:
+            raise ValueError("Driver oracledb nao instalado para descoberta Oracle.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        owner = str(profile.get("owner") or profile.get("schema") or user).strip().upper()
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT owner, table_name
+                    FROM all_tables
+                    WHERE owner = :owner
+                    ORDER BY table_name
+                    """,
+                    {"owner": owner},
+                )
+                rows = cur.fetchall()
+        return [{"schema_name": str(row[0]), "table_name": str(row[1])} for row in rows]
+
+    @staticmethod
+    def _discover_oracle_columns(profile: dict, *, schema_name: str, table_name: str) -> list[dict[str, str]]:
+        if oracledb is None:
+            raise ValueError("Driver oracledb nao instalado para descoberta Oracle.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        owner = str(schema_name or profile.get("owner") or profile.get("schema") or user).strip().upper()
+        table = str(table_name or "").strip().upper()
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name, data_type, column_id
+                    FROM all_tab_columns
+                    WHERE owner = :owner
+                      AND table_name = :table_name
+                    ORDER BY column_id
+                    """,
+                    {"owner": owner, "table_name": table},
+                )
+                rows = cur.fetchall()
+        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
 
     @staticmethod
     def _test_bearer_http_connection(*, profile: dict, default_url: str, label: str) -> dict:
@@ -5237,7 +7037,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             FROM {schema}.billing_installment i
             JOIN {schema}.billing_subscription s ON s.id = i.subscription_id
             WHERE s.client_id = %(client_id)s
-              AND (%(status)s IS NULL OR i.status = %(status)s)
+              AND (%(status)s::text IS NULL OR i.status = %(status)s::text)
             ORDER BY i.due_date DESC, i.id DESC
         """
         with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
@@ -5412,6 +7212,204 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 for row in recent_rows
             ],
         }
+
+    def _is_global_superadmin_context(self, context: dict) -> bool:
+        if not isinstance(context, dict):
+            return False
+        user_id = int(context.get("user_id") or 0)
+        tenant_id = int(context.get("tenant_id") or 0)
+        return tenant_id <= 0 and self._is_superadmin_user(user_id=user_id)
+
+    def _db_get_user_mfa_status_global(self, *, user_id: int) -> dict:
+        if not self._is_db_enabled():
+            return {
+                "enabled": False,
+                "enabled_at": None,
+                "has_pending_setup": False,
+                "pending_expires_at": None,
+            }
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(cfg.is_enabled, FALSE) AS enabled,
+                    cfg.enabled_at,
+                    pnd.expires_at AS pending_expires_at
+                FROM {schema}.app_user u
+                LEFT JOIN {schema}.user_mfa_config cfg ON cfg.user_id = u.id
+                LEFT JOIN {schema}.user_mfa_pending_setup pnd ON pnd.user_id = u.id
+                WHERE u.id = %(user_id)s
+                LIMIT 1
+                """,
+                {"user_id": user_id},
+            )
+            row = cur.fetchone()
+        if not row:
+            raise ValueError("usuario nao encontrado")
+        return {
+            "enabled": bool(row[0]),
+            "enabled_at": row[1].isoformat() if row[1] else None,
+            "has_pending_setup": bool(row[2]),
+            "pending_expires_at": row[2].isoformat() if row[2] else None,
+        }
+
+    def _db_begin_user_mfa_setup_global(self, *, user_id: int, issuer: str) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        schema = self.signup_schema
+        secret = generate_base32_secret()
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT email FROM {schema}.app_user WHERE id = %(user_id)s LIMIT 1", {"user_id": user_id})
+            user_row = cur.fetchone()
+            if not user_row:
+                raise ValueError("usuario nao encontrado")
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.user_mfa_pending_setup (
+                    user_id,
+                    pending_secret_ciphertext,
+                    expires_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %(user_id)s,
+                    %(pending_secret_ciphertext)s,
+                    NOW() + INTERVAL '10 minutes',
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    pending_secret_ciphertext = EXCLUDED.pending_secret_ciphertext,
+                    expires_at = NOW() + INTERVAL '10 minutes',
+                    updated_at = NOW()
+                RETURNING expires_at
+                """,
+                {
+                    "user_id": user_id,
+                    "pending_secret_ciphertext": encrypt_text(secret),
+                },
+            )
+            expires_row = cur.fetchone()
+            conn.commit()
+        email = str(user_row[0] or "")
+        return {
+            "secret": secret,
+            "provisioning_uri": provisioning_uri(issuer=issuer or "IAOps Governance", account_name=email, secret=secret),
+            "expires_at": expires_row[0].isoformat() if expires_row and expires_row[0] else None,
+        }
+
+    def _db_enable_user_mfa_global(self, *, user_id: int, otp_code: str) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        code = str(otp_code or "").strip()
+        if not code:
+            raise ValueError("otp_code obrigatorio")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT pending_secret_ciphertext, expires_at
+                FROM {schema}.user_mfa_pending_setup
+                WHERE user_id = %(user_id)s
+                LIMIT 1
+                """,
+                {"user_id": user_id},
+            )
+            pending = cur.fetchone()
+            if not pending:
+                raise ValueError("setup MFA nao iniciado")
+            secret_ciphertext = str(pending[0] or "")
+            expires_at = pending[1]
+            if not secret_ciphertext:
+                raise ValueError("segredo MFA pendente invalido")
+            if expires_at is None:
+                raise ValueError("setup MFA expirado")
+            if expires_at.timestamp() < time():
+                raise ValueError("setup MFA expirado")
+            try:
+                secret = decrypt_text(secret_ciphertext)
+            except Exception as exc:
+                raise ValueError("nao foi possivel validar setup MFA") from exc
+            if not verify_totp(secret, code):
+                raise ValueError("codigo TOTP invalido")
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.user_mfa_config (
+                    user_id,
+                    method,
+                    totp_secret_ciphertext,
+                    is_enabled,
+                    enabled_at,
+                    disabled_at,
+                    updated_at
+                )
+                VALUES (
+                    %(user_id)s,
+                    'totp',
+                    %(totp_secret_ciphertext)s,
+                    TRUE,
+                    NOW(),
+                    NULL,
+                    NOW()
+                )
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    method = 'totp',
+                    totp_secret_ciphertext = EXCLUDED.totp_secret_ciphertext,
+                    is_enabled = TRUE,
+                    enabled_at = NOW(),
+                    disabled_at = NULL,
+                    updated_at = NOW()
+                """,
+                {"user_id": user_id, "totp_secret_ciphertext": encrypt_text(secret)},
+            )
+            cur.execute(f"DELETE FROM {schema}.user_mfa_pending_setup WHERE user_id = %(user_id)s", {"user_id": user_id})
+            conn.commit()
+        return self._db_get_user_mfa_status_global(user_id=user_id)
+
+    def _db_disable_user_mfa_global(self, *, user_id: int, otp_code: str) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        code = str(otp_code or "").strip()
+        if not code:
+            raise ValueError("otp_code obrigatorio")
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT totp_secret_ciphertext, is_enabled
+                FROM {schema}.user_mfa_config
+                WHERE user_id = %(user_id)s
+                LIMIT 1
+                """,
+                {"user_id": user_id},
+            )
+            row = cur.fetchone()
+            if not row or not bool(row[1]):
+                raise ValueError("MFA nao habilitado para o usuario")
+            secret_ciphertext = str(row[0] or "")
+            try:
+                secret = decrypt_text(secret_ciphertext)
+            except Exception as exc:
+                raise ValueError("nao foi possivel validar MFA") from exc
+            if not verify_totp(secret, code):
+                raise ValueError("codigo TOTP invalido")
+            cur.execute(
+                f"""
+                UPDATE {schema}.user_mfa_config
+                   SET is_enabled = FALSE,
+                       disabled_at = NOW(),
+                       updated_at = NOW()
+                 WHERE user_id = %(user_id)s
+                """,
+                {"user_id": user_id},
+            )
+            cur.execute(f"DELETE FROM {schema}.user_mfa_pending_setup WHERE user_id = %(user_id)s", {"user_id": user_id})
+            conn.commit()
+        return self._db_get_user_mfa_status_global(user_id=user_id)
 
     def _can_access_tenant_billing_usage(self, *, user_id: int, client_id: int, tenant_id: int) -> bool:
         if tenant_id <= 0:
@@ -5591,20 +7589,24 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _send_signup_email(*, to_email: str, trade_name: str, confirm_token: str) -> tuple[bool, str]:
-        smtp_host = os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST")
-        smtp_port = int(os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
-        smtp_user = os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or ""
-        smtp_pass = os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or ""
-        smtp_from = os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or smtp_user
-        smtp_tls = str(os.getenv("IAOPS_SMTP_STARTTLS") or "1").strip() not in {"0", "false", "False"}
+        smtp = IAOpsAPIHandler._smtp_effective_config()
+        smtp_host = str(smtp.get("host") or "")
+        smtp_port = int(smtp.get("port") or 587)
+        smtp_user = str(smtp.get("user") or "")
+        smtp_pass = str(smtp.get("password") or "")
+        smtp_from = str(smtp.get("from_email") or "")
+        smtp_tls = bool(smtp.get("starttls"))
 
         if not smtp_host or not smtp_from:
             return False, "SMTP nao configurado no ambiente de desenvolvimento."
 
+        confirm_link = IAOpsAPIHandler._build_signup_confirm_link(confirm_token)
         subject = "IAOps Governance - Confirmacao de cadastro"
         body = (
             f"Ola, {trade_name}.\n\n"
-            "Seu cadastro foi recebido. Use o token abaixo para confirmar o acesso no app:\n\n"
+            "Seu cadastro foi recebido. Clique no link abaixo para confirmar seu acesso:\n\n"
+            f"{confirm_link}\n\n"
+            "Caso prefira confirmar manualmente no app, use o token abaixo:\n\n"
             f"{confirm_token}\n\n"
             "Se voce nao solicitou este cadastro, ignore esta mensagem."
         )
@@ -5621,11 +7623,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     smtp.login(smtp_user, smtp_pass)
                 smtp.send_message(message)
             return True, f"Token enviado para {to_email}."
-        except Exception:
-            return False, "Falha no envio por SMTP. Token retornado no payload para uso em desenvolvimento."
+        except Exception as exc:
+            return False, f"Falha no envio por SMTP: {exc}. Token retornado no payload para uso em desenvolvimento."
 
     def _send_json(self, status: HTTPStatus, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, default=self._json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -5635,6 +7637,32 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if status != HTTPStatus.NO_CONTENT:
             self.wfile.write(body)
+
+    def _send_html(self, status: HTTPStatus, html_body: str) -> None:
+        body = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>IAOps</title></head><body style='font-family:Segoe UI,Arial,sans-serif;padding:24px;'>"
+            f"{html_body}</body></html>"
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, (dt.datetime, dt.date, dt.time)):
+            return value.isoformat()
+        if isinstance(value, decimal.Decimal):
+            return float(value)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, set):
+            return list(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def run(host: str = "127.0.0.1", port: int = 8000) -> None:

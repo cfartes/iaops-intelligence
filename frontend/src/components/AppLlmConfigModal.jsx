@@ -7,18 +7,52 @@ const INITIAL_FORM = {
   secret_ref: "",
 };
 
-export default function AppLlmConfigModal({ open, providers, initialConfig, loading, onClose, onSubmit }) {
+export default function AppLlmConfigModal({
+  open,
+  providers,
+  modelsByProvider,
+  initialConfig,
+  loading,
+  onClose,
+  onSubmit,
+  onRefreshCatalog,
+}) {
   const [form, setForm] = useState(INITIAL_FORM);
+  const [useCustomModel, setUseCustomModel] = useState(false);
 
   useEffect(() => {
     if (!open) return;
+    const providerName = initialConfig?.provider_name || providers?.[0]?.code || "";
+    const modelCode = initialConfig?.model_code || "";
+    const providerModels = Array.isArray(modelsByProvider?.[providerName]) ? modelsByProvider[providerName] : [];
+    const modelInCatalog = providerModels.some((item) => item.code === modelCode);
     setForm({
-      provider_name: initialConfig?.provider_name || providers?.[0]?.code || "",
-      model_code: initialConfig?.model_code || "",
+      provider_name: providerName,
+      model_code: modelCode,
       endpoint_url: initialConfig?.endpoint_url || "",
       secret_ref: initialConfig?.secret_ref || "",
     });
-  }, [open, initialConfig, providers]);
+    setUseCustomModel(Boolean(modelCode) && !modelInCatalog);
+  }, [open, initialConfig, providers, modelsByProvider]);
+
+  const modelOptions = useMemo(() => {
+    const key = form.provider_name || "";
+    return Array.isArray(modelsByProvider?.[key]) ? modelsByProvider[key] : [];
+  }, [form.provider_name, modelsByProvider]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (useCustomModel) return;
+    if (!form.provider_name) return;
+    if (modelOptions.length === 0) {
+      setUseCustomModel(true);
+      return;
+    }
+    const hasCurrent = modelOptions.some((item) => item.code === form.model_code);
+    if (!hasCurrent) {
+      setForm((prev) => ({ ...prev, model_code: modelOptions[0].code }));
+    }
+  }, [open, form.provider_name, form.model_code, modelOptions, useCustomModel]);
 
   const canSubmit = useMemo(() => form.provider_name.trim() && form.model_code.trim(), [form]);
 
@@ -46,7 +80,16 @@ export default function AppLlmConfigModal({ open, providers, initialConfig, load
             Provedor
             <select
               value={form.provider_name}
-              onChange={(e) => setForm((prev) => ({ ...prev, provider_name: e.target.value }))}
+              onChange={(e) => {
+                const providerName = e.target.value;
+                const providerModels = Array.isArray(modelsByProvider?.[providerName]) ? modelsByProvider[providerName] : [];
+                setForm((prev) => ({
+                  ...prev,
+                  provider_name: providerName,
+                  model_code: providerModels[0]?.code || prev.model_code || "",
+                }));
+                if (providerModels.length === 0) setUseCustomModel(true);
+              }}
             >
               {providers.map((item) => (
                 <option key={item.code} value={item.code}>
@@ -55,13 +98,52 @@ export default function AppLlmConfigModal({ open, providers, initialConfig, load
               ))}
             </select>
           </label>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={onRefreshCatalog}
+              disabled={loading}
+            >
+              Atualizar catalogo de modelos
+            </button>
+          </div>
           <label>
             Modelo
-            <input
-              value={form.model_code}
-              onChange={(e) => setForm((prev) => ({ ...prev, model_code: e.target.value }))}
-              placeholder="gpt-4.1-mini / claude-sonnet / llama3..."
-            />
+            {useCustomModel ? (
+              <input
+                value={form.model_code}
+                onChange={(e) => setForm((prev) => ({ ...prev, model_code: e.target.value }))}
+                placeholder="Digite o nome do modelo"
+              />
+            ) : (
+              <select
+                value={form.model_code}
+                onChange={(e) => setForm((prev) => ({ ...prev, model_code: e.target.value }))}
+              >
+                {modelOptions.map((item) => (
+                  <option key={item.code} value={item.code}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={() => {
+                if (useCustomModel) {
+                  if (modelOptions.length > 0) {
+                    setForm((prev) => ({ ...prev, model_code: modelOptions[0].code }));
+                    setUseCustomModel(false);
+                  }
+                  return;
+                }
+                setUseCustomModel(true);
+              }}
+            >
+              {useCustomModel ? "Usar lista de modelos" : "Informar modelo manualmente"}
+            </button>
           </label>
           <label>
             Endpoint (opcional)

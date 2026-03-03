@@ -12,7 +12,7 @@ from iaops.security.crypto import decrypt_text, encrypt_text
 from iaops.security.totp import generate_base32_secret, provisioning_uri, verify_totp
 
 from .models import ToolPolicy
-from .repository import MCPRepository
+from .repository import DEFAULT_LLM_MODELS, MCPRepository
 
 
 DEFAULT_TOOL_POLICIES = {
@@ -33,7 +33,9 @@ DEFAULT_TOOL_POLICIES = {
     "tenant_llm.get_config": ToolPolicy("tenant_llm.get_config", "viewer", True, None, 120, True, None),
     "tenant_llm.update_config": ToolPolicy("tenant_llm.update_config", "admin", True, None, 60, True, None),
     "tenant_llm.list_providers": ToolPolicy("tenant_llm.list_providers", "viewer", True, 200, 120, True, None),
+    "tenant_llm.list_models": ToolPolicy("tenant_llm.list_models", "viewer", True, 500, 120, True, None),
     "llm_admin.list_providers": ToolPolicy("llm_admin.list_providers", "owner", True, 200, 120, True, None),
+    "llm_admin.list_models": ToolPolicy("llm_admin.list_models", "owner", True, 500, 120, True, None),
     "llm_admin.get_app_config": ToolPolicy("llm_admin.get_app_config", "owner", True, None, 120, True, None),
     "llm_admin.update_app_config": ToolPolicy("llm_admin.update_app_config", "owner", True, None, 60, True, None),
     "channel.list_user_tenants": ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
@@ -59,10 +61,33 @@ DEFAULT_TOOL_POLICIES = {
     "audit.list_calls": ToolPolicy("audit.list_calls", "admin", True, 200, 120, True, None),
     "security_sql.get_policy": ToolPolicy("security_sql.get_policy", "viewer", True, 200, 120, True, None),
     "security_sql.update_policy": ToolPolicy("security_sql.update_policy", "admin", True, 200, 120, True, None),
+    "security_mcp.list_policies": ToolPolicy("security_mcp.list_policies", "viewer", True, 500, 120, True, None),
+    "security_mcp.update_policy": ToolPolicy("security_mcp.update_policy", "admin", True, None, 120, True, None),
+    "mcp_client.list_connections": ToolPolicy("mcp_client.list_connections", "viewer", True, 200, 120, True, None),
+    "mcp_client.upsert_connection": ToolPolicy("mcp_client.upsert_connection", "admin", True, None, 120, True, None),
+    "mcp_client.update_status": ToolPolicy("mcp_client.update_status", "admin", True, None, 120, True, None),
     "ops.get_health_summary": ToolPolicy("ops.get_health_summary", "viewer", True, None, 120, True, None),
     "setup.get_progress": ToolPolicy("setup.get_progress", "admin", True, None, 120, True, None),
     "setup.upsert_progress": ToolPolicy("setup.upsert_progress", "admin", True, None, 120, True, None),
 }
+
+DEFAULT_SOURCE_CATALOG = [
+    {"code": "postgres", "name": "PostgreSQL", "category": "relational", "is_supported": True, "notes": None},
+    {"code": "mysql", "name": "MySQL", "category": "relational", "is_supported": True, "notes": None},
+    {"code": "sqlserver", "name": "SQL Server", "category": "relational", "is_supported": True, "notes": None},
+    {"code": "oracle", "name": "Oracle", "category": "relational", "is_supported": True, "notes": None},
+    {"code": "mongodb", "name": "MongoDB", "category": "nosql", "is_supported": True, "notes": None},
+    {"code": "cassandra", "name": "Cassandra", "category": "nosql", "is_supported": True, "notes": None},
+    {"code": "dynamodb", "name": "DynamoDB", "category": "nosql", "is_supported": True, "notes": None},
+    {"code": "snowflake", "name": "Snowflake", "category": "warehouse", "is_supported": True, "notes": None},
+    {"code": "bigquery", "name": "BigQuery", "category": "warehouse", "is_supported": True, "notes": None},
+    {"code": "redshift", "name": "Redshift", "category": "warehouse", "is_supported": True, "notes": None},
+    {"code": "s3", "name": "AWS S3", "category": "lake_storage", "is_supported": True, "notes": None},
+    {"code": "azure_blob", "name": "Azure Blob Storage", "category": "lake_storage", "is_supported": True, "notes": None},
+    {"code": "gcs", "name": "Google Cloud Storage", "category": "lake_storage", "is_supported": True, "notes": None},
+    {"code": "power_bi", "name": "Power BI", "category": "bi_semantic", "is_supported": True, "notes": None},
+    {"code": "fabric", "name": "Microsoft Fabric", "category": "lakehouse_semantic", "is_supported": True, "notes": None},
+]
 
 
 class PostgresMCPRepository(MCPRepository):
@@ -73,6 +98,8 @@ class PostgresMCPRepository(MCPRepository):
         self.schema = schema
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
+        if int(tenant_id) <= 0:
+            return True
         sql = f"""
             SELECT EXISTS (
                 SELECT 1
@@ -119,11 +146,27 @@ class PostgresMCPRepository(MCPRepository):
                   )
             ) AS ok
         """
+        basic_sql = f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {self.schema}.tenant t
+                JOIN {self.schema}.client c ON c.id = t.client_id
+                WHERE t.id = %(tenant_id)s
+                  AND t.client_id = %(client_id)s
+                  AND t.status = 'active'
+                  AND c.status = 'active'
+            ) AS ok
+        """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             try:
                 cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
             except Exception:
-                cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
+                conn.rollback()
+                try:
+                    cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
+                except Exception:
+                    conn.rollback()
+                    cur.execute(basic_sql, {"client_id": client_id, "tenant_id": tenant_id})
             row = cur.fetchone()
         return bool(row and row["ok"])
 
@@ -614,6 +657,11 @@ class PostgresMCPRepository(MCPRepository):
             {"code": "ollama", "name": "Ollama (Local)"},
         ]
 
+    def list_supported_llm_models(self, provider_name: str) -> list[dict[str, Any]]:
+        key = str(provider_name or "").strip().lower()
+        rows = DEFAULT_LLM_MODELS.get(key, [])
+        return [dict(item) for item in rows]
+
     def get_app_default_llm_config(self) -> dict[str, Any] | None:
         sql = f"""
             SELECT
@@ -734,12 +782,12 @@ class PostgresMCPRepository(MCPRepository):
                 "app_default_available": app_row is not None,
             }
         return {
-            "use_app_default_llm": True if app_row else False,
-            "billing_mode": "app_default_token" if app_row else "tenant_provider",
-            "provider_name": app_row["provider_name"] if app_row else None,
-            "model_code": app_row["model_code"] if app_row else None,
-            "endpoint_url": app_row["endpoint_url"] if app_row else None,
-            "secret_ref": app_row["secret_ref"] if app_row else None,
+            "use_app_default_llm": False,
+            "billing_mode": None,
+            "provider_name": None,
+            "model_code": None,
+            "endpoint_url": None,
+            "secret_ref": None,
             "app_default_available": app_row is not None,
         }
 
@@ -1055,10 +1103,20 @@ class PostgresMCPRepository(MCPRepository):
             WHERE is_supported = TRUE
             ORDER BY category, name
         """
-        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {})
-            rows = cur.fetchall()
-        return rows
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(sql, {})
+                rows = cur.fetchall()
+            if rows:
+                return rows
+        except Exception:
+            pass
+        return list(DEFAULT_SOURCE_CATALOG)
+
+    @staticmethod
+    def _is_source_type_supported(source_type: str) -> bool:
+        value = str(source_type or "").strip().lower()
+        return any(str(item.get("code") or "").strip().lower() == value for item in DEFAULT_SOURCE_CATALOG)
 
     def list_tenant_data_sources(self, tenant_id: int) -> list[dict[str, Any]]:
         sql = f"""
@@ -1112,9 +1170,13 @@ class PostgresMCPRepository(MCPRepository):
             RETURNING id
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(check_catalog_sql, {"source_type": source_type})
-            catalog_row = cur.fetchone()
-            if not catalog_row:
+            catalog_row = None
+            try:
+                cur.execute(check_catalog_sql, {"source_type": source_type})
+                catalog_row = cur.fetchone()
+            except Exception:
+                catalog_row = None
+            if not catalog_row and not self._is_source_type_supported(source_type):
                 raise ValueError("source_type nao suportado")
             cur.execute(
                 insert_sql,
@@ -1185,9 +1247,13 @@ class PostgresMCPRepository(MCPRepository):
          RETURNING id
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(check_catalog_sql, {"source_type": source_type})
-            catalog_row = cur.fetchone()
-            if not catalog_row:
+            catalog_row = None
+            try:
+                cur.execute(check_catalog_sql, {"source_type": source_type})
+                catalog_row = cur.fetchone()
+            except Exception:
+                catalog_row = None
+            if not catalog_row and not self._is_source_type_supported(source_type):
                 raise ValueError("source_type nao suportado")
             cur.execute(
                 update_sql,
@@ -1249,10 +1315,10 @@ class PostgresMCPRepository(MCPRepository):
             SELECT
                 mt.tool_name,
                 mt.min_role,
-                COALESCE(tmp.is_enabled, FALSE) AS is_enabled,
+                tmp.is_enabled AS is_enabled,
                 tmp.max_rows,
                 tmp.max_calls_per_minute,
-                COALESCE(tmp.require_masking, TRUE) AS require_masking,
+                tmp.require_masking AS require_masking,
                 tmp.allowed_schema_patterns
             FROM {self.schema}.mcp_tool mt
             JOIN {self.schema}.mcp_server ms ON ms.id = mt.mcp_server_id
@@ -1264,20 +1330,278 @@ class PostgresMCPRepository(MCPRepository):
               AND ms.is_active = TRUE
             LIMIT 1
         """
-        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"tenant_id": tenant_id, "tool_name": tool_name})
-            row = cur.fetchone()
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(sql, {"tenant_id": tenant_id, "tool_name": tool_name})
+                row = cur.fetchone()
+        except Exception:
+            return DEFAULT_TOOL_POLICIES.get(tool_name)
         if row:
+            default = DEFAULT_TOOL_POLICIES.get(tool_name)
             return ToolPolicy(
                 tool_name=row["tool_name"],
-                min_role=row["min_role"],
-                is_enabled=bool(row["is_enabled"]),
-                max_rows=row["max_rows"],
-                max_calls_per_minute=row["max_calls_per_minute"],
-                require_masking=bool(row["require_masking"]),
-                allowed_schema_patterns=(row["allowed_schema_patterns"] or None),
+                min_role=str(row["min_role"] or (default.min_role if default else "viewer")),
+                is_enabled=bool(row["is_enabled"]) if row["is_enabled"] is not None else bool(default.is_enabled if default else False),
+                max_rows=row["max_rows"] if row["max_rows"] is not None else (default.max_rows if default else None),
+                max_calls_per_minute=(
+                    row["max_calls_per_minute"]
+                    if row["max_calls_per_minute"] is not None
+                    else (default.max_calls_per_minute if default else None)
+                ),
+                require_masking=(
+                    bool(row["require_masking"])
+                    if row["require_masking"] is not None
+                    else bool(default.require_masking if default else True)
+                ),
+                allowed_schema_patterns=(
+                    row["allowed_schema_patterns"]
+                    if row["allowed_schema_patterns"] is not None
+                    else (default.allowed_schema_patterns if default else None)
+                ),
             )
         return DEFAULT_TOOL_POLICIES.get(tool_name)
+
+    def list_tenant_tool_policies(self, tenant_id: int) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT
+                mt.tool_name,
+                mt.min_role,
+                tmp.is_enabled AS is_enabled,
+                tmp.max_rows,
+                tmp.max_calls_per_minute,
+                tmp.require_masking AS require_masking,
+                COALESCE(tmp.allowed_schema_patterns, '[]'::jsonb) AS allowed_schema_patterns
+            FROM {self.schema}.mcp_tool mt
+            JOIN {self.schema}.mcp_server ms ON ms.id = mt.mcp_server_id
+            LEFT JOIN {self.schema}.tenant_mcp_tool_policy tmp
+              ON tmp.mcp_tool_id = mt.id
+             AND tmp.tenant_id = %(tenant_id)s
+            WHERE mt.is_active = TRUE
+              AND ms.is_active = TRUE
+            ORDER BY mt.tool_name
+        """
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(sql, {"tenant_id": tenant_id})
+                rows = cur.fetchall()
+        except Exception:
+            rows = []
+        materialized = []
+        for row in rows:
+            default = DEFAULT_TOOL_POLICIES.get(str(row["tool_name"] or ""))
+            materialized.append(
+                {
+                    "tool_name": row["tool_name"],
+                    "min_role": str(row["min_role"] or (default.min_role if default else "viewer")),
+                    "is_enabled": bool(row["is_enabled"]) if row["is_enabled"] is not None else bool(default.is_enabled if default else False),
+                    "max_rows": row["max_rows"] if row["max_rows"] is not None else (default.max_rows if default else None),
+                    "max_calls_per_minute": (
+                        row["max_calls_per_minute"]
+                        if row["max_calls_per_minute"] is not None
+                        else (default.max_calls_per_minute if default else None)
+                    ),
+                    "require_masking": (
+                        bool(row["require_masking"])
+                        if row["require_masking"] is not None
+                        else bool(default.require_masking if default else True)
+                    ),
+                    "allowed_schema_patterns": row["allowed_schema_patterns"] or (default.allowed_schema_patterns or [] if default else []),
+                }
+            )
+        return materialized or [
+            {
+                "tool_name": policy.tool_name,
+                "min_role": policy.min_role,
+                "is_enabled": bool(policy.is_enabled),
+                "max_rows": policy.max_rows,
+                "max_calls_per_minute": policy.max_calls_per_minute,
+                "require_masking": bool(policy.require_masking),
+                "allowed_schema_patterns": policy.allowed_schema_patterns or [],
+            }
+            for policy in DEFAULT_TOOL_POLICIES.values()
+        ]
+
+    def upsert_tenant_tool_policy(
+        self,
+        tenant_id: int,
+        *,
+        tool_name: str,
+        is_enabled: bool,
+        max_rows: int | None,
+        max_calls_per_minute: int | None,
+        require_masking: bool,
+        allowed_schema_patterns: list[str],
+    ) -> dict[str, Any]:
+        lookup_sql = f"""
+            SELECT mt.id AS mcp_tool_id
+            FROM {self.schema}.mcp_tool mt
+            JOIN {self.schema}.mcp_server ms ON ms.id = mt.mcp_server_id
+            WHERE mt.tool_name = %(tool_name)s
+              AND mt.is_active = TRUE
+              AND ms.is_active = TRUE
+            LIMIT 1
+        """
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.tenant_mcp_tool_policy (
+                tenant_id,
+                mcp_tool_id,
+                is_enabled,
+                max_rows,
+                max_calls_per_minute,
+                require_masking,
+                allowed_schema_patterns,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(mcp_tool_id)s,
+                %(is_enabled)s,
+                %(max_rows)s,
+                %(max_calls_per_minute)s,
+                %(require_masking)s,
+                %(allowed_schema_patterns)s,
+                NOW(),
+                NOW()
+            )
+            ON CONFLICT (tenant_id, mcp_tool_id)
+            DO UPDATE SET
+                is_enabled = EXCLUDED.is_enabled,
+                max_rows = EXCLUDED.max_rows,
+                max_calls_per_minute = EXCLUDED.max_calls_per_minute,
+                require_masking = EXCLUDED.require_masking,
+                allowed_schema_patterns = EXCLUDED.allowed_schema_patterns,
+                updated_at = NOW()
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(lookup_sql, {"tool_name": tool_name})
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("tool nao encontrada")
+            cur.execute(
+                upsert_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "mcp_tool_id": row["mcp_tool_id"],
+                    "is_enabled": bool(is_enabled),
+                    "max_rows": max_rows,
+                    "max_calls_per_minute": max_calls_per_minute,
+                    "require_masking": bool(require_masking),
+                    "allowed_schema_patterns": Jsonb(allowed_schema_patterns),
+                },
+            )
+            conn.commit()
+        rows = self.list_tenant_tool_policies(tenant_id)
+        for item in rows:
+            if item["tool_name"] == tool_name:
+                return item
+        raise ValueError("falha ao recuperar policy")
+
+    def list_mcp_client_connections(self, tenant_id: int) -> list[dict[str, Any]]:
+        sql = f"""
+            SELECT
+                id,
+                tenant_id,
+                connection_name,
+                transport_type,
+                endpoint_url,
+                auth_secret_ref,
+                is_active,
+                health_status,
+                last_healthcheck_at,
+                created_at
+            FROM {self.schema}.mcp_client_connection
+            WHERE tenant_id = %(tenant_id)s
+            ORDER BY connection_name
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, {"tenant_id": tenant_id})
+            rows = cur.fetchall()
+        return rows
+
+    def upsert_mcp_client_connection(
+        self,
+        tenant_id: int,
+        *,
+        connection_name: str,
+        transport_type: str,
+        endpoint_url: str | None,
+        auth_secret_ref: str | None,
+        is_active: bool,
+    ) -> dict[str, Any]:
+        if transport_type not in {"stdio", "http", "websocket"}:
+            raise ValueError("transport_type invalido")
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.mcp_client_connection (
+                tenant_id,
+                connection_name,
+                transport_type,
+                endpoint_url,
+                auth_secret_ref,
+                is_active
+            )
+            VALUES (
+                %(tenant_id)s,
+                %(connection_name)s,
+                %(transport_type)s,
+                %(endpoint_url)s,
+                %(auth_secret_ref)s,
+                %(is_active)s
+            )
+            ON CONFLICT (tenant_id, connection_name)
+            DO UPDATE SET
+                transport_type = EXCLUDED.transport_type,
+                endpoint_url = EXCLUDED.endpoint_url,
+                auth_secret_ref = EXCLUDED.auth_secret_ref,
+                is_active = EXCLUDED.is_active
+            RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                upsert_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "connection_name": connection_name,
+                    "transport_type": transport_type,
+                    "endpoint_url": endpoint_url,
+                    "auth_secret_ref": auth_secret_ref,
+                    "is_active": bool(is_active),
+                },
+            )
+            row = cur.fetchone()
+            conn.commit()
+        rows = self.list_mcp_client_connections(tenant_id)
+        for item in rows:
+            if int(item["id"]) == int(row["id"]):
+                return item
+        raise ValueError("falha ao recuperar conexao MCP")
+
+    def update_mcp_client_connection_status(self, tenant_id: int, connection_id: int, is_active: bool) -> dict[str, Any]:
+        sql = f"""
+            UPDATE {self.schema}.mcp_client_connection
+               SET is_active = %(is_active)s
+             WHERE id = %(connection_id)s
+               AND tenant_id = %(tenant_id)s
+         RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "tenant_id": tenant_id,
+                    "connection_id": connection_id,
+                    "is_active": bool(is_active),
+                },
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("conexao MCP nao encontrada")
+            conn.commit()
+        rows = self.list_mcp_client_connections(tenant_id)
+        for item in rows:
+            if int(item["id"]) == int(connection_id):
+                return item
+        raise ValueError("conexao MCP nao encontrada")
 
     def get_sql_security_policy(self, tenant_id: int) -> dict[str, Any]:
         sql = f"""
@@ -2155,24 +2479,28 @@ class PostgresMCPRepository(MCPRepository):
                 NOW()
             )
         """
-        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(tool_lookup_sql, {"tool_name": tool_name})
-            tool_row = cur.fetchone()
-            cur.execute(
-                insert_sql,
-                {
-                    "client_id": client_id,
-                    "tenant_id": tenant_id,
-                    "user_id": user_id,
-                    "mcp_server_id": tool_row["mcp_server_id"] if tool_row else None,
-                    "mcp_tool_id": tool_row["mcp_tool_id"] if tool_row else None,
-                    "correlation_id": correlation_id,
-                    "request_payload_json": Jsonb(request_payload),
-                    "response_payload_json": Jsonb(response_payload),
-                    "status": status,
-                    "error_code": error_code,
-                    "error_message": error_message,
-                    "latency_ms": latency_ms,
-                },
-            )
-            conn.commit()
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(tool_lookup_sql, {"tool_name": tool_name})
+                tool_row = cur.fetchone()
+                cur.execute(
+                    insert_sql,
+                    {
+                        "client_id": client_id,
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "mcp_server_id": tool_row["mcp_server_id"] if tool_row else None,
+                        "mcp_tool_id": tool_row["mcp_tool_id"] if tool_row else None,
+                        "correlation_id": correlation_id,
+                        "request_payload_json": Jsonb(request_payload),
+                        "response_payload_json": Jsonb(response_payload),
+                        "status": status,
+                        "error_code": error_code,
+                        "error_message": error_message,
+                        "latency_ms": latency_ms,
+                    },
+                )
+                conn.commit()
+        except Exception:
+            # Auditoria nao pode derrubar o fluxo principal caso esquema MCP ainda nao esteja aplicado.
+            return

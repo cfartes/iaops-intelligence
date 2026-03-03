@@ -16,7 +16,8 @@ import {
 export default function BillingPanel({ onSystemMessage }) {
   const auth = getAuthContext();
   const authRole = String(auth?.role || "").toLowerCase();
-  const canSelectUsageTenant = ["owner", "admin", "superadmin"].includes(authRole);
+  const isGlobalSuperadmin = Boolean(auth?.is_superadmin) && Number(auth?.tenant_id || 0) <= 0;
+  const canSelectUsageTenant = !isGlobalSuperadmin && ["owner", "admin", "superadmin"].includes(authRole);
   const [plans, setPlans] = useState([]);
   const [subscription, setSubscription] = useState({});
   const [jobs, setJobs] = useState([]);
@@ -31,20 +32,27 @@ export default function BillingPanel({ onSystemMessage }) {
 
   const loadAll = async () => {
     try {
-      const [p, s, j, m, u, t] = await Promise.all([
+      const [p, s, j, m, u] = await Promise.all([
         listBillingPlans(),
         getBillingSubscription(),
         listAsyncJobs(20),
         getObservabilityMetrics(),
         getBillingLlmUsage(Number(llmUsageDays) || 30, usageTenantId || undefined),
-        listClientTenants(),
       ]);
+      let tenants = [];
+      if (!isGlobalSuperadmin) {
+        try {
+          const t = await listClientTenants();
+          tenants = t.tenants || [];
+        } catch (_) {
+          tenants = [];
+        }
+      }
       setPlans(p.plans || []);
       setSubscription(s.subscription || {});
       setJobs(j.jobs || []);
       setMetrics(m || {});
       setLlmUsage(u || { summary: {}, by_feature: [], recent: [] });
-      const tenants = t.tenants || [];
       setTenantOptions(tenants);
       if (!usageTenantId && tenants.length > 0) {
         setUsageTenantId(String(tenants[0].id));
@@ -56,7 +64,7 @@ export default function BillingPanel({ onSystemMessage }) {
 
   useEffect(() => {
     loadAll();
-  }, [llmUsageDays]);
+  }, [llmUsageDays, isGlobalSuperadmin]);
 
   const saveSubscription = async () => {
     try {

@@ -9,9 +9,13 @@ import {
   enqueueHousekeepingJob,
   getObservabilityMetrics,
   getOperationHealth,
+  listMcpConnections,
   listAsyncJobs,
   retryAsyncJob,
+  updateMcpConnectionStatus,
+  upsertMcpConnection,
 } from "../api/mcpApi";
+import McpConnectionModal from "../components/McpConnectionModal";
 import { tUi } from "../i18n/uiText";
 
 export default function OperationPanel({ onSystemMessage }) {
@@ -47,6 +51,10 @@ export default function OperationPanel({ onSystemMessage }) {
   const [jobSortBy, setJobSortBy] = useState("id");
   const [jobSortDir, setJobSortDir] = useState("desc");
   const [jobsViewLoaded, setJobsViewLoaded] = useState(false);
+  const [mcpConnections, setMcpConnections] = useState([]);
+  const [isLoadingMcpConnections, setIsLoadingMcpConnections] = useState(false);
+  const [isMcpConnectionModalOpen, setIsMcpConnectionModalOpen] = useState(false);
+  const [editingMcpConnection, setEditingMcpConnection] = useState(null);
 
   const baseChannelPayload = () => ({
     channel_type: channelType,
@@ -96,6 +104,18 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const loadMcpConnections = async () => {
+    setIsLoadingMcpConnections(true);
+    try {
+      const data = await listMcpConnections();
+      setMcpConnections(data.connections || []);
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar conexoes MCP", error.message);
+    } finally {
+      setIsLoadingMcpConnections(false);
+    }
+  };
+
   const visibleJobs = useMemo(() => {
     const filtered = jobs.filter((job) => {
       const status = String(job.status || "").toLowerCase();
@@ -127,6 +147,7 @@ export default function OperationPanel({ onSystemMessage }) {
   useEffect(() => {
     loadHealth();
     loadObservability();
+    loadMcpConnections();
   }, []);
 
   useEffect(() => {
@@ -345,6 +366,41 @@ export default function OperationPanel({ onSystemMessage }) {
     }
   };
 
+  const openNewMcpConnectionModal = () => {
+    setEditingMcpConnection(null);
+    setIsMcpConnectionModalOpen(true);
+  };
+
+  const openEditMcpConnectionModal = (item) => {
+    setEditingMcpConnection(item);
+    setIsMcpConnectionModalOpen(true);
+  };
+
+  const saveMcpConnection = async (payload) => {
+    try {
+      await upsertMcpConnection(payload);
+      setIsMcpConnectionModalOpen(false);
+      setEditingMcpConnection(null);
+      await loadMcpConnections();
+      onSystemMessage("success", "Conexao MCP salva", "Cadastro de conexao MCP atualizado com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar conexao MCP", error.message);
+    }
+  };
+
+  const toggleMcpConnectionStatus = async (item) => {
+    try {
+      await updateMcpConnectionStatus({
+        connection_id: Number(item.id),
+        is_active: !item.is_active,
+      });
+      await loadMcpConnections();
+      onSystemMessage("success", "Status atualizado", `Conexao ${item.connection_name} atualizada.`);
+    } catch (error) {
+      onSystemMessage("error", "Falha ao atualizar status da conexao", error.message);
+    }
+  };
+
   return (
     <section className="page-panel">
       <header>
@@ -479,6 +535,66 @@ export default function OperationPanel({ onSystemMessage }) {
             <pre>{webhookResponse.reply_text || tUi("op.tester.noReply", "Sem resposta textual")}</pre>
           </article>
         )}
+      </section>
+
+      <section className="catalog-block">
+        <h3>Conexoes MCP Externas</h3>
+        <p className="muted">Cadastro e ativacao de servidores MCP externos por tenant.</p>
+        <div className="page-actions">
+          <button type="button" className="btn btn-primary" onClick={openNewMcpConnectionModal}>
+            Nova Conexao MCP
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadMcpConnections}>
+            Atualizar Conexoes
+          </button>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Nome</th>
+                <th>Transporte</th>
+                <th>Endpoint</th>
+                <th>Status</th>
+                <th>Saude</th>
+                <th>Acoes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoadingMcpConnections ? (
+                <tr>
+                  <td colSpan={7}>Carregando conexoes...</td>
+                </tr>
+              ) : mcpConnections.length === 0 ? (
+                <tr>
+                  <td colSpan={7}>Nenhuma conexao MCP cadastrada.</td>
+                </tr>
+              ) : (
+                mcpConnections.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.id}</td>
+                    <td>{item.connection_name}</td>
+                    <td>{item.transport_type}</td>
+                    <td>{item.endpoint_url || "-"}</td>
+                    <td>{item.is_active ? "ativo" : "inativo"}</td>
+                    <td>{item.health_status || "unknown"}</td>
+                    <td>
+                      <div className="chip-row">
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => openEditMcpConnectionModal(item)}>
+                          Editar
+                        </button>
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => toggleMcpConnectionStatus(item)}>
+                          {item.is_active ? "Desativar" : "Ativar"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="catalog-block channel-tester">
@@ -653,6 +769,15 @@ export default function OperationPanel({ onSystemMessage }) {
           </table>
         </div>
       </section>
+      <McpConnectionModal
+        open={isMcpConnectionModalOpen}
+        initialData={editingMcpConnection}
+        onClose={() => {
+          setIsMcpConnectionModalOpen(false);
+          setEditingMcpConnection(null);
+        }}
+        onSubmit={saveMcpConnection}
+      />
     </section>
   );
 }
