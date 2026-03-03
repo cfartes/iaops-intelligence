@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { UI_TEXT } from "./locales/translations";
 import SideMenu from "./components/SideMenu";
 import EntityFormModal from "./components/EntityFormModal";
 import SystemMessageModal from "./components/SystemMessageModal";
@@ -54,543 +55,6 @@ const SETUP_MINI_CHECKLIST_COLLAPSED_KEY = "iaops_setup_mini_checklist_collapsed
 const SETUP_DEFER_HOURS = 24;
 const SESSION_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_REFRESH_AHEAD_MS = 2 * 60 * 1000;
-
-const UI_TEXT = {
-  pt: {
-    nav: {
-      onboarding: "Onboarding",
-      inventario: "Catalogo de Dados",
-      sugestoes: "Sugestoes",
-      "chat-bi": "Chat BI",
-      eventos: "Eventos",
-      incidentes: "Incidentes",
-      auditoria: "Auditoria",
-      "seguranca-sql": "Seguranca SQL",
-      acesso: "Acesso (Owner)",
-      lgpd: "LGPD",
-      operacao: "Operacao",
-      faturamento: "Faturamento (Owner)",
-      parcelas: "Parcelas (Owner)",
-      configuracao: "Configuracao",
-    },
-    subtitles: {
-      onboarding: "Configure fontes de dados e tabelas monitoradas do tenant no fluxo guiado.",
-      inventario: "Explore tabelas, colunas e classificacao de metadados por tenant.",
-      sugestoes: "Revise sugestoes da LLM por campo, com confirmacao, edicao e lote.",
-      "chat-bi": "Perguntas em linguagem natural com contexto de metadados e politicas LGPD.",
-      eventos: "Acompanhe mudancas estruturais detectadas e alertas por severidade.",
-      incidentes: "Gerencie ciclo de vida de incidentes com SLA e rastreabilidade.",
-      auditoria: "Consulte trilhas de auditoria das operacoes criticas do sistema.",
-      "seguranca-sql": "Defina guardrails e politicas de seguranca para consultas.",
-      acesso: "Controle usuarios, papeis e restricoes de privilegio por tenant.",
-      lgpd: "Administre politicas, mascaramento e solicitacoes de titulares.",
-      operacao: "Visualize saude operacional e status de integracoes.",
-      faturamento: "Gerencie planos, assinaturas e limites por cliente.",
-      parcelas: "Acompanhe vencimentos, baixas e inadimplencia.",
-      configuracao: "Ajuste preferencias de tenant, notificacoes e LLM.",
-    },
-    genericModule: "Modulo",
-    setupAssistant: "Assistente Inicial",
-    genericAlertTitle: "Alerta de Governanca",
-    genericAlertMessage: "Este tenant possui configuracoes pendentes de LGPD e deve ser revisado.",
-    entityCreateTitlePrefix: "Novo cadastro",
-    signUp: "Cadastre-se",
-    signIn: "Entrar",
-    signOut: "Sair",
-    authScreen: {
-      title: "IAOps Governance",
-      headline: "Governanca inteligente para operacao de dados",
-      lead: "Inventario de metadados, deteccao de mudancas, LGPD e consultas naturais em um unico painel.",
-      benefits: [
-        "Multi-tenant com trilha de auditoria completa",
-        "Chat BI, WhatsApp e Telegram com linguagem natural",
-        "Controles de acesso, MFA e bloqueio por risco",
-      ],
-      language_options: [
-        { value: "pt-BR", label: "Portugues (Brasil)" },
-        { value: "en-US", label: "English (US)" },
-        { value: "es-ES", label: "Espanol" },
-      ],
-    },
-    sessionLabel: "Sessao: {email} ({role})",
-    loginModal: {
-      title: "Acesso ao IAOps",
-      email: "E-mail de acesso",
-      password: "Senha",
-      login: "Entrar",
-      forgot_password: "Esqueci minha senha",
-      back: "Voltar",
-      reset_intro: "Informe seu e-mail para receber o token de redefinicao.",
-      reset_request: "Enviar token",
-      reset_requesting: "Enviando...",
-      reset_confirm_intro: "Informe o token recebido e a nova senha.",
-      reset_token: "Token de redefinicao",
-      reset_new_password: "Nova senha",
-      reset_confirm: "Redefinir senha",
-      reset_confirming: "Redefinindo...",
-      reset_ok_title: "Senha atualizada",
-      reset_ok_message: "Sua senha foi redefinida com sucesso.",
-      reset_request_ok_title: "Solicitacao enviada",
-      reset_request_ok_message: "Se o e-mail existir, enviaremos instrucoes de redefinicao.",
-      logging: "Entrando...",
-      mfa_intro: "MFA ativo. Informe o codigo TOTP para concluir o acesso.",
-      otp_code: "Codigo TOTP",
-      verify: "Validar MFA",
-      verifying: "Validando...",
-      ok_title: "Login concluido",
-      ok_message: "Acesso autenticado com sucesso.",
-      fail_title: "Falha no login",
-    },
-    inactivityLogoutTitle: "Sessao encerrada",
-    inactivityLogoutMessage: "Voce ficou 5 minutos inativo. Faca login novamente.",
-    signupModal: {
-      title: "Cadastro de Novo Cliente",
-      trade_name: "Nome Fantasia",
-      legal_name: "Razao Social",
-      cnpj: "CNPJ",
-      address_text: "Endereco",
-      phone_contact: "Telefone contato",
-      email_contact: "E-mail contato",
-      email_access: "E-mail acesso",
-      email_notification: "E-mail notificacao",
-      password: "Senha",
-      plan_code: "Plano",
-      language_code: "Idioma",
-      submit: "Cadastrar",
-      submitting: "Cadastrando...",
-      confirm_intro: "Informe o token de confirmacao enviado por e-mail para ativar o acesso.",
-      confirm_token: "Token de confirmacao",
-      confirm: "Confirmar cadastro",
-      confirming: "Confirmando...",
-      cancel: "Cancelar",
-      ok_signup_title: "Cadastro recebido",
-      ok_signup_message: "Cadastro criado em modo pendente. Verifique seu e-mail para confirmar.",
-      ok_confirm_title: "Cadastro confirmado",
-      ok_confirm_message: "Cliente confirmado com sucesso. Primeiro acesso liberado.",
-    },
-    setupWizard: {
-      title: "Assistente Inicial de Configuracao",
-      intro: "Use as etapas abaixo para configurar o app no primeiro acesso. Voce pode pular qualquer etapa.",
-      progress: "Progresso: {completed}/{total} etapas concluidas.",
-      pending: "Pendente",
-      done: "Concluida",
-      partial: "Parcial",
-      blocked: "Bloqueada",
-      completed: "Concluida",
-      goToStep: "Ir para etapa",
-      markDone: "Marcar como concluida",
-      completeCurrent: "Concluir etapa atual",
-      continue: "Continuar de onde parei",
-      nextPending: "Ir para proxima pendente",
-      collapse: "Recolher trilha",
-      expand: "Expandir trilha",
-      statusSummary: {
-        done: "Concluidas: {count}",
-        partial: "Parciais: {count}",
-        blocked: "Bloqueadas: {count}",
-      },
-      close: "Fechar",
-      postpone: "Lembrar mais tarde",
-      stepDoneTitle: "Etapa concluida",
-      stepDoneMessage: "Etapa marcada como concluida.",
-      allDoneTitle: "Setup concluido",
-      allDoneMessage: "Todas as etapas do assistente foram concluidas.",
-      reasonLabel: "Pendencia: {reason}",
-      reasons: {
-        onboarding_no_source: "Cadastre pelo menos uma fonte de dados no tenant.",
-        onboarding_no_table: "Cadastre ao menos uma tabela monitorada.",
-        acesso_no_users: "Cadastre pelo menos um usuario.",
-        configuracao_missing: "Configure LLM do tenant/app ou ative MFA.",
-        operacao_missing_channels: "Configure ao menos um canal de notificacao.",
-      },
-      steps: {
-        onboarding: {
-          title: "Configurar Tenant e Fontes",
-          description: "Cadastre tenant e fontes, e sincronize tabelas/colunas automaticamente.",
-        },
-        acesso: {
-          title: "Cadastrar Usuarios e Acesso",
-          description: "Defina usuarios, roles e reset MFA quando necessario.",
-        },
-        configuracao: {
-          title: "Configurar LLM e Preferencias",
-          description: "Defina LLM do tenant (ou LLM do app), MFA e preferencias iniciais.",
-        },
-        operacao: {
-          title: "Configurar Canais e Alertas",
-          description: "Valide notificacoes Telegram/WhatsApp e operacao.",
-        },
-      },
-    },
-    entityForm: {
-      clientName: "Nome Fantasia",
-      legalName: "Razao Social",
-      cnpj: "CNPJ",
-      contactEmail: "E-mail Contato",
-      language: "Idioma",
-      cancel: "Cancelar",
-      save: "Salvar",
-    },
-    entityCreateSuccessTitle: "Cadastro confirmado",
-    entityCreateSuccessMessage: "Cadastro recebido para {name}. Idioma inicial: {language}.",
-  },
-  en: {
-    nav: {
-      onboarding: "Onboarding",
-      inventario: "Data Catalog",
-      sugestoes: "Suggestions",
-      "chat-bi": "Chat BI",
-      eventos: "Events",
-      incidentes: "Incidents",
-      auditoria: "Audit",
-      "seguranca-sql": "SQL Security",
-      acesso: "Access (Owner)",
-      lgpd: "LGPD",
-      operacao: "Operations",
-      faturamento: "Billing (Owner)",
-      parcelas: "Installments (Owner)",
-      configuracao: "Configuration",
-    },
-    subtitles: {
-      onboarding: "Configure tenant data sources and monitored tables in a guided flow.",
-      inventario: "Explore tables, columns and metadata classification by tenant.",
-      sugestoes: "Review LLM suggestions by field with confirm, edit and batch actions.",
-      "chat-bi": "Natural language questions with metadata context and LGPD policies.",
-      eventos: "Track structural changes and alerts by severity.",
-      incidentes: "Manage incident lifecycle with SLA and traceability.",
-      auditoria: "Review audit trails for critical system operations.",
-      "seguranca-sql": "Define SQL guardrails and query safety policies.",
-      acesso: "Manage users, roles and privilege restrictions per tenant.",
-      lgpd: "Manage policies, masking and data subject requests.",
-      operacao: "View operational health and integration status.",
-      faturamento: "Manage plans, subscriptions and client limits.",
-      parcelas: "Track due dates, payments and delinquency.",
-      configuracao: "Adjust tenant preferences, notifications and LLM.",
-    },
-    genericModule: "Module",
-    setupAssistant: "Initial Assistant",
-    genericAlertTitle: "Governance Alert",
-    genericAlertMessage: "This tenant has pending LGPD settings and must be reviewed.",
-    entityCreateTitlePrefix: "New record",
-    signUp: "Sign up",
-    signIn: "Sign in",
-    signOut: "Sign out",
-    authScreen: {
-      title: "IAOps Governance",
-      headline: "Intelligent governance for data operations",
-      lead: "Metadata inventory, change detection, LGPD controls and natural language insights in one workspace.",
-      benefits: [
-        "Multi-tenant governance with full audit trail",
-        "Chat BI, WhatsApp and Telegram in natural language",
-        "Access controls, MFA and risk-based blocking",
-      ],
-      language_options: [
-        { value: "pt-BR", label: "Portuguese (Brazil)" },
-        { value: "en-US", label: "English (US)" },
-        { value: "es-ES", label: "Spanish" },
-      ],
-    },
-    sessionLabel: "Session: {email} ({role})",
-    loginModal: {
-      title: "IAOps Sign in",
-      email: "Access e-mail",
-      password: "Password",
-      login: "Sign in",
-      forgot_password: "Forgot password",
-      back: "Back",
-      reset_intro: "Enter your email to receive a password reset token.",
-      reset_request: "Send token",
-      reset_requesting: "Sending...",
-      reset_confirm_intro: "Enter the token received and your new password.",
-      reset_token: "Reset token",
-      reset_new_password: "New password",
-      reset_confirm: "Reset password",
-      reset_confirming: "Resetting...",
-      reset_ok_title: "Password updated",
-      reset_ok_message: "Your password was reset successfully.",
-      reset_request_ok_title: "Request sent",
-      reset_request_ok_message: "If the email exists, we will send reset instructions.",
-      logging: "Signing in...",
-      mfa_intro: "MFA enabled. Enter your TOTP code to finish sign in.",
-      otp_code: "TOTP code",
-      verify: "Verify MFA",
-      verifying: "Verifying...",
-      ok_title: "Signed in",
-      ok_message: "Access authenticated successfully.",
-      fail_title: "Sign in failed",
-    },
-    inactivityLogoutTitle: "Session ended",
-    inactivityLogoutMessage: "You were inactive for 5 minutes. Please sign in again.",
-    signupModal: {
-      title: "New Client Registration",
-      trade_name: "Trade Name",
-      legal_name: "Legal Name",
-      cnpj: "Tax ID (CNPJ)",
-      address_text: "Address",
-      phone_contact: "Contact phone",
-      email_contact: "Contact email",
-      email_access: "Access email",
-      email_notification: "Notification email",
-      password: "Password",
-      plan_code: "Plan",
-      language_code: "Language",
-      submit: "Register",
-      submitting: "Registering...",
-      confirm_intro: "Enter the confirmation token sent by e-mail to activate access.",
-      confirm_token: "Confirmation token",
-      confirm: "Confirm registration",
-      confirming: "Confirming...",
-      cancel: "Cancel",
-      ok_signup_title: "Registration received",
-      ok_signup_message: "Registration created as pending. Check your email to confirm.",
-      ok_confirm_title: "Registration confirmed",
-      ok_confirm_message: "Client confirmed successfully. First access unlocked.",
-    },
-    setupWizard: {
-      title: "Initial Setup Assistant",
-      intro: "Use the steps below to configure the app on first access. You can skip any step.",
-      progress: "Progress: {completed}/{total} steps completed.",
-      pending: "Pending",
-      done: "Done",
-      partial: "Partial",
-      blocked: "Blocked",
-      completed: "Completed",
-      goToStep: "Go to step",
-      markDone: "Mark as done",
-      completeCurrent: "Complete current step",
-      continue: "Continue where I left off",
-      nextPending: "Go to next pending",
-      collapse: "Collapse tracker",
-      expand: "Expand tracker",
-      statusSummary: {
-        done: "Done: {count}",
-        partial: "Partial: {count}",
-        blocked: "Blocked: {count}",
-      },
-      close: "Close",
-      postpone: "Remind later",
-      stepDoneTitle: "Step completed",
-      stepDoneMessage: "Step marked as completed.",
-      allDoneTitle: "Setup completed",
-      allDoneMessage: "All setup assistant steps are completed.",
-      reasonLabel: "Pending: {reason}",
-      reasons: {
-        onboarding_no_source: "Register at least one tenant data source.",
-        onboarding_no_table: "Register at least one monitored table.",
-        acesso_no_users: "Register at least one user.",
-        configuracao_missing: "Configure tenant/app LLM or enable MFA.",
-        operacao_missing_channels: "Configure at least one notification channel.",
-      },
-      steps: {
-        onboarding: {
-          title: "Configure Tenant and Sources",
-          description: "Register tenant and data sources, then auto-sync monitored tables/columns.",
-        },
-        acesso: {
-          title: "Configure Users and Access",
-          description: "Define users, roles and MFA reset policy when needed.",
-        },
-        configuracao: {
-          title: "Configure LLM and Preferences",
-          description: "Set tenant LLM (or app default), MFA and initial preferences.",
-        },
-        operacao: {
-          title: "Configure Channels and Alerts",
-          description: "Validate Telegram/WhatsApp notifications and operations.",
-        },
-      },
-    },
-    entityForm: {
-      clientName: "Trade Name",
-      legalName: "Legal Name",
-      cnpj: "Tax ID (CNPJ)",
-      contactEmail: "Contact Email",
-      language: "Language",
-      cancel: "Cancel",
-      save: "Save",
-    },
-    entityCreateSuccessTitle: "Registration confirmed",
-    entityCreateSuccessMessage: "Registration received for {name}. Initial language: {language}.",
-  },
-  es: {
-    nav: {
-      onboarding: "Onboarding",
-      inventario: "Catalogo de Datos",
-      sugestoes: "Sugerencias",
-      "chat-bi": "Chat BI",
-      eventos: "Eventos",
-      incidentes: "Incidentes",
-      auditoria: "Auditoria",
-      "seguranca-sql": "Seguridad SQL",
-      acesso: "Acceso (Owner)",
-      lgpd: "LGPD",
-      operacao: "Operacion",
-      faturamento: "Facturacion (Owner)",
-      parcelas: "Cuotas (Owner)",
-      configuracao: "Configuracion",
-    },
-    subtitles: {
-      onboarding: "Configure fuentes de datos y tablas monitoreadas del tenant en flujo guiado.",
-      inventario: "Explore tablas, columnas y clasificacion de metadatos por tenant.",
-      sugestoes: "Revise sugerencias de la LLM por campo con confirmar, editar y lote.",
-      "chat-bi": "Preguntas en lenguaje natural con contexto de metadatos y politicas LGPD.",
-      eventos: "Acompanhe cambios estructurales y alertas por severidad.",
-      incidentes: "Gestione el ciclo de vida de incidentes con SLA y trazabilidad.",
-      auditoria: "Consulte trazas de auditoria de operaciones criticas.",
-      "seguranca-sql": "Defina guardrails y politicas de seguridad para consultas.",
-      acesso: "Controle usuarios, roles y restricciones por tenant.",
-      lgpd: "Administre politicas, enmascaramiento y solicitudes de titulares.",
-      operacao: "Visualice salud operacional y estado de integraciones.",
-      faturamento: "Gestione planes, suscripciones y limites por cliente.",
-      parcelas: "Acompanhe vencimientos, pagos y morosidad.",
-      configuracao: "Ajuste preferencias de tenant, notificaciones y LLM.",
-    },
-    genericModule: "Modulo",
-    setupAssistant: "Asistente Inicial",
-    genericAlertTitle: "Alerta de Gobernanza",
-    genericAlertMessage: "Este tenant tiene configuraciones LGPD pendientes y debe revisarse.",
-    entityCreateTitlePrefix: "Nuevo registro",
-    signUp: "Registrarse",
-    signIn: "Iniciar sesion",
-    signOut: "Salir",
-    authScreen: {
-      title: "IAOps Governance",
-      headline: "Gobernanza inteligente para operaciones de datos",
-      lead: "Inventario de metadatos, deteccion de cambios, controles LGPD y respuestas en lenguaje natural en un solo lugar.",
-      benefits: [
-        "Gobernanza multi-tenant con auditoria completa",
-        "Chat BI, WhatsApp y Telegram con lenguaje natural",
-        "Controles de acceso, MFA y bloqueo por riesgo",
-      ],
-      language_options: [
-        { value: "pt-BR", label: "Portugues (Brasil)" },
-        { value: "en-US", label: "English (US)" },
-        { value: "es-ES", label: "Espanol" },
-      ],
-    },
-    sessionLabel: "Sesion: {email} ({role})",
-    loginModal: {
-      title: "Acceso IAOps",
-      email: "Correo de acceso",
-      password: "Contrasena",
-      login: "Iniciar sesion",
-      forgot_password: "Olvide mi contrasena",
-      back: "Volver",
-      reset_intro: "Informe su correo para recibir el token de redefinicion.",
-      reset_request: "Enviar token",
-      reset_requesting: "Enviando...",
-      reset_confirm_intro: "Informe el token recibido y su nueva contrasena.",
-      reset_token: "Token de redefinicion",
-      reset_new_password: "Nueva contrasena",
-      reset_confirm: "Redefinir contrasena",
-      reset_confirming: "Redefiniendo...",
-      reset_ok_title: "Contrasena actualizada",
-      reset_ok_message: "Su contrasena fue redefinida con exito.",
-      reset_request_ok_title: "Solicitud enviada",
-      reset_request_ok_message: "Si el correo existe, enviaremos instrucciones de redefinicion.",
-      logging: "Iniciando...",
-      mfa_intro: "MFA activo. Informe el codigo TOTP para concluir el acceso.",
-      otp_code: "Codigo TOTP",
-      verify: "Validar MFA",
-      verifying: "Validando...",
-      ok_title: "Login completado",
-      ok_message: "Acceso autenticado con exito.",
-      fail_title: "Fallo de login",
-    },
-    inactivityLogoutTitle: "Sesion finalizada",
-    inactivityLogoutMessage: "Estuvo inactivo por 5 minutos. Inicie sesion nuevamente.",
-    signupModal: {
-      title: "Registro de Nuevo Cliente",
-      trade_name: "Nombre Comercial",
-      legal_name: "Razon Social",
-      cnpj: "CNPJ",
-      address_text: "Direccion",
-      phone_contact: "Telefono de contacto",
-      email_contact: "Correo de contacto",
-      email_access: "Correo de acceso",
-      email_notification: "Correo de notificacion",
-      password: "Contrasena",
-      plan_code: "Plan",
-      language_code: "Idioma",
-      submit: "Registrar",
-      submitting: "Registrando...",
-      confirm_intro: "Informe el token de confirmacion enviado por correo para activar el acceso.",
-      confirm_token: "Token de confirmacion",
-      confirm: "Confirmar registro",
-      confirming: "Confirmando...",
-      cancel: "Cancelar",
-      ok_signup_title: "Registro recibido",
-      ok_signup_message: "Registro creado como pendiente. Verifique su correo para confirmar.",
-      ok_confirm_title: "Registro confirmado",
-      ok_confirm_message: "Cliente confirmado con exito. Primer acceso liberado.",
-    },
-    setupWizard: {
-      title: "Asistente Inicial de Configuracion",
-      intro: "Use las etapas abajo para configurar la app en el primer acceso. Puede omitir cualquier etapa.",
-      progress: "Progreso: {completed}/{total} etapas completadas.",
-      pending: "Pendiente",
-      done: "Completada",
-      partial: "Parcial",
-      blocked: "Bloqueada",
-      completed: "Completada",
-      goToStep: "Ir a etapa",
-      markDone: "Marcar como completada",
-      completeCurrent: "Completar etapa actual",
-      continue: "Continuar donde lo deje",
-      nextPending: "Ir a la siguiente pendiente",
-      collapse: "Contraer seguimiento",
-      expand: "Expandir seguimiento",
-      statusSummary: {
-        done: "Completadas: {count}",
-        partial: "Parciales: {count}",
-        blocked: "Bloqueadas: {count}",
-      },
-      close: "Cerrar",
-      postpone: "Recordar despues",
-      stepDoneTitle: "Etapa completada",
-      stepDoneMessage: "Etapa marcada como completada.",
-      allDoneTitle: "Setup completado",
-      allDoneMessage: "Todas las etapas del asistente fueron completadas.",
-      reasonLabel: "Pendiente: {reason}",
-      reasons: {
-        onboarding_no_source: "Registre al menos una fuente de datos del tenant.",
-        onboarding_no_table: "Registre al menos una tabla monitoreada.",
-        acesso_no_users: "Registre al menos un usuario.",
-        configuracao_missing: "Configure LLM del tenant/app o habilite MFA.",
-        operacao_missing_channels: "Configure al menos un canal de notificacion.",
-      },
-      steps: {
-        onboarding: {
-          title: "Configurar Tenant y Fuentes",
-          description: "Registre tenant y fuentes y sincronice tablas/columnas automaticamente.",
-        },
-        acesso: {
-          title: "Configurar Usuarios y Acceso",
-          description: "Defina usuarios, roles y reset de MFA cuando sea necesario.",
-        },
-        configuracao: {
-          title: "Configurar LLM y Preferencias",
-          description: "Defina LLM del tenant (o LLM de la app), MFA y preferencias iniciales.",
-        },
-        operacao: {
-          title: "Configurar Canales y Alertas",
-          description: "Valide notificaciones Telegram/WhatsApp y operacion.",
-        },
-      },
-    },
-    entityForm: {
-      clientName: "Nombre Comercial",
-      legalName: "Razon Social",
-      cnpj: "CNPJ",
-      contactEmail: "Correo de Contacto",
-      language: "Idioma",
-      cancel: "Cancelar",
-      save: "Guardar",
-    },
-    entityCreateSuccessTitle: "Registro confirmado",
-    entityCreateSuccessMessage: "Registro recibido para {name}. Idioma inicial: {language}.",
-  },
-};
 
 export default function App() {
   const setupSyncSignatureRef = useRef("");
@@ -1141,6 +605,54 @@ export default function App() {
     }
   };
 
+  const renderActivePage = () => {
+    const panels = {
+      onboarding: <OnboardingPanel onSystemMessage={openSystemMessage} />,
+      inventario: <InventoryPanel onSystemMessage={openSystemMessage} />,
+      sugestoes: <SuggestionsPanel onSystemMessage={openSystemMessage} />,
+      "chat-bi": <ChatBiPanel onSystemMessage={openSystemMessage} />,
+      eventos: <EventsPanel onSystemMessage={openSystemMessage} />,
+      operacao: <OperationPanel onSystemMessage={openSystemMessage} />,
+      auditoria: <AuditPanel onSystemMessage={openSystemMessage} />,
+      "seguranca-sql": <SqlSecurityPanel onSystemMessage={openSystemMessage} />,
+      acesso: <AccessPanel onSystemMessage={openSystemMessage} />,
+      configuracao: (
+        <ConfiguracaoPanel
+          onSystemMessage={openSystemMessage}
+          onPreferenceApplied={(preference) => {
+            setUiLanguage(preference?.language_code || "pt-BR");
+            setUserTheme(preference?.theme_code || "light");
+          }}
+          onSessionRevokedCurrent={() => performLogout()}
+        />
+      ),
+      lgpd: <LgpdPanel onSystemMessage={openSystemMessage} />,
+      faturamento: <BillingPanel onSystemMessage={openSystemMessage} />,
+      parcelas: <InstallmentsPanel onSystemMessage={openSystemMessage} />,
+      incidentes: (
+        <IncidentPanel
+          onOpenCreate={() => setIsIncidentModalOpen(true)}
+          onOpenStatusModal={(incident) => {
+            setSelectedIncident(incident);
+            setIsIncidentStatusModalOpen(true);
+          }}
+          onQuickStatusUpdate={handleQuickIncidentStatusUpdate}
+          onSystemMessage={openSystemMessage}
+          reloadSignal={incidentReloadSignal}
+        />
+      ),
+    };
+
+    return panels[activePage] || (
+      <PagePanel
+        title={activeLabel}
+        subtitle={localizedSubtitleByPage[activePage]}
+        onOpenCreate={() => setIsEntityModalOpen(true)}
+        onShowAlert={() => openSystemMessage("warning", uiText.genericAlertTitle, uiText.genericAlertMessage)}
+      />
+    );
+  };
+
   if (!authContext) {
     return (
       <>
@@ -1273,64 +785,7 @@ export default function App() {
           </div>
         )}
 
-        {activePage === "onboarding" ? (
-          <OnboardingPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "inventario" ? (
-          <InventoryPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "sugestoes" ? (
-          <SuggestionsPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "chat-bi" ? (
-          <ChatBiPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "eventos" ? (
-          <EventsPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "operacao" ? (
-          <OperationPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "auditoria" ? (
-          <AuditPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "seguranca-sql" ? (
-          <SqlSecurityPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "acesso" ? (
-          <AccessPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "configuracao" ? (
-          <ConfiguracaoPanel
-            onSystemMessage={openSystemMessage}
-            onPreferenceApplied={(preference) => {
-              setUiLanguage(preference?.language_code || "pt-BR");
-              setUserTheme(preference?.theme_code || "light");
-            }}
-            onSessionRevokedCurrent={() => performLogout()}
-          />
-        ) : activePage === "lgpd" ? (
-          <LgpdPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "faturamento" ? (
-          <BillingPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "parcelas" ? (
-          <InstallmentsPanel onSystemMessage={openSystemMessage} />
-        ) : activePage === "incidentes" ? (
-          <IncidentPanel
-            onOpenCreate={() => setIsIncidentModalOpen(true)}
-            onOpenStatusModal={(incident) => {
-              setSelectedIncident(incident);
-              setIsIncidentStatusModalOpen(true);
-            }}
-            onQuickStatusUpdate={handleQuickIncidentStatusUpdate}
-            onSystemMessage={openSystemMessage}
-            reloadSignal={incidentReloadSignal}
-          />
-        ) : (
-          <PagePanel
-            title={activeLabel}
-            subtitle={localizedSubtitleByPage[activePage]}
-            onOpenCreate={() => setIsEntityModalOpen(true)}
-            onShowAlert={() =>
-              openSystemMessage(
-                "warning",
-                uiText.genericAlertTitle,
-                uiText.genericAlertMessage
-              )
-            }
-          />
-        )}
+        {renderActivePage()}
       </main>
 
       <EntityFormModal
