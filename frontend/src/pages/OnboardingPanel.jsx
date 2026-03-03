@@ -3,6 +3,7 @@ import {
   deleteDataSource,
   discoverDataSourceColumns,
   discoverDataSourceTables,
+  confirmMonitoredColumnDescription,
   deleteMonitoredColumn,
   deleteMonitoredTable,
   enrichMonitoredColumns,
@@ -348,6 +349,13 @@ export default function OnboardingPanel({ onSystemMessage }) {
           tUi("onboarding.ok.columnRemoved.title", "Coluna monitorada removida"),
           `Coluna ${data.result.column_name} removida com sucesso.`
         );
+      } else if (pendingAction.type === "confirm_llm_description") {
+        const data = await confirmMonitoredColumnDescription({ monitored_column_id: pendingAction.column.id });
+        onSystemMessage(
+          "success",
+          "Descricao confirmada",
+          `Descricao da coluna ${pendingAction.column.column_name} confirmada (${data.confirmed ? "LLM" : "manual"}).`
+        );
       }
       setPendingAction(null);
       await loadTenantSources();
@@ -504,7 +512,11 @@ export default function OnboardingPanel({ onSystemMessage }) {
               </thead>
               <tbody>
                 {monitoredTables.map((item) => (
-                  <tr key={item.id}>
+                  <tr
+                    key={item.id}
+                    onClick={() => setSelectedTableIdForColumns(String(item.id))}
+                    style={{ cursor: "pointer", backgroundColor: String(item.id) === String(selectedTableIdForColumns) ? "#f2f8fc" : "transparent" }}
+                  >
                     <td>{item.schema_name}</td>
                     <td>{item.table_name}</td>
                     <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
@@ -573,38 +585,58 @@ export default function OnboardingPanel({ onSystemMessage }) {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>ID</th>
                   <th>Coluna</th>
                   <th>Tipo</th>
-                  <th>Classificacao</th>
-                  <th>Descricao</th>
+                  <th>Descricao da Fonte</th>
+                  <th>Descricao LLM</th>
+                  <th>Classificacao Sugerida</th>
+                  <th>Descricao Confirmada</th>
                   <th>Acoes</th>
                 </tr>
               </thead>
               <tbody>
                 {monitoredColumns.map((item) => (
                   <tr key={item.id}>
-                    <td>{item.id}</td>
                     <td>{item.column_name}</td>
                     <td>{item.data_type || "-"}</td>
-                    <td>{item.classification || "-"}</td>
+                    <td>{item.source_description_text || "-"}</td>
+                    <td>{item.llm_description_suggested || "-"}</td>
+                    <td>{item.llm_classification_suggested || item.classification || "-"}</td>
                     <td>{item.description_text || "-"}</td>
                     <td>
-                      <button
-                        type="button"
-                        className="btn btn-small btn-secondary"
-                        onClick={() =>
-                          setPendingAction({
-                            type: "delete_column",
-                            column: item,
-                            title: tUi("onboarding.column.remove", "Remover coluna monitorada"),
-                            message: `Remover coluna ${item.column_name}?`,
-                            confirmLabel: tUi("common.remove", "Remover"),
-                          })
-                        }
-                      >
-                        {tUi("common.remove", "Remover")}
-                      </button>
+                      <div className="chip-row">
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          disabled={!item.llm_description_suggested}
+                          onClick={() =>
+                            setPendingAction({
+                              type: "confirm_llm_description",
+                              column: item,
+                              title: "Confirmar descricao da LLM",
+                              message: `Aplicar a descricao sugerida pela LLM para a coluna ${item.column_name}?`,
+                              confirmLabel: "Confirmar",
+                            })
+                          }
+                        >
+                          Confirmar LLM
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() =>
+                            setPendingAction({
+                              type: "delete_column",
+                              column: item,
+                              title: tUi("onboarding.column.remove", "Remover coluna monitorada"),
+                              message: `Remover coluna ${item.column_name}?`,
+                              confirmLabel: tUi("common.remove", "Remover"),
+                            })
+                          }
+                        >
+                          {tUi("common.remove", "Remover")}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

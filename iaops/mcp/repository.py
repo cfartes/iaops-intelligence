@@ -589,6 +589,10 @@ class InMemoryMCPRepository(MCPRepository):
                     "data_type": "bigint",
                     "classification": "identifier",
                     "description_text": "PK",
+                    "source_description_text": None,
+                    "llm_description_suggested": "Identificador unico do registro.",
+                    "llm_classification_suggested": "identifier",
+                    "llm_description_confirmed": True,
                 },
                 {
                     "id": 7002,
@@ -597,6 +601,10 @@ class InMemoryMCPRepository(MCPRepository):
                     "data_type": "text",
                     "classification": "sensitive",
                     "description_text": "Documento do titular",
+                    "source_description_text": None,
+                    "llm_description_suggested": "CPF do cliente titular do pedido.",
+                    "llm_classification_suggested": "sensitive",
+                    "llm_description_confirmed": False,
                 },
                 {
                     "id": 7003,
@@ -605,6 +613,10 @@ class InMemoryMCPRepository(MCPRepository):
                     "data_type": "numeric",
                     "classification": "financial",
                     "description_text": "Valor",
+                    "source_description_text": None,
+                    "llm_description_suggested": "Valor total financeiro do pedido.",
+                    "llm_classification_suggested": "financial",
+                    "llm_description_confirmed": False,
                 },
             ]
         }
@@ -1429,6 +1441,10 @@ class InMemoryMCPRepository(MCPRepository):
             "data_type": data_type,
             "classification": classification,
             "description_text": description_text,
+            "source_description_text": None,
+            "llm_description_suggested": None,
+            "llm_classification_suggested": None,
+            "llm_description_confirmed": bool(description_text),
         }
         self._monitored_column_seq += 1
         rows.append(row)

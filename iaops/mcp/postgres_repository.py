@@ -96,6 +96,24 @@ class PostgresMCPRepository(MCPRepository):
     def __init__(self, dsn: str, schema: str = "iaops_gov") -> None:
         self.dsn = dsn
         self.schema = schema
+        self._monitored_column_meta_ready = False
+
+    def _ensure_monitored_column_meta(self) -> None:
+        if self._monitored_column_meta_ready:
+            return
+        ddl_statements = [
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS source_description_text TEXT",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_suggested TEXT",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_classification_suggested TEXT",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_at TIMESTAMPTZ",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_by_user_id BIGINT",
+        ]
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            for ddl in ddl_statements:
+                cur.execute(ddl)
+            conn.commit()
+        self._monitored_column_meta_ready = True
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         if int(tenant_id) <= 0:
@@ -1875,8 +1893,17 @@ class PostgresMCPRepository(MCPRepository):
         }
 
     def list_monitored_columns(self, tenant_id: int, schema_name: str, table_name: str) -> list[dict[str, Any]]:
+        self._ensure_monitored_column_meta()
         sql = f"""
-            SELECT mc.column_name, mc.data_type, mc.classification, mc.description_text
+            SELECT
+                mc.column_name,
+                mc.data_type,
+                mc.classification,
+                mc.description_text,
+                mc.source_description_text,
+                mc.llm_description_suggested,
+                mc.llm_classification_suggested,
+                mc.llm_description_confirmed
             FROM {self.schema}.monitored_column mc
             JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
             WHERE mt.tenant_id = %(tenant_id)s
@@ -1897,6 +1924,7 @@ class PostgresMCPRepository(MCPRepository):
         tenant_id: int,
         monitored_table_id: int,
     ) -> list[dict[str, Any]]:
+        self._ensure_monitored_column_meta()
         sql = f"""
             SELECT
                 mc.id,
@@ -1904,7 +1932,11 @@ class PostgresMCPRepository(MCPRepository):
                 mc.column_name,
                 mc.data_type,
                 mc.classification,
-                mc.description_text
+                mc.description_text,
+                mc.source_description_text,
+                mc.llm_description_suggested,
+                mc.llm_classification_suggested,
+                mc.llm_description_confirmed
             FROM {self.schema}.monitored_column mc
             JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
             WHERE mt.tenant_id = %(tenant_id)s
@@ -1932,6 +1964,7 @@ class PostgresMCPRepository(MCPRepository):
         classification: str | None = None,
         description_text: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_monitored_column_meta()
         table_check_sql = f"""
             SELECT id
             FROM {self.schema}.monitored_table

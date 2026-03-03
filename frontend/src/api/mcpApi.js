@@ -273,6 +273,15 @@ export async function enrichMonitoredColumns(payload) {
   return parseResponse(response);
 }
 
+export async function confirmMonitoredColumnDescription(payload) {
+  const response = await fetch("/api/onboarding/monitored-columns/confirm-description", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function createIncident(payload) {
   const response = await fetch("/api/incidents", {
     method: "POST",

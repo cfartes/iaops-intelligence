@@ -277,6 +277,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/onboarding/monitored-columns/enrich":
             self._handle_onboarding_monitored_columns_enrich()
             return
+        if parsed.path == "/api/onboarding/monitored-columns/confirm-description":
+            self._handle_onboarding_monitored_column_confirm_description()
+            return
         if parsed.path == "/api/onboarding/monitored-columns/delete":
             self._handle_onboarding_monitored_column_delete()
             return
@@ -598,6 +601,74 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
         }
         self._dispatch_mcp(payload)
+
+    def _handle_onboarding_monitored_column_confirm_description(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "inventory.confirm_column_description",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_db_enabled():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.confirm_column_description",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "db_unavailable", "message": "Banco nao configurado para confirmar descricao."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        monitored_column_id = body.get("monitored_column_id")
+        if monitored_column_id is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.confirm_column_description",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "monitored_column_id obrigatorio"},
+                },
+            )
+            return
+        try:
+            result = self._db_confirm_monitored_column_description(
+                tenant_id=int(context["tenant_id"]),
+                user_id=int(context["user_id"]),
+                monitored_column_id=int(monitored_column_id),
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "inventory.confirm_column_description",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": result,
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.confirm_column_description",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "confirm_error", "message": str(exc)},
+                },
+            )
 
     def _handle_onboarding_monitored_columns_enrich(self) -> None:
         context = self._request_context()
@@ -5838,6 +5909,24 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 rows = cur.fetchall()
         return [dict(zip(cols, row)) for row in rows]
 
+    def _db_ensure_monitored_column_metadata_fields(self) -> None:
+        dsn = self._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = self.signup_schema
+        ddls = [
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS source_description_text TEXT",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_suggested TEXT",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_classification_suggested TEXT",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_at TIMESTAMPTZ",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_by_user_id BIGINT",
+        ]
+        with connect(dsn) as conn, conn.cursor() as cur:
+            for ddl in ddls:
+                cur.execute(ddl)
+            conn.commit()
+
     def _db_enrich_monitored_columns(
         self,
         *,
@@ -5854,24 +5943,40 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not dsn or connect is None:
             raise ValueError("Banco indisponivel para enriquecimento.")
         schema = self.signup_schema
+        self._db_ensure_monitored_column_metadata_fields()
         upsert_sql = f"""
             INSERT INTO {schema}.monitored_column (
                 tenant_id,
                 monitored_table_id,
                 column_name,
-                data_type
+                data_type,
+                source_description_text
             )
             VALUES (
                 %(tenant_id)s,
                 %(monitored_table_id)s,
                 %(column_name)s,
-                %(data_type)s
+                %(data_type)s,
+                %(source_description_text)s
             )
             ON CONFLICT (monitored_table_id, column_name)
-            DO UPDATE SET data_type = COALESCE(EXCLUDED.data_type, {schema}.monitored_column.data_type)
+            DO UPDATE SET
+                data_type = COALESCE(EXCLUDED.data_type, {schema}.monitored_column.data_type),
+                source_description_text = COALESCE(
+                    NULLIF(TRIM(EXCLUDED.source_description_text), ''),
+                    {schema}.monitored_column.source_description_text
+                )
         """
         fetch_sql = f"""
-            SELECT mc.column_name, mc.data_type, mc.classification, mc.description_text
+            SELECT
+                mc.column_name,
+                mc.data_type,
+                mc.classification,
+                mc.description_text,
+                mc.source_description_text,
+                mc.llm_description_suggested,
+                mc.llm_classification_suggested,
+                mc.llm_description_confirmed
             FROM {schema}.monitored_column mc
             JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
             WHERE mt.tenant_id = %(tenant_id)s
@@ -5880,13 +5985,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         """
         update_sql = f"""
             UPDATE {schema}.monitored_column mc
-               SET classification = CASE
-                     WHEN COALESCE(NULLIF(TRIM(mc.classification), ''), '') = '' THEN %(classification)s
-                     ELSE mc.classification
-                   END,
-                   description_text = CASE
-                     WHEN COALESCE(NULLIF(TRIM(mc.description_text), ''), '') = '' THEN %(description_text)s
-                     ELSE mc.description_text
+               SET llm_classification_suggested = %(classification)s,
+                   llm_description_suggested = %(description_text)s,
+                   llm_description_confirmed = CASE
+                       WHEN COALESCE(NULLIF(TRIM(mc.description_text), ''), '') <> ''
+                            AND COALESCE(NULLIF(TRIM(mc.description_text), ''), '') = COALESCE(NULLIF(TRIM(%(description_text)s), ''), '')
+                       THEN TRUE
+                       ELSE FALSE
                    END
             FROM {schema}.monitored_table mt
             WHERE mc.monitored_table_id = mt.id
@@ -5906,6 +6011,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "monitored_table_id": monitored_table_id,
                         "column_name": col_name,
                         "data_type": str(col.get("data_type") or "").strip() or None,
+                        "source_description_text": str(col.get("description_text") or "").strip() or None,
                     },
                 )
             cur.execute(fetch_sql, {"tenant_id": tenant_id, "monitored_table_id": monitored_table_id})
@@ -5916,6 +6022,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "data_type": str(item[1] or ""),
                     "classification": str(item[2] or "").strip() or None,
                     "description_text": str(item[3] or "").strip() or None,
+                    "source_description_text": str(item[4] or "").strip() or None,
+                    "llm_description_suggested": str(item[5] or "").strip() or None,
+                    "llm_classification_suggested": str(item[6] or "").strip() or None,
+                    "llm_description_confirmed": bool(item[7]),
                 }
                 for item in rows
             ]
@@ -5935,9 +6045,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 proposed = suggestions.get(col_name.lower()) or {}
                 classification = str(proposed.get("classification") or "").strip() or None
                 description_text = str(proposed.get("description_text") or "").strip() or None
-                if (current_class and current_class.strip()) and (current_desc and current_desc.strip()):
-                    continue
                 if not classification and not description_text:
+                    continue
+                if (
+                    (item["llm_classification_suggested"] or "") == (classification or "")
+                    and (item["llm_description_suggested"] or "") == (description_text or "")
+                ):
                     continue
                 cur.execute(
                     update_sql,
@@ -5951,6 +6064,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 )
                 if cur.rowcount:
                     updated += 1
+                    if not current_class and classification:
+                        current_class = classification
+                    if not current_desc and item["source_description_text"]:
+                        current_desc = item["source_description_text"]
             conn.commit()
         return {
             "tenant_id": tenant_id,
@@ -5958,6 +6075,64 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "discovered_columns": len(discovered_columns),
             "sample_rows": len(sample_rows),
             "updated_columns": updated,
+        }
+
+    def _db_confirm_monitored_column_description(self, *, tenant_id: int, user_id: int, monitored_column_id: int) -> dict[str, object]:
+        dsn = self._get_db_dsn()
+        if not dsn or connect is None:
+            raise ValueError("Banco indisponivel para confirmar descricao.")
+        schema = self.signup_schema
+        self._db_ensure_monitored_column_metadata_fields()
+        select_sql = f"""
+            SELECT
+                mc.id,
+                mc.monitored_table_id,
+                mc.column_name,
+                mc.description_text,
+                mc.llm_description_suggested,
+                mc.llm_classification_suggested
+            FROM {schema}.monitored_column mc
+            JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mt.tenant_id = %(tenant_id)s
+              AND mc.id = %(monitored_column_id)s
+            LIMIT 1
+        """
+        update_sql = f"""
+            UPDATE {schema}.monitored_column
+               SET description_text = %(description_text)s,
+                   classification = CASE
+                       WHEN COALESCE(NULLIF(TRIM(%(classification)s), ''), '') = '' THEN classification
+                       ELSE %(classification)s
+                   END,
+                   llm_description_confirmed = TRUE,
+                   llm_confirmed_at = NOW(),
+                   llm_confirmed_by_user_id = %(user_id)s
+             WHERE id = %(monitored_column_id)s
+        """
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(select_sql, {"tenant_id": tenant_id, "monitored_column_id": monitored_column_id})
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("coluna monitorada nao encontrada para o tenant")
+            llm_description = str(row[4] or "").strip()
+            llm_classification = str(row[5] or "").strip()
+            if not llm_description:
+                raise ValueError("nao ha descricao sugerida pela LLM para confirmar")
+            cur.execute(
+                update_sql,
+                {
+                    "monitored_column_id": monitored_column_id,
+                    "description_text": llm_description,
+                    "classification": llm_classification or None,
+                    "user_id": user_id,
+                },
+            )
+            conn.commit()
+        return {
+            "monitored_column_id": monitored_column_id,
+            "description_text": llm_description,
+            "classification": llm_classification or None,
+            "confirmed": True,
         }
 
     def _suggest_column_enrichment(
@@ -6195,16 +6370,39 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 dsn += f" password={password}"
         schema = schema_name or str(profile.get("schema") or "public").strip()
         sql = """
-            SELECT column_name, data_type, ordinal_position
-            FROM information_schema.columns
-            WHERE table_schema = %s
-              AND table_name = %s
-            ORDER BY ordinal_position
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.ordinal_position,
+                pgd.description
+            FROM information_schema.columns c
+            LEFT JOIN pg_catalog.pg_namespace n
+              ON n.nspname = c.table_schema
+            LEFT JOIN pg_catalog.pg_class cls
+              ON cls.relname = c.table_name
+             AND cls.relnamespace = n.oid
+            LEFT JOIN pg_catalog.pg_attribute a
+              ON a.attrelid = cls.oid
+             AND a.attname = c.column_name
+            LEFT JOIN pg_catalog.pg_description pgd
+              ON pgd.objoid = cls.oid
+             AND pgd.objsubid = a.attnum
+            WHERE c.table_schema = %s
+              AND c.table_name = %s
+            ORDER BY c.ordinal_position
         """
         with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
             cur.execute(sql, [schema, table_name])
             rows = cur.fetchall()
-        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
+        return [
+            {
+                "column_name": str(row[0]),
+                "data_type": str(row[1]),
+                "ordinal_position": int(row[2]),
+                "description_text": str(row[3] or "").strip() or None,
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _test_sqlserver_connection(profile: dict) -> dict:
@@ -6320,17 +6518,33 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
         schema = schema_name or "dbo"
         sql = """
-            SELECT COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = ?
-              AND TABLE_NAME = ?
-            ORDER BY ORDINAL_POSITION
+            SELECT
+                c.COLUMN_NAME,
+                c.DATA_TYPE,
+                c.ORDINAL_POSITION,
+                CAST(ep.value AS NVARCHAR(4000)) AS description_text
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            LEFT JOIN sys.extended_properties ep
+              ON ep.major_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
+             AND ep.minor_id = c.ORDINAL_POSITION
+             AND ep.name = 'MS_Description'
+            WHERE c.TABLE_SCHEMA = ?
+              AND c.TABLE_NAME = ?
+            ORDER BY c.ORDINAL_POSITION
         """
         with pyodbc.connect(conn_str, timeout=timeout) as conn:
             cur = conn.cursor()
             cur.execute(sql, (schema, table_name))
             rows = cur.fetchall()
-        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
+        return [
+            {
+                "column_name": str(row[0]),
+                "data_type": str(row[1]),
+                "ordinal_position": int(row[2]),
+                "description_text": str(row[3] or "").strip() or None,
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _test_mysql_connection(profile: dict) -> dict:
@@ -6447,7 +6661,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT column_name, data_type, ordinal_position
+                    SELECT column_name, data_type, ordinal_position, column_comment
                     FROM information_schema.columns
                     WHERE table_schema = %s
                       AND table_name = %s
@@ -6456,7 +6670,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     (schema, table_name),
                 )
                 rows = cur.fetchall()
-        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
+        return [
+            {
+                "column_name": str(row[0]),
+                "data_type": str(row[1]),
+                "ordinal_position": int(row[2]),
+                "description_text": str(row[3] or "").strip() or None,
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _test_oracle_connection(profile: dict) -> dict:
@@ -6560,16 +6782,32 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT column_name, data_type, column_id
-                    FROM all_tab_columns
-                    WHERE owner = :owner
-                      AND table_name = :table_name
-                    ORDER BY column_id
+                    SELECT
+                        c.column_name,
+                        c.data_type,
+                        c.column_id,
+                        cc.comments AS description_text
+                    FROM all_tab_columns c
+                    LEFT JOIN all_col_comments cc
+                      ON cc.owner = c.owner
+                     AND cc.table_name = c.table_name
+                     AND cc.column_name = c.column_name
+                    WHERE c.owner = :owner
+                      AND c.table_name = :table_name
+                    ORDER BY c.column_id
                     """,
                     {"owner": owner, "table_name": table},
                 )
                 rows = cur.fetchall()
-        return [{"column_name": str(row[0]), "data_type": str(row[1]), "ordinal_position": int(row[2])} for row in rows]
+        return [
+            {
+                "column_name": str(row[0]),
+                "data_type": str(row[1]),
+                "ordinal_position": int(row[2]),
+                "description_text": str(row[3] or "").strip() or None,
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _test_bearer_http_connection(*, profile: dict, default_url: str, label: str) -> dict:
