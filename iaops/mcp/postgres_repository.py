@@ -97,6 +97,7 @@ class PostgresMCPRepository(MCPRepository):
         self.dsn = dsn
         self.schema = schema
         self._monitored_column_meta_ready = False
+        self._data_source_rag_meta_ready = False
 
     def _ensure_monitored_column_meta(self) -> None:
         if self._monitored_column_meta_ready:
@@ -114,6 +115,19 @@ class PostgresMCPRepository(MCPRepository):
                 cur.execute(ddl)
             conn.commit()
         self._monitored_column_meta_ready = True
+
+    def _ensure_data_source_rag_meta(self) -> None:
+        if self._data_source_rag_meta_ready:
+            return
+        ddl_statements = [
+            f"ALTER TABLE {self.schema}.data_source ADD COLUMN IF NOT EXISTS rag_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            f"ALTER TABLE {self.schema}.data_source ADD COLUMN IF NOT EXISTS rag_context_text TEXT",
+        ]
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            for ddl in ddl_statements:
+                cur.execute(ddl)
+            conn.commit()
+        self._data_source_rag_meta_ready = True
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         if int(tenant_id) <= 0:
@@ -1137,6 +1151,7 @@ class PostgresMCPRepository(MCPRepository):
         return any(str(item.get("code") or "").strip().lower() == value for item in DEFAULT_SOURCE_CATALOG)
 
     def list_tenant_data_sources(self, tenant_id: int) -> list[dict[str, Any]]:
+        self._ensure_data_source_rag_meta()
         sql = f"""
             SELECT
                 ds.id,
@@ -1145,6 +1160,8 @@ class PostgresMCPRepository(MCPRepository):
                 COALESCE(cat.name, ds.source_type) AS source_name,
                 ds.conn_secret_ref,
                 ds.is_active,
+                ds.rag_enabled,
+                ds.rag_context_text,
                 ds.created_at
             FROM {self.schema}.data_source ds
             LEFT JOIN {self.schema}.data_source_catalog cat
@@ -1164,7 +1181,10 @@ class PostgresMCPRepository(MCPRepository):
         source_type: str,
         conn_secret_ref: str,
         is_active: bool = True,
+        rag_enabled: bool = False,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_data_source_rag_meta()
         check_catalog_sql = f"""
             SELECT code
             FROM {self.schema}.data_source_catalog
@@ -1177,13 +1197,17 @@ class PostgresMCPRepository(MCPRepository):
                 tenant_id,
                 source_type,
                 conn_secret_ref,
-                is_active
+                is_active,
+                rag_enabled,
+                rag_context_text
             )
             VALUES (
                 %(tenant_id)s,
                 %(source_type)s,
                 %(conn_secret_ref)s,
-                %(is_active)s
+                %(is_active)s,
+                %(rag_enabled)s,
+                %(rag_context_text)s
             )
             RETURNING id
         """
@@ -1203,6 +1227,8 @@ class PostgresMCPRepository(MCPRepository):
                     "source_type": source_type,
                     "conn_secret_ref": conn_secret_ref,
                     "is_active": is_active,
+                    "rag_enabled": bool(rag_enabled),
+                    "rag_context_text": str(rag_context_text or "").strip() or None,
                 },
             )
             inserted = cur.fetchone()
@@ -1248,7 +1274,10 @@ class PostgresMCPRepository(MCPRepository):
         *,
         source_type: str,
         conn_secret_ref: str,
+        rag_enabled: bool | None = None,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_data_source_rag_meta()
         check_catalog_sql = f"""
             SELECT code
             FROM {self.schema}.data_source_catalog
@@ -1259,7 +1288,9 @@ class PostgresMCPRepository(MCPRepository):
         update_sql = f"""
             UPDATE {self.schema}.data_source
                SET source_type = %(source_type)s,
-                   conn_secret_ref = %(conn_secret_ref)s
+                   conn_secret_ref = %(conn_secret_ref)s,
+                   rag_enabled = COALESCE(%(rag_enabled)s, rag_enabled),
+                   rag_context_text = %(rag_context_text)s
              WHERE id = %(data_source_id)s
                AND tenant_id = %(tenant_id)s
          RETURNING id
@@ -1280,6 +1311,8 @@ class PostgresMCPRepository(MCPRepository):
                     "data_source_id": data_source_id,
                     "source_type": source_type,
                     "conn_secret_ref": conn_secret_ref,
+                    "rag_enabled": (bool(rag_enabled) if rag_enabled is not None else None),
+                    "rag_context_text": str(rag_context_text or "").strip() or None,
                 },
             )
             row = cur.fetchone()

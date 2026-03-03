@@ -664,6 +664,8 @@ class MCPGateway:
             source_type=source_type,
             conn_secret_ref=conn_secret_ref,
             is_active=is_active,
+            rag_enabled=bool(tool_input.get("rag_enabled", False)),
+            rag_context_text=(str(tool_input.get("rag_context_text")).strip() if tool_input.get("rag_context_text") is not None else None),
         )
         return {"source": source}
 
@@ -697,6 +699,8 @@ class MCPGateway:
             data_source_id=int(tool_input["data_source_id"]),
             source_type=source_type,
             conn_secret_ref=conn_secret_ref,
+            rag_enabled=(bool(tool_input.get("rag_enabled")) if tool_input.get("rag_enabled") is not None else None),
+            rag_context_text=(str(tool_input.get("rag_context_text")).strip() if tool_input.get("rag_context_text") is not None else None),
         )
         return {"source": source}
 

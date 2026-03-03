@@ -259,6 +259,8 @@ export default function OnboardingPanel({ onSystemMessage }) {
         data_source_id: payload.id,
         source_type: payload.source_type,
         conn_secret_ref: payload.conn_secret_ref,
+        rag_enabled: payload.rag_enabled,
+        rag_context_text: payload.rag_context_text,
       });
       setEditingSource(null);
       setIsModalOpen(false);
@@ -356,6 +358,28 @@ export default function OnboardingPanel({ onSystemMessage }) {
           "Descricao confirmada",
           `Descricao da coluna ${pendingAction.column.column_name} confirmada (${data.confirmed ? "LLM" : "manual"}).`
         );
+      } else if (pendingAction.type === "confirm_all_llm_descriptions") {
+        const targets = monitoredColumns.filter((item) => {
+          const suggested = String(item.llm_description_suggested || "").trim();
+          const confirmed = String(item.description_text || "").trim();
+          return suggested && suggested !== confirmed;
+        });
+        let successCount = 0;
+        for (const column of targets) {
+          try {
+            await confirmMonitoredColumnDescription({ monitored_column_id: column.id });
+            successCount += 1;
+          } catch (_) {
+            // segue com as demais colunas
+          }
+        }
+        onSystemMessage(
+          successCount > 0 ? "success" : "warning",
+          "Confirmacao em lote",
+          successCount > 0
+            ? `${successCount} descricao(oes) da LLM confirmada(s) para a tabela selecionada.`
+            : "Nenhuma descricao elegivel para confirmacao."
+        );
       }
       setPendingAction(null);
       await loadTenantSources();
@@ -425,6 +449,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                   <th>ID</th>
                   <th>Fonte</th>
                   <th>Tipo</th>
+                  <th>RAG</th>
                   <th>Secret Ref</th>
                   <th>Status</th>
                   <th>Acoes</th>
@@ -436,6 +461,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
                     <td>{item.id}</td>
                     <td>{item.source_name || item.source_type}</td>
                     <td>{item.source_type}</td>
+                    <td>{item.rag_enabled ? "Ativo" : "Inativo"}</td>
                     <td>{item.conn_secret_ref}</td>
                     <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
                     <td>
@@ -558,6 +584,21 @@ export default function OnboardingPanel({ onSystemMessage }) {
         <div className="section-header">
           <h3>{tUi("onboarding.columns.title", "Colunas monitoradas por tabela")}</h3>
           <div className="chip-row">
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              onClick={() =>
+                setPendingAction({
+                  type: "confirm_all_llm_descriptions",
+                  title: "Confirmar todas as descricoes LLM",
+                  message: "Aplicar todas as descricoes sugeridas pela LLM para a tabela selecionada?",
+                  confirmLabel: "Confirmar todas",
+                })
+              }
+              disabled={!monitoredColumns.some((item) => String(item.llm_description_suggested || "").trim())}
+            >
+              Confirmar todas LLM
+            </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns(undefined, { forceSync: true })}>
               {discoveringColumns ? "Sincronizando..." : "Sincronizar colunas"}
             </button>

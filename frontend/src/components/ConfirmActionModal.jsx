@@ -1,7 +1,19 @@
+import { useEffect } from "react";
+import { createPortal } from "react-dom";
+
 export default function ConfirmActionModal({ open, title, message, confirmLabel, onConfirm, onClose, loading }) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [open]);
+
   if (!open) return null;
 
-  return (
+  const node = (
     <div className="modal-overlay" role="dialog" aria-modal="true">
       <div className="modal-card form-modal">
         <header className="modal-header">
@@ -21,4 +33,6 @@ export default function ConfirmActionModal({ open, title, message, confirmLabel,
       </div>
     </div>
   );
+
+  return createPortal(node, document.body);
 }

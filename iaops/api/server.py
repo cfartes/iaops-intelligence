@@ -428,6 +428,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "source_type": body.get("source_type"),
                 "conn_secret_ref": body.get("conn_secret_ref"),
                 "is_active": body.get("is_active", True),
+                "rag_enabled": bool(body.get("rag_enabled", False)),
+                "rag_context_text": body.get("rag_context_text"),
             },
         }
         self._dispatch_mcp(payload)
@@ -453,6 +455,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "data_source_id": body.get("data_source_id"),
                 "source_type": body.get("source_type"),
                 "conn_secret_ref": body.get("conn_secret_ref"),
+                "rag_enabled": body.get("rag_enabled"),
+                "rag_context_text": body.get("rag_context_text"),
             },
         }
         self._dispatch_mcp(payload)
@@ -4393,6 +4397,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _build_rag_context(self, context: dict, question_text: str = "") -> dict:
         semantic_docs: list[dict] = []
+        data_source_rag: list[dict] = []
         try:
             semantic_docs = search_rag_documents(
                 tenant_id=int(context.get("tenant_id") or 0),
@@ -4401,6 +4406,29 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
         except Exception:
             semantic_docs = []
+        source_result = self._call_mcp(
+            {
+                "context": context,
+                "tool": "source.list_tenant",
+                "input": {},
+            }
+        )
+        if source_result.get("status") == "success":
+            for src in ((source_result.get("data") or {}).get("sources") or []):
+                if not bool(src.get("rag_enabled")):
+                    continue
+                rag_text = str(src.get("rag_context_text") or "").strip()
+                if not rag_text:
+                    continue
+                data_source_rag.append(
+                    {
+                        "data_source_id": src.get("id"),
+                        "source_name": src.get("source_name") or src.get("source_type"),
+                        "source_type": src.get("source_type"),
+                        "context_text": rag_text,
+                    }
+                )
+        data_source_rag = data_source_rag[:6]
         table_result = self._call_mcp(
             {
                 "context": context,
@@ -4409,7 +4437,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             }
         )
         if table_result["status"] != "success":
-            return {"tables": [], "columns": {}}
+            return {"tables": [], "columns": {}, "relationships": [], "semantic_docs": semantic_docs, "data_source_rag": data_source_rag}
         tables = (table_result.get("data") or {}).get("tables") or []
         tables = tables[:12]
         columns_by_table: dict[str, list[dict]] = {}
@@ -4429,7 +4457,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             key = f"{table.get('schema_name')}.{table.get('table_name')}"
             columns_by_table[key] = (column_result.get("data") or {}).get("columns") or []
         relationships = self._infer_table_relationships(tables, columns_by_table)
-        return {"tables": tables, "columns": columns_by_table, "relationships": relationships, "semantic_docs": semantic_docs}
+        return {
+            "tables": tables,
+            "columns": columns_by_table,
+            "relationships": relationships,
+            "semantic_docs": semantic_docs,
+            "data_source_rag": data_source_rag,
+        }
 
     @staticmethod
     def _infer_table_relationships(tables: list[dict], columns_by_table: dict[str, list[dict]]) -> list[dict]:
@@ -4548,6 +4582,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "score": item.get("score"),
                 }
                 for item in (rag.get("semantic_docs") or [])[:8]
+            ],
+            "data_source_rag": [
+                {
+                    "data_source_id": item.get("data_source_id"),
+                    "source_name": item.get("source_name"),
+                    "source_type": item.get("source_type"),
+                    "context_text": item.get("context_text"),
+                }
+                for item in (rag.get("data_source_rag") or [])[:6]
             ],
             "allowed_schemas_hint": ["public", "analytics", "iaops_gov"],
         }
@@ -6036,6 +6079,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 columns=existing,
                 sample_rows=sample_rows,
                 context=context,
+                language_code=self._resolve_language_code(context),
             )
             updated = 0
             for item in existing:
@@ -6144,7 +6188,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         columns: list[dict[str, object]],
         sample_rows: list[dict[str, object]],
         context: dict,
+        language_code: str = "pt-BR",
     ) -> dict[str, dict[str, str]]:
+        columns_index = {
+            str(col.get("column_name") or "").strip().lower(): col
+            for col in columns
+            if str(col.get("column_name") or "").strip()
+        }
         llm_map = self._suggest_column_enrichment_with_llm(
             source_type=source_type,
             schema_name=schema_name,
@@ -6152,8 +6202,35 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             columns=columns,
             sample_rows=sample_rows,
             context=context,
+            language_code=language_code,
         )
         if llm_map:
+            for key, item in llm_map.items():
+                col_meta = columns_index.get(str(key or "").strip().lower()) or {}
+                col_name = str(col_meta.get("column_name") or key or "").strip()
+                classification = str(item.get("classification") or "").strip().lower() or "attribute"
+                desc = str(item.get("description_text") or "").strip()
+                source_desc = str(col_meta.get("source_description_text") or "").strip()
+                if not desc and source_desc:
+                    desc = source_desc
+                if (not desc) or self._is_generic_column_description(desc, column_name=col_name, schema_name=schema_name, table_name=table_name):
+                    desc = self._build_contextual_column_description(
+                        column_name=col_name,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        classification=classification,
+                        data_type=str(col_meta.get("data_type") or ""),
+                        language_code=language_code,
+                    )
+                desc = self._normalize_business_description(
+                    description_text=desc,
+                    column_name=col_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    language_code=language_code,
+                )
+                item["classification"] = classification
+                item["description_text"] = desc
             return llm_map
         result: dict[str, dict[str, str]] = {}
         for col in columns:
@@ -6175,12 +6252,307 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 classification = "temporal"
             elif "int" in data_type or "decimal" in data_type or "numeric" in data_type:
                 classification = "measure"
-            description_text = f"Campo {name} da tabela {schema_name}.{table_name}."
+            source_desc = str(col.get("source_description_text") or "").strip()
+            description_text = source_desc or self._build_contextual_column_description(
+                column_name=name,
+                schema_name=schema_name,
+                table_name=table_name,
+                classification=classification,
+                data_type=data_type,
+                language_code=language_code,
+            )
+            description_text = self._normalize_business_description(
+                description_text=description_text,
+                column_name=name,
+                schema_name=schema_name,
+                table_name=table_name,
+                language_code=language_code,
+            )
             result[lower] = {
                 "classification": classification,
                 "description_text": description_text,
             }
         return result
+
+    @staticmethod
+    def _is_generic_column_description(description_text: str, *, column_name: str, schema_name: str, table_name: str) -> bool:
+        desc = str(description_text or "").strip().lower()
+        col = str(column_name or "").strip().lower()
+        schema = str(schema_name or "").strip().lower()
+        table = str(table_name or "").strip().lower()
+        if not desc:
+            return True
+        if desc.startswith("campo ") or desc.startswith("coluna "):
+            if " da tabela " in desc:
+                return True
+        if desc.startswith("field ") and " table " in desc:
+            return True
+        if col and desc in {
+            f"campo {col}.",
+            f"campo {col} da tabela {table}.",
+            f"campo {col} da tabela {schema}.{table}.",
+            f"coluna {col}.",
+            f"coluna {col} da tabela {table}.",
+            f"coluna {col} da tabela {schema}.{table}.",
+            f"field {col}.",
+            f"field {col} from table {table}.",
+            f"field {col} from table {schema}.{table}.",
+        }:
+            return True
+        return False
+
+    @staticmethod
+    def _build_contextual_column_description(
+        *,
+        column_name: str,
+        schema_name: str,
+        table_name: str,
+        classification: str,
+        data_type: str,
+        language_code: str = "pt-BR",
+    ) -> str:
+        col = str(column_name or "").strip().lower()
+        schema = str(schema_name or "").strip().lower()
+        table = str(table_name or "").strip().lower()
+        data_t = str(data_type or "").strip().lower()
+        lang = IAOpsAPIHandler._language_bucket(language_code)
+
+        if col == "rental_date":
+            if lang == "en":
+                return "Rental date"
+            if lang == "es":
+                return "Fecha de alquiler"
+            return "Data do aluguel"
+        if col == "return_date":
+            if lang == "en":
+                return "Return date"
+            if lang == "es":
+                return "Fecha de devolucion"
+            return "Data da devolucao"
+        if any(token in col for token in ["amount", "valor"]) and "payment" in table:
+            if lang == "en":
+                return "Amount received"
+            if lang == "es":
+                return "Valor recibido"
+            return "Valor recebido"
+        if col == "payment_date":
+            if lang == "en":
+                return "Payment date"
+            if lang == "es":
+                return "Fecha del pago"
+            return "Data do pagamento"
+        if col in {"last_update", "updated_at", "update_date"}:
+            if "time" in data_t or "timestamp" in data_t:
+                if lang == "en":
+                    return "Last update date and time"
+                if lang == "es":
+                    return "Fecha y hora de la ultima actualizacion"
+                return "Data e hora da ultima atualizacao"
+            if lang == "en":
+                return "Last update date"
+            if lang == "es":
+                return "Fecha de la ultima actualizacion"
+            return "Data da ultima atualizacao"
+        if col in {"customer_id", "id_customer"}:
+            if lang == "en":
+                return "Customer code"
+            if lang == "es":
+                return "Codigo del cliente"
+            return "Codigo do cliente"
+        if col.endswith("_id"):
+            entity = col[: -len("_id")].replace("_", " ").strip()
+            if entity:
+                label, prep = IAOpsAPIHandler._entity_label(entity, language_code=language_code)
+                if IAOpsAPIHandler._is_likely_foreign_key(table_name=table, column_name=col):
+                    if lang == "en":
+                        return f"{label} code (FK to table {schema}.{entity})"
+                    if lang == "es":
+                        return f"Codigo {prep} {label} (FK de la tabla {schema}.{entity})"
+                    return f"Codigo {prep} {label} (FK da tabela {schema}.{entity})"
+                if lang == "en":
+                    return f"{label} code"
+                return f"Codigo {prep} {label}"
+            if lang == "en":
+                return "Identifier code"
+            if lang == "es":
+                return "Codigo identificador"
+            return "Codigo identificador"
+        if any(token in col for token in ["email", "mail"]):
+            if lang == "en":
+                return "Contact e-mail"
+            if lang == "es":
+                return "Correo de contacto"
+            return "E-mail de contato"
+        if any(token in col for token in ["phone", "telefone", "celular"]):
+            if lang == "en":
+                return "Contact phone"
+            if lang == "es":
+                return "Telefono de contacto"
+            return "Telefone de contato"
+        if "date" in col:
+            if lang == "en":
+                return "Event date"
+            if lang == "es":
+                return "Fecha del evento"
+            return "Data do evento"
+        if "time" in col:
+            if lang == "en":
+                return "Event time"
+            if lang == "es":
+                return "Hora del evento"
+            return "Horario do evento"
+        if classification == "financial":
+            if lang == "en":
+                return "Financial amount"
+            if lang == "es":
+                return "Valor financiero"
+            return "Valor financeiro"
+        if classification == "identifier":
+            if lang == "en":
+                return "Identifier code"
+            if lang == "es":
+                return "Codigo identificador"
+            return "Codigo identificador"
+        if classification == "temporal":
+            if lang == "en":
+                return "Reference date"
+            if lang == "es":
+                return "Fecha de referencia"
+            return "Data de referencia"
+        readable = col.replace("_", " ").strip()
+        if readable:
+            if lang == "en":
+                return f"{readable} information"
+            if lang == "es":
+                return f"Informacion de {readable}"
+            return f"Informacao de {readable}"
+        if lang == "en":
+            return "Field information"
+        if lang == "es":
+            return "Informacion del campo"
+        return "Informacao do campo"
+
+    @staticmethod
+    def _is_likely_foreign_key(*, table_name: str, column_name: str) -> bool:
+        table = str(table_name or "").strip().lower()
+        col = str(column_name or "").strip().lower()
+        if not col.endswith("_id") or col == "id":
+            return False
+        base_table = table[:-1] if table.endswith("s") else table
+        return col != f"{base_table}_id"
+
+    @staticmethod
+    def _entity_label(entity_raw: str, *, language_code: str = "pt-BR") -> tuple[str, str]:
+        entity = str(entity_raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+        lang = IAOpsAPIHandler._language_bucket(language_code)
+        mapping_pt = {
+            "film": ("filme", "do"),
+            "store": ("loja", "da"),
+            "inventory": ("inventario", "do"),
+            "customer": ("cliente", "do"),
+            "staff": ("funcionario", "do"),
+            "rental": ("locacao", "da"),
+            "payment": ("pagamento", "do"),
+            "actor": ("ator", "do"),
+            "category": ("categoria", "da"),
+            "city": ("cidade", "da"),
+            "country": ("pais", "do"),
+            "language": ("idioma", "do"),
+            "address": ("endereco", "do"),
+        }
+        mapping_es = {
+            "film": ("pelicula", "del"),
+            "store": ("tienda", "de la"),
+            "inventory": ("inventario", "del"),
+            "customer": ("cliente", "del"),
+            "staff": ("empleado", "del"),
+            "rental": ("alquiler", "del"),
+            "payment": ("pago", "del"),
+            "actor": ("actor", "del"),
+            "category": ("categoria", "de la"),
+            "city": ("ciudad", "de la"),
+            "country": ("pais", "del"),
+            "language": ("idioma", "del"),
+            "address": ("direccion", "de la"),
+        }
+        mapping_en = {
+            "film": ("film", "of"),
+            "store": ("store", "of"),
+            "inventory": ("inventory", "of"),
+            "customer": ("customer", "of"),
+            "staff": ("staff", "of"),
+            "rental": ("rental", "of"),
+            "payment": ("payment", "of"),
+            "actor": ("actor", "of"),
+            "category": ("category", "of"),
+            "city": ("city", "of"),
+            "country": ("country", "of"),
+            "language": ("language", "of"),
+            "address": ("address", "of"),
+        }
+        mapping = mapping_pt if lang == "pt" else (mapping_es if lang == "es" else mapping_en)
+        if entity in mapping:
+            return mapping[entity]
+        label = entity.replace("_", " ")
+        if lang == "en":
+            prep = "of"
+        elif lang == "es":
+            prep = "de la" if label.endswith("a") else "del"
+        else:
+            prep = "da" if label.endswith("a") else "do"
+        return label, prep
+
+    @staticmethod
+    def _normalize_business_description(
+        *,
+        description_text: str,
+        column_name: str,
+        schema_name: str,
+        table_name: str,
+        language_code: str = "pt-BR",
+    ) -> str:
+        desc = str(description_text or "").strip()
+        col = str(column_name or "").strip().lower()
+        lang = IAOpsAPIHandler._language_bucket(language_code)
+        if not desc:
+            return desc
+        match = re.match(r"^(codigo de|code of|code for) ([a-zA-Z0-9_ ]+)\.?$", desc.strip(), re.IGNORECASE)
+        if match:
+            entity = str(match.group(2) or "").strip().lower().replace(" ", "_")
+            label, prep = IAOpsAPIHandler._entity_label(entity, language_code=language_code)
+            if lang == "en":
+                desc = f"{label} code"
+            else:
+                desc = f"Codigo {prep} {label}"
+        if col.endswith("_id"):
+            entity = col[: -len("_id")]
+            label, prep = IAOpsAPIHandler._entity_label(entity, language_code=language_code)
+            if IAOpsAPIHandler._is_likely_foreign_key(table_name=table_name, column_name=col):
+                fk_ref = f"{schema_name}.{entity}"
+                if lang == "en":
+                    if "fk to table" not in desc.lower():
+                        desc = f"{label} code (FK to table {fk_ref})"
+                elif lang == "es":
+                    if "fk de la tabla" not in desc.lower():
+                        desc = f"Codigo {prep} {label} (FK de la tabla {fk_ref})"
+                else:
+                    if "fk da tabela" not in desc.lower():
+                        desc = f"Codigo {prep} {label} (FK da tabela {fk_ref})"
+            else:
+                if lang == "en":
+                    desc = f"{label} code"
+                else:
+                    desc = f"Codigo {prep} {label}"
+        return desc
+
+    @staticmethod
+    def _language_bucket(language_code: str | None) -> str:
+        code = str(language_code or "pt-BR").strip().lower()
+        if code.startswith("en"):
+            return "en"
+        if code.startswith("es"):
+            return "es"
+        return "pt"
 
     def _suggest_column_enrichment_with_llm(
         self,
@@ -6191,6 +6563,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         columns: list[dict[str, object]],
         sample_rows: list[dict[str, object]],
         context: dict,
+        language_code: str = "pt-BR",
     ) -> dict[str, dict[str, str]]:
         try:
             cfg_result = self._call_mcp(
@@ -6229,7 +6602,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 sample_by_col[col_name] = vals
             payload = {
                 "task": "metadata_enrichment",
-                "instructions": "Classifique e descreva colunas de dados. Responda APENAS JSON no formato {'columns':[{'column_name':'','classification':'','description_text':''}]}.",
+                "instructions": (
+                    "Classifique e descreva colunas de dados em linguagem de negocio clara, evitando frases genericas. "
+                    f"Responda sempre no idioma {language_code}. "
+                    "Use descricoes curtas e objetivas, como: "
+                    "'amount' na tabela 'payment' -> 'Valor recebido'; "
+                    "'customer_id' -> 'Codigo do cliente'; "
+                    "'payment_date' -> 'Data do pagamento'; "
+                    "'inventory_id' em tabela diferente de 'inventory' -> 'Codigo do inventario (FK da tabela sakila.inventory)'. "
+                    "Responda APENAS JSON no formato {'columns':[{'column_name':'','classification':'','description_text':''}]}."
+                ),
+                "output_language": language_code,
                 "source_type": source_type,
                 "table": {"schema_name": schema_name, "table_name": table_name},
                 "columns": [

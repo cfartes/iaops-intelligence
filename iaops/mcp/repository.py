@@ -275,6 +275,8 @@ class MCPRepository(ABC):
         source_type: str,
         conn_secret_ref: str,
         is_active: bool = True,
+        rag_enabled: bool = False,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -290,6 +292,8 @@ class MCPRepository(ABC):
         *,
         source_type: str,
         conn_secret_ref: str,
+        rag_enabled: bool | None = None,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -575,6 +579,8 @@ class InMemoryMCPRepository(MCPRepository):
                     "source_type": "postgresql",
                     "conn_secret_ref": "secret://tenant-10/postgres/main",
                     "is_active": True,
+                    "rag_enabled": False,
+                    "rag_context_text": None,
                     "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 }
             ]
@@ -1228,6 +1234,8 @@ class InMemoryMCPRepository(MCPRepository):
         source_type: str,
         conn_secret_ref: str,
         is_active: bool = True,
+        rag_enabled: bool = False,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
         source = {
             "id": self._data_source_seq,
@@ -1235,6 +1243,8 @@ class InMemoryMCPRepository(MCPRepository):
             "source_type": source_type,
             "conn_secret_ref": conn_secret_ref,
             "is_active": is_active,
+            "rag_enabled": bool(rag_enabled),
+            "rag_context_text": str(rag_context_text or "").strip() or None,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
         self._data_source_seq += 1
@@ -1256,12 +1266,17 @@ class InMemoryMCPRepository(MCPRepository):
         *,
         source_type: str,
         conn_secret_ref: str,
+        rag_enabled: bool | None = None,
+        rag_context_text: str | None = None,
     ) -> dict[str, Any]:
         rows = self._tenant_data_sources.get(tenant_id, [])
         for row in rows:
             if int(row["id"]) == int(data_source_id):
                 row["source_type"] = source_type
                 row["conn_secret_ref"] = conn_secret_ref
+                if rag_enabled is not None:
+                    row["rag_enabled"] = bool(rag_enabled)
+                row["rag_context_text"] = str(rag_context_text or "").strip() or None
                 return row
         raise ValueError("fonte de dados nao encontrada")
 

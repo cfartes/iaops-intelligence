@@ -3,6 +3,8 @@ import { useEffect, useMemo, useState } from "react";
 const INITIAL_FORM = {
   source_type: "",
   is_active: true,
+  rag_enabled: false,
+  rag_context_text: "",
   profile: {},
 };
 
@@ -151,6 +153,8 @@ export default function DataSourceFormModal({
       setForm({
         source_type: initialData.source_type || sourceCatalog?.[0]?.code || "",
         is_active: Boolean(initialData.is_active),
+        rag_enabled: Boolean(initialData.rag_enabled),
+        rag_context_text: String(initialData.rag_context_text || ""),
         profile: getProfileTemplate(initialData.source_type || sourceCatalog?.[0]?.code || "", parsedSecret),
       });
       return;
@@ -159,6 +163,8 @@ export default function DataSourceFormModal({
     setForm({
       ...INITIAL_FORM,
       source_type: defaultType,
+      rag_enabled: false,
+      rag_context_text: "",
       profile: getProfileTemplate(defaultType),
     });
   }, [open, sourceCatalog, initialData]);
@@ -198,6 +204,8 @@ export default function DataSourceFormModal({
       source_type: form.source_type,
       conn_secret_ref: buildConnSecretRef(),
       is_active: form.is_active,
+      rag_enabled: Boolean(form.rag_enabled),
+      rag_context_text: String(form.rag_context_text || "").trim() || null,
     });
   };
 
@@ -253,6 +261,26 @@ export default function DataSourceFormModal({
               onChange={(e) => setForm((prev) => ({ ...prev, is_active: e.target.checked }))}
             />
             Fonte ativa
+          </label>
+          <label className="checkbox-inline">
+            <input
+              type="checkbox"
+              checked={Boolean(form.rag_enabled)}
+              onChange={(e) => setForm((prev) => ({ ...prev, rag_enabled: e.target.checked }))}
+            />
+            Habilitar contexto RAG para esta fonte
+          </label>
+          <label>
+            Contexto RAG (descricao de tabelas/campos e regras de negocio)
+            <textarea
+              rows={6}
+              value={String(form.rag_context_text || "")}
+              onChange={(e) => setForm((prev) => ({ ...prev, rag_context_text: e.target.value }))}
+              placeholder={
+                "Ex.: payment.amount = valor recebido; rental.return_date = data da devolucao; " +
+                "regra: considerar somente pagamentos concluídos."
+              }
+            />
           </label>
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>
