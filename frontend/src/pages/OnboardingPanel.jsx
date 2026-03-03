@@ -3,11 +3,9 @@ import {
   deleteDataSource,
   discoverDataSourceColumns,
   discoverDataSourceTables,
-  confirmMonitoredColumnDescription,
-  deleteMonitoredColumn,
   deleteMonitoredTable,
   enrichMonitoredColumns,
-  listOnboardingMonitoredColumns,
+  getTenantLimits,
   listOnboardingMonitoredTables,
   listSourceCatalog,
   listTenantDataSources,
@@ -45,6 +43,18 @@ function parseSourceLocation(connSecretRef) {
   return "-";
 }
 
+function translateSourceLimitMessage(rawMessage) {
+  const text = String(rawMessage || "").trim();
+  const normalized = text.toLowerCase();
+  if (normalized.includes("limite de fontes por cliente") || normalized.includes("limite de fontes ativas por cliente")) {
+    return `${tUi("onboarding.limit.sourceClient", "Limite de fontes ativas por cliente atingido no plano atual.")} ${tUi("onboarding.limit.actionHint", "Inative uma fonte existente ou altere o plano para continuar.")}`;
+  }
+  if (normalized.includes("limite de fontes por tenant") || normalized.includes("limite de fontes ativas por tenant")) {
+    return `${tUi("onboarding.limit.sourceTenant", "Limite de fontes ativas por tenant atingido no plano atual.")} ${tUi("onboarding.limit.actionHint", "Inative uma fonte existente ou altere o plano para continuar.")}`;
+  }
+  return text;
+}
+
 export default function OnboardingPanel({ onSystemMessage }) {
   const [sources, setSources] = useState([]);
   const [tenantSources, setTenantSources] = useState([]);
@@ -58,13 +68,10 @@ export default function OnboardingPanel({ onSystemMessage }) {
   const [tablesLoading, setTablesLoading] = useState(false);
   const [isTableModalOpen, setIsTableModalOpen] = useState(false);
   const [tableSaving, setTableSaving] = useState(false);
-  const [monitoredColumns, setMonitoredColumns] = useState([]);
-  const [selectedTableIdForColumns, setSelectedTableIdForColumns] = useState("");
-  const [columnsLoading, setColumnsLoading] = useState(false);
-  const [discoveringColumns, setDiscoveringColumns] = useState(false);
   const [exportingSourceId, setExportingSourceId] = useState(null);
   const [pendingAction, setPendingAction] = useState(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [limits, setLimits] = useState(null);
 
   const loadCatalog = async () => {
     setLoading(true);
@@ -80,9 +87,10 @@ export default function OnboardingPanel({ onSystemMessage }) {
 
   const loadTenantSources = async () => {
     try {
-      const data = await listTenantDataSources();
+      const [data, limitsData] = await Promise.all([listTenantDataSources(), getTenantLimits()]);
       const rows = data.sources || [];
       setTenantSources(rows);
+      setLimits(limitsData?.limits || null);
       if (rows.length === 0) {
         setSelectedSourceIdForTables("");
         setMonitoredTables([]);
@@ -128,12 +136,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
             const refreshed = await listOnboardingMonitoredTables(Number(sourceId));
             const refreshedRows = refreshed.tables || [];
             setMonitoredTables(refreshedRows);
-            if (refreshedRows.length > 0) {
-              const tableExists = refreshedRows.some((item) => String(item.id) === String(selectedTableIdForColumns));
-              if (!selectedTableIdForColumns || !tableExists) {
-                setSelectedTableIdForColumns(String(refreshedRows[0].id));
-              }
-            }
             for (const table of refreshedRows.slice(0, 300)) {
               try {
                 await syncColumnsForTable(table);
@@ -147,15 +149,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
         }
       }
       setMonitoredTables(rows);
-      if (rows.length === 0) {
-        setSelectedTableIdForColumns("");
-        setMonitoredColumns([]);
-        return;
-      }
-      const tableExists = rows.some((item) => String(item.id) === String(selectedTableIdForColumns));
-      if (!selectedTableIdForColumns || !tableExists) {
-        setSelectedTableIdForColumns(String(rows[0].id));
-      }
     } catch (error) {
       onSystemMessage("error", tUi("onboarding.fail.tables", "Erro ao carregar tabelas monitoradas"), error.message);
     } finally {
@@ -205,38 +198,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
     return synced;
   };
 
-  const loadMonitoredColumns = async (tableIdRaw, options = {}) => {
-    const { attemptSync = true, forceSync = false } = options;
-    const tableId = tableIdRaw || selectedTableIdForColumns || undefined;
-    if (!tableId) {
-      setMonitoredColumns([]);
-      return;
-    }
-    setColumnsLoading(true);
-    try {
-      const data = await listOnboardingMonitoredColumns(Number(tableId));
-      let rows = data.columns || [];
-      const table = monitoredTables.find((item) => String(item.id) === String(tableId));
-      if (table && (forceSync || (attemptSync && rows.length === 0))) {
-        setDiscoveringColumns(true);
-        try {
-          await syncColumnsForTable(table);
-          const refreshed = await listOnboardingMonitoredColumns(Number(tableId));
-          rows = refreshed.columns || [];
-        } catch (error) {
-          onSystemMessage("warning", "Colunas nao detectadas automaticamente", error.message);
-        } finally {
-          setDiscoveringColumns(false);
-        }
-      }
-      setMonitoredColumns(rows);
-    } catch (error) {
-      onSystemMessage("error", tUi("onboarding.fail.columns", "Erro ao carregar colunas monitoradas"), error.message);
-    } finally {
-      setColumnsLoading(false);
-    }
-  };
-
   const handleRegisterSource = async (payload) => {
     setRegistering(true);
     try {
@@ -249,7 +210,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
       );
       await loadTenantSources();
     } catch (error) {
-      onSystemMessage("error", tUi("onboarding.fail.sourceCreate", "Falha no cadastro da fonte"), error.message);
+      onSystemMessage("error", tUi("onboarding.fail.sourceCreate", "Falha no cadastro da fonte"), translateSourceLimitMessage(error.message));
     } finally {
       setRegistering(false);
     }
@@ -294,7 +255,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
       );
       await loadTenantSources();
     } catch (error) {
-      onSystemMessage("error", tUi("onboarding.fail.sourceUpdate", "Falha na edicao da fonte"), error.message);
+      onSystemMessage("error", tUi("onboarding.fail.sourceUpdate", "Falha na edicao da fonte"), translateSourceLimitMessage(error.message));
     } finally {
       setRegistering(false);
     }
@@ -322,15 +283,21 @@ export default function OnboardingPanel({ onSystemMessage }) {
       });
       const tables = Array.isArray(discovered?.tables) ? discovered.tables : [];
       const lines = [];
-      lines.push(`# Base RAG - ${source.source_name || source.source_type} (#${source.id})`);
-      lines.push(`source_type=${source.source_type}`);
-      lines.push(`generated_at=${new Date().toISOString()}`);
+      lines.push("# Modelo RAG IAOps (texto amigavel)");
+      lines.push(`# Fonte: ${source.source_name || source.source_type} (#${source.id})`);
+      lines.push(`Gerado em: ${new Date().toISOString()}`);
       lines.push("");
       for (const table of tables) {
         const schemaName = String(table.schema_name || "public").trim();
         const tableName = String(table.table_name || "").trim();
         if (!tableName) continue;
-        lines.push(`## ${schemaName}.${tableName}`);
+        lines.push(`## Tabela: ${schemaName}.${tableName}`);
+        lines.push(`Nome amigavel: ${tableName}`);
+        lines.push("Descricao: -");
+        lines.push("");
+        lines.push("### Campos");
+        lines.push("| Campo tecnico | Nome amigavel | Tipo | Sinonimos |");
+        lines.push("| --- | --- | --- | --- |");
         try {
           const colsResp = await discoverDataSourceColumns({
             source_type: source.source_type,
@@ -343,18 +310,23 @@ export default function OnboardingPanel({ onSystemMessage }) {
             const colName = String(col.column_name || "").trim();
             const dataType = String(col.data_type || "").trim() || "unknown";
             if (!colName) continue;
-            lines.push(`- ${colName} (${dataType})`);
+            lines.push(`| ${colName} | ${colName} | ${dataType} | - |`);
           }
         } catch (_) {
-          lines.push("- erro_ao_carregar_colunas");
+          lines.push("| erro_ao_carregar_colunas | erro_ao_carregar_colunas | unknown | - |");
         }
+        lines.push("");
+        lines.push("### Relacionamentos");
+        lines.push("| Tabela destino | Condicao de join | Descricao |");
+        lines.push("| --- | --- | --- |");
+        lines.push("| - | - | - |");
         lines.push("");
       }
       const safeSource = String(source.source_name || source.source_type || "fonte")
         .toLowerCase()
         .replace(/[^a-z0-9_-]+/g, "_");
-      downloadTextFile(`rag_metadata_${safeSource}_${source.id}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
-      onSystemMessage("success", "Exportacao concluida", `Arquivo RAG gerado com ${tables.length} tabela(s).`);
+      downloadTextFile(`modelo_rag_${safeSource}_${source.id}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
+      onSystemMessage("success", "Exportacao concluida", `Modelo RAG textual gerado com ${tables.length} tabela(s).`);
     } catch (error) {
       onSystemMessage("error", "Falha na exportacao RAG", error.message);
     } finally {
@@ -412,6 +384,7 @@ export default function OnboardingPanel({ onSystemMessage }) {
           data_source_id: pendingAction.source.id,
           is_active: pendingAction.nextIsActive,
         });
+        setPendingAction(null);
         onSystemMessage(
           "success",
           tUi("onboarding.ok.sourceUpdated.title", "Fonte atualizada"),
@@ -421,57 +394,22 @@ export default function OnboardingPanel({ onSystemMessage }) {
         );
       } else if (pendingAction.type === "delete") {
         const data = await deleteDataSource({ data_source_id: pendingAction.source.id });
+        setPendingAction(null);
         onSystemMessage("success", tUi("onboarding.ok.sourceRemoved.title", "Fonte removida"), `Fonte ${data.result.source_type} removida com sucesso.`);
       } else if (pendingAction.type === "delete_table") {
         const data = await deleteMonitoredTable({ monitored_table_id: pendingAction.table.id });
+        setPendingAction(null);
         onSystemMessage(
           "success",
           tUi("onboarding.ok.tableRemoved.title", "Tabela monitorada removida"),
           `Tabela ${data.result.schema_name}.${data.result.table_name} removida com sucesso.`
         );
-      } else if (pendingAction.type === "delete_column") {
-        const data = await deleteMonitoredColumn({ monitored_column_id: pendingAction.column.id });
-        onSystemMessage(
-          "success",
-          tUi("onboarding.ok.columnRemoved.title", "Coluna monitorada removida"),
-          `Coluna ${data.result.column_name} removida com sucesso.`
-        );
-      } else if (pendingAction.type === "confirm_llm_description") {
-        const data = await confirmMonitoredColumnDescription({ monitored_column_id: pendingAction.column.id });
-        onSystemMessage(
-          "success",
-          "Descricao confirmada",
-          `Descricao da coluna ${pendingAction.column.column_name} confirmada (${data.confirmed ? "LLM" : "manual"}).`
-        );
-      } else if (pendingAction.type === "confirm_all_llm_descriptions") {
-        const targets = monitoredColumns.filter((item) => {
-          const suggested = String(item.llm_description_suggested || "").trim();
-          const confirmed = String(item.description_text || "").trim();
-          return suggested && suggested !== confirmed;
-        });
-        let successCount = 0;
-        for (const column of targets) {
-          try {
-            await confirmMonitoredColumnDescription({ monitored_column_id: column.id });
-            successCount += 1;
-          } catch (_) {
-            // segue com as demais colunas
-          }
-        }
-        onSystemMessage(
-          successCount > 0 ? "success" : "warning",
-          "Confirmacao em lote",
-          successCount > 0
-            ? `${successCount} descricao(oes) da LLM confirmada(s) para a tabela selecionada.`
-            : "Nenhuma descricao elegivel para confirmacao."
-        );
       }
-      setPendingAction(null);
       await loadTenantSources();
       await loadMonitoredTables();
-      await loadMonitoredColumns();
     } catch (error) {
-      onSystemMessage("error", tUi("onboarding.fail.action", "Falha na operacao"), error.message);
+      setPendingAction(null);
+      onSystemMessage("error", tUi("onboarding.fail.action", "Falha na operacao"), translateSourceLimitMessage(error.message));
     } finally {
       setActionLoading(false);
     }
@@ -488,11 +426,22 @@ export default function OnboardingPanel({ onSystemMessage }) {
     }
   }, [selectedSourceIdForTables]);
 
-  useEffect(() => {
-    if (selectedTableIdForColumns) {
-      loadMonitoredColumns(selectedTableIdForColumns);
-    }
-  }, [selectedTableIdForColumns]);
+  const reachedClientLimit = limits
+    ? Number(limits.total_data_sources || 0) >= Number(limits.max_data_sources_per_client || 0)
+    : false;
+  const reachedTenantLimit = limits
+    ? Number(limits.total_data_sources_tenant || 0) >= Number(limits.max_data_sources_per_tenant || 0)
+    : false;
+  const sourceCreateBlocked = reachedClientLimit || reachedTenantLimit;
+  const sourceCreateBlockedReason = reachedClientLimit
+    ? `${tUi("onboarding.limit.sourceClient", "Limite de fontes ativas por cliente atingido no plano atual.")} (${Number(
+        limits?.total_data_sources || 0
+      )}/${Number(limits?.max_data_sources_per_client || 0)})`
+    : reachedTenantLimit
+      ? `${tUi("onboarding.limit.sourceTenant", "Limite de fontes ativas por tenant atingido no plano atual.")} (${Number(
+          limits?.total_data_sources_tenant || 0
+        )}/${Number(limits?.max_data_sources_per_tenant || 0)})`
+      : "";
 
   return (
     <section className="page-panel">
@@ -508,6 +457,8 @@ export default function OnboardingPanel({ onSystemMessage }) {
         <button
           type="button"
           className="btn btn-primary"
+          disabled={sourceCreateBlocked}
+          title={sourceCreateBlocked ? sourceCreateBlockedReason : ""}
           onClick={() => {
             setEditingSource(null);
             setIsModalOpen(true);
@@ -519,6 +470,16 @@ export default function OnboardingPanel({ onSystemMessage }) {
           {tUi("onboarding.refresh.tenantSources", "Atualizar Fontes do Tenant")}
         </button>
       </div>
+      {limits ? (
+        <div className="chip-row" style={{ marginBottom: "0.75rem" }}>
+          <span className={`chip ${reachedClientLimit ? "chip-error" : "chip-muted"}`}>
+            {`Fontes por cliente: ${Number(limits.total_data_sources || 0)}/${Number(limits.max_data_sources_per_client || 0)}`}
+          </span>
+          <span className={`chip ${reachedTenantLimit ? "chip-error" : "chip-muted"}`}>
+            {`Fontes por tenant: ${Number(limits.total_data_sources_tenant || 0)}/${Number(limits.max_data_sources_per_tenant || 0)}`}
+          </span>
+        </div>
+      ) : null}
 
       {loading && <p className="empty-state">{tUi("onboarding.loading.sources", "Carregando fontes...")}</p>}
 
@@ -631,23 +592,12 @@ export default function OnboardingPanel({ onSystemMessage }) {
               </thead>
               <tbody>
                 {monitoredTables.map((item) => (
-                  <tr
-                    key={item.id}
-                    onClick={() => setSelectedTableIdForColumns(String(item.id))}
-                    style={{ cursor: "pointer", backgroundColor: String(item.id) === String(selectedTableIdForColumns) ? "#f2f8fc" : "transparent" }}
-                  >
+                  <tr key={item.id}>
                     <td>{item.schema_name}</td>
                     <td>{item.table_name}</td>
                     <td>{item.is_active ? tUi("common.active", "Ativa") : tUi("common.inactive", "Inativa")}</td>
                     <td>
                       <div className="chip-row">
-                        <button
-                          type="button"
-                          className="btn btn-small btn-secondary"
-                          onClick={() => setSelectedTableIdForColumns(String(item.id))}
-                        >
-                          {tUi("onboarding.columns.button", "Colunas")}
-                        </button>
                         <button
                           type="button"
                           className="btn btn-small btn-secondary"
@@ -657,113 +607,6 @@ export default function OnboardingPanel({ onSystemMessage }) {
                               table: item,
                               title: tUi("onboarding.table.remove", "Remover tabela monitorada"),
                               message: `Remover ${item.schema_name}.${item.table_name}?`,
-                              confirmLabel: tUi("common.remove", "Remover"),
-                            })
-                          }
-                        >
-                          {tUi("common.remove", "Remover")}
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      <section className="catalog-block">
-        <div className="section-header">
-          <h3>{tUi("onboarding.columns.title", "Colunas monitoradas por tabela")}</h3>
-          <div className="chip-row">
-            <button
-              type="button"
-              className="btn btn-secondary btn-small"
-              onClick={() =>
-                setPendingAction({
-                  type: "confirm_all_llm_descriptions",
-                  title: "Confirmar todas as descricoes LLM",
-                  message: "Aplicar todas as descricoes sugeridas pela LLM para a tabela selecionada?",
-                  confirmLabel: "Confirmar todas",
-                })
-              }
-              disabled={!monitoredColumns.some((item) => String(item.llm_description_suggested || "").trim())}
-            >
-              Confirmar todas LLM
-            </button>
-            <button type="button" className="btn btn-secondary btn-small" onClick={() => loadMonitoredColumns(undefined, { forceSync: true })}>
-              {discoveringColumns ? "Sincronizando..." : "Sincronizar colunas"}
-            </button>
-          </div>
-        </div>
-        <div className="inline-form">
-          <select
-            value={selectedTableIdForColumns}
-            onChange={(e) => setSelectedTableIdForColumns(e.target.value)}
-            disabled={monitoredTables.length === 0}
-          >
-            {monitoredTables.map((item) => (
-              <option key={item.id} value={item.id}>
-                {`${item.schema_name}.${item.table_name} (#${item.id})`}
-              </option>
-            ))}
-          </select>
-        </div>
-        {columnsLoading ? (
-          <p className="empty-state">{tUi("onboarding.loading.columns", "Carregando colunas monitoradas...")}</p>
-        ) : monitoredColumns.length === 0 ? (
-          <p className="empty-state">{tUi("onboarding.columns.empty", "Nenhuma coluna monitorada para a tabela selecionada.")}</p>
-        ) : (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Coluna</th>
-                  <th>Tipo</th>
-                  <th>Descricao da Fonte</th>
-                  <th>Descricao LLM</th>
-                  <th>Classificacao Sugerida</th>
-                  <th>Descricao Confirmada</th>
-                  <th>Acoes</th>
-                </tr>
-              </thead>
-              <tbody>
-                {monitoredColumns.map((item) => (
-                  <tr key={item.id}>
-                    <td>{item.column_name}</td>
-                    <td>{item.data_type || "-"}</td>
-                    <td>{item.source_description_text || "-"}</td>
-                    <td>{item.llm_description_suggested || "-"}</td>
-                    <td>{item.llm_classification_suggested || item.classification || "-"}</td>
-                    <td>{item.description_text || "-"}</td>
-                    <td>
-                      <div className="chip-row">
-                        <button
-                          type="button"
-                          className="btn btn-small btn-secondary"
-                          disabled={!item.llm_description_suggested}
-                          onClick={() =>
-                            setPendingAction({
-                              type: "confirm_llm_description",
-                              column: item,
-                              title: "Confirmar descricao da LLM",
-                              message: `Aplicar a descricao sugerida pela LLM para a coluna ${item.column_name}?`,
-                              confirmLabel: "Confirmar",
-                            })
-                          }
-                        >
-                          Confirmar LLM
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-small btn-secondary"
-                          onClick={() =>
-                            setPendingAction({
-                              type: "delete_column",
-                              column: item,
-                              title: tUi("onboarding.column.remove", "Remover coluna monitorada"),
-                              message: `Remover coluna ${item.column_name}?`,
                               confirmLabel: tUi("common.remove", "Remover"),
                             })
                           }

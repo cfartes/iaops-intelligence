@@ -80,7 +80,7 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
+    def get_client_tenant_limits(self, client_id: int, tenant_id: int | None = None) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -485,7 +485,7 @@ class InMemoryMCPRepository(MCPRepository):
                 {"id": 10, "client_id": 1, "name": "Tenant Demo", "slug": "tenant-demo", "status": "active"},
             ]
         }
-        self._client_plan_limits = {1: {"max_tenants": 5}}
+        self._client_plan_limits = {1: {"max_tenants": 5, "max_data_sources_per_client": 20, "max_data_sources_per_tenant": 10}}
         self._tenant_seq = 11
         self._tool_policies = {
             (10, "tenant.list_client"): ToolPolicy("tenant.list_client", "viewer", True, 1000, 120, True, None),
@@ -728,14 +728,38 @@ class InMemoryMCPRepository(MCPRepository):
         rows = self._client_tenants.get(client_id, [])
         return sorted(rows, key=lambda item: item["id"])
 
-    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
+    def get_client_tenant_limits(self, client_id: int, tenant_id: int | None = None) -> dict[str, Any]:
         rows = self._client_tenants.get(client_id, [])
         active_count = sum(1 for item in rows if item["status"] == "active")
         max_tenants = int(self._client_plan_limits.get(client_id, {}).get("max_tenants", 1))
+        max_data_sources_per_client = int(self._client_plan_limits.get(client_id, {}).get("max_data_sources_per_client", 10))
+        max_data_sources_per_tenant = int(self._client_plan_limits.get(client_id, {}).get("max_data_sources_per_tenant", 5))
+        total_data_sources = 0
+        total_data_sources_tenant = 0
+        active_data_sources = 0
+        active_data_sources_tenant = 0
+        tenant_ids = {int(item["id"]) for item in rows}
+        active_tenant_ids = {int(item["id"]) for item in rows if item["status"] == "active"}
+        for t_id, sources in self._tenant_data_sources.items():
+            if int(t_id) in tenant_ids:
+                total_data_sources += len(sources)
+            if int(t_id) in active_tenant_ids:
+                active_data_sources += sum(1 for src in sources if bool(src.get("is_active", True)))
+            if tenant_id is not None and int(t_id) == int(tenant_id):
+                total_data_sources_tenant = len(sources)
+                active_data_sources_tenant = sum(1 for src in sources if bool(src.get("is_active", True)))
         return {
             "active_tenants": active_count,
             "max_tenants": max_tenants,
             "can_create": active_count < max_tenants,
+            "total_data_sources": total_data_sources,
+            "active_data_sources": active_data_sources,
+            "max_data_sources_per_client": max_data_sources_per_client,
+            "can_create_data_source_client": total_data_sources < max_data_sources_per_client,
+            "total_data_sources_tenant": total_data_sources_tenant,
+            "active_data_sources_tenant": active_data_sources_tenant,
+            "max_data_sources_per_tenant": max_data_sources_per_tenant,
+            "can_create_data_source_tenant": total_data_sources_tenant < max_data_sources_per_tenant,
         }
 
     def create_tenant(self, client_id: int, *, name: str, slug: str) -> dict[str, Any]:
@@ -1237,6 +1261,26 @@ class InMemoryMCPRepository(MCPRepository):
         rag_enabled: bool = False,
         rag_context_text: str | None = None,
     ) -> dict[str, Any]:
+        client_id = None
+        for candidate_client_id, rows in self._client_tenants.items():
+            if any(int(item["id"]) == int(tenant_id) for item in rows):
+                client_id = int(candidate_client_id)
+                break
+        if client_id is None:
+            raise ValueError("tenant nao encontrado")
+        limits = self.get_client_tenant_limits(client_id, tenant_id=tenant_id)
+        if not limits.get("can_create_data_source_client", True):
+            raise ValueError(
+                "Limite de fontes por cliente atingido no plano atual "
+                f"({limits.get('total_data_sources', 0)}/{limits.get('max_data_sources_per_client', 0)}). "
+                "Remova uma fonte ou altere o plano."
+            )
+        if not limits.get("can_create_data_source_tenant", True):
+            raise ValueError(
+                "Limite de fontes por tenant atingido no plano atual "
+                f"({limits.get('total_data_sources_tenant', 0)}/{limits.get('max_data_sources_per_tenant', 0)}). "
+                "Remova uma fonte deste tenant ou altere o plano."
+            )
         source = {
             "id": self._data_source_seq,
             "tenant_id": tenant_id,
@@ -1284,11 +1328,18 @@ class InMemoryMCPRepository(MCPRepository):
         rows = self._tenant_data_sources.get(tenant_id, [])
         for idx, row in enumerate(rows):
             if int(row["id"]) == int(data_source_id):
+                table_rows = self._tables.get(tenant_id, [])
+                target_table_ids = [int(item["id"]) for item in table_rows if int(item.get("data_source_id", -1)) == int(data_source_id)]
+                if target_table_ids:
+                    self._tables[tenant_id] = [item for item in table_rows if int(item.get("data_source_id", -1)) != int(data_source_id)]
+                    for table_id in target_table_ids:
+                        self._columns_by_table.pop((tenant_id, int(table_id)), None)
                 removed = rows.pop(idx)
                 return {
                     "deleted": True,
                     "id": removed["id"],
                     "source_type": removed["source_type"],
+                    "removed_tables": len(target_table_ids),
                 }
         raise ValueError("fonte de dados nao encontrada")
 

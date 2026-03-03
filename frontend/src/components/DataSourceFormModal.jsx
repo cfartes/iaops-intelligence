@@ -98,259 +98,229 @@ const PROFILE_BY_TYPE = {
 
 const ALLOWED_CLASSIFICATIONS = new Set(["identifier", "sensitive", "financial", "temporal", "attribute", "metric"]);
 
-function validateRagText(rawText) {
-  const text = String(rawText || "");
-  if (!text.trim()) {
-    return { errors: [], warnings: [] };
+function buildDefaultRagModel() {
+  return { tenant_id: "global_default", entities: [] };
+}
+
+function parseRagJsonMaybe(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return null;
+  const candidates = [text];
+  if (text.startsWith("json:")) candidates.unshift(text.slice(5).trim());
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.entities)) {
+        return parsed;
+      }
+    } catch (_) {
+      // noop
+    }
   }
-  const lines = text.split(/\r?\n/);
+  return null;
+}
+
+function ragModelToFriendlyText(modelInput) {
+  const model = modelInput && typeof modelInput === "object" ? modelInput : buildDefaultRagModel();
+  const entities = Array.isArray(model.entities) ? model.entities : [];
+  const lines = [];
+  lines.push("# Modelo RAG IAOps (texto amigavel)");
+  lines.push("# Preencha os nomes amigaveis e sinonimos para ajudar o Chat BI.");
+  lines.push("");
+  for (const entity of entities) {
+    const tableName = String(entity?.table_name || "").trim();
+    if (!tableName) continue;
+    lines.push(`## Tabela: ${tableName}`);
+    lines.push(`Nome amigavel: ${String(entity?.friendly_name || "").trim() || tableName}`);
+    lines.push(`Descricao: ${String(entity?.description || "").trim() || "-"}`);
+    lines.push("");
+    lines.push("### Campos");
+    lines.push("| Campo tecnico | Nome amigavel | Tipo | Sinonimos |");
+    lines.push("| --- | --- | --- | --- |");
+    const cols = Array.isArray(entity?.columns) ? entity.columns : [];
+    if (cols.length === 0) {
+      lines.push("| id | Identificador | int | codigo |");
+    } else {
+      for (const col of cols) {
+        const name = String(col?.name || "").trim();
+        if (!name) continue;
+        const friendly = String(col?.friendly_name || "").trim() || name;
+        const type = String(col?.type || "").trim() || "text";
+        const syn = Array.isArray(col?.synonyms)
+          ? col.synonyms
+              .map((item) => String(item || "").trim())
+              .filter(Boolean)
+              .join("; ")
+          : "";
+        lines.push(`| ${name} | ${friendly} | ${type} | ${syn || "-"} |`);
+      }
+    }
+    lines.push("");
+    lines.push("### Relacionamentos");
+    lines.push("| Tabela destino | Condicao de join | Descricao |");
+    lines.push("| --- | --- | --- |");
+    const rels = Array.isArray(entity?.relationships) ? entity.relationships : [];
+    if (rels.length === 0) {
+      lines.push("| - | - | - |");
+    } else {
+      for (const rel of rels) {
+        const toTable = String(rel?.to_table || "").trim() || "-";
+        const joinCondition = String(rel?.join_condition || "").trim() || "-";
+        const description = String(rel?.description || "").trim() || "-";
+        lines.push(`| ${toTable} | ${joinCondition} | ${description} |`);
+      }
+    }
+    lines.push("");
+  }
+  if (entities.length === 0) {
+    lines.push("## Tabela: vendas.fact_vendas");
+    lines.push("Nome amigavel: Vendas");
+    lines.push("Descricao: Contem os registros de transacoes de vendas.");
+    lines.push("");
+    lines.push("### Campos");
+    lines.push("| Campo tecnico | Nome amigavel | Tipo | Sinonimos |");
+    lines.push("| --- | --- | --- | --- |");
+    lines.push("| vlr_total | Valor da Venda | decimal | faturamento; preco; quanto custou |");
+    lines.push("| dt_mov | Data da Transacao | date | quando; dia da venda; periodo |");
+    lines.push("");
+    lines.push("### Relacionamentos");
+    lines.push("| Tabela destino | Condicao de join | Descricao |");
+    lines.push("| --- | --- | --- |");
+    lines.push("| dim_clientes | fact_vendas.cliente_id = dim_clientes.id | Relaciona uma venda a um cliente especifico |");
+  }
+  return lines.join("\n").trim();
+}
+
+function parseMarkdownTableRow(trimmedLine) {
+  if (!trimmedLine.startsWith("|")) return null;
+  const parts = trimmedLine
+    .split("|")
+    .map((item) => item.trim())
+    .filter((_, idx, arr) => !(idx === 0 || idx === arr.length - 1));
+  if (parts.length < 3) return null;
+  if (parts.every((value) => /^-+$/.test(value.replace(/\s+/g, "")))) return null;
+  return parts;
+}
+
+function parseRagFriendlyTextToModel(rawText) {
+  const direct = parseRagJsonMaybe(rawText);
+  if (direct) {
+    return { model: direct, errors: [], warnings: [] };
+  }
+  const text = String(rawText || "").trim();
+  if (!text) return { model: buildDefaultRagModel(), errors: [], warnings: [] };
+
   const errors = [];
   const warnings = [];
-  let inTableBlock = false;
-  let inRulesBlock = false;
-  let currentColumn = "";
-  let foundStructuredBlock = false;
-  let foundKeyValue = false;
+  const entities = [];
+  let current = null;
+  let section = "";
 
-  const pushError = (line, message) => errors.push(`Linha ${line}: ${message}`);
-  const pushWarning = (line, message) => warnings.push(`Linha ${line}: ${message}`);
-
+  const lines = text.split(/\r?\n/);
   for (let idx = 0; idx < lines.length; idx += 1) {
     const lineNo = idx + 1;
-    const line = lines[idx];
+    const line = String(lines[idx] || "");
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("# ")) continue;
 
-    if (trimmed.startsWith("##")) {
-      inTableBlock = false;
-      inRulesBlock = false;
-      currentColumn = "";
-      const tableHeader = /^##\s*tabela\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(trimmed);
-      if (tableHeader) {
-        inTableBlock = true;
-        foundStructuredBlock = true;
+    const tableMatch = /^##\s*tabela\s*:\s*(.+)$/i.exec(trimmed);
+    if (tableMatch) {
+      const tableName = String(tableMatch[1] || "").trim();
+      if (!tableName) {
+        errors.push(`Linha ${lineNo}: nome da tabela vazio.`);
+        current = null;
         continue;
       }
-      if (/^##\s*regras_negocio\s*$/i.test(trimmed)) {
-        inRulesBlock = true;
-        foundStructuredBlock = true;
-        continue;
-      }
-      pushWarning(lineNo, "Cabecalho nao reconhecido. Use '## tabela: schema.tabela' ou '## regras_negocio'.");
+      current = {
+        table_name: tableName,
+        friendly_name: "",
+        description: "",
+        columns: [],
+        relationships: [],
+      };
+      entities.push(current);
+      section = "";
       continue;
     }
 
-    if (/^-\s*coluna\s*:/i.test(trimmed)) {
-      foundStructuredBlock = true;
-      if (!inTableBlock) {
-        pushError(lineNo, "Item de coluna fora de bloco de tabela.");
-        continue;
-      }
-      const col = trimmed.split(":").slice(1).join(":").trim();
-      if (!col || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) {
-        pushError(lineNo, "Nome de coluna invalido.");
-        continue;
-      }
-      currentColumn = col;
+    if (!current) {
       continue;
     }
 
-    if (/^-\s+/.test(trimmed)) {
-      if (!inRulesBlock && !inTableBlock) {
-        pushWarning(lineNo, "Item de lista sem bloco definido.");
-      }
+    const nameMatch = /^nome\s+amigavel\s*:\s*(.+)$/i.exec(trimmed);
+    if (nameMatch) {
+      current.friendly_name = String(nameMatch[1] || "").trim();
+      continue;
+    }
+    const descMatch = /^descricao\s*:\s*(.+)$/i.exec(trimmed);
+    if (descMatch) {
+      current.description = String(descMatch[1] || "").trim();
       continue;
     }
 
-    const kvMatch = /^([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*(.+)$/.exec(trimmed);
-    if (kvMatch) {
-      foundKeyValue = true;
-      const key = String(kvMatch[1] || "").toLowerCase();
-      const value = String(kvMatch[2] || "").trim();
-      if (!value) {
-        pushError(lineNo, "Valor vazio na definicao de chave.");
-        continue;
-      }
-      if (key === "classificacao") {
-        if (!currentColumn) {
-          pushWarning(lineNo, "Classificacao sem coluna ativa no bloco atual.");
-        }
-        if (!ALLOWED_CLASSIFICATIONS.has(value.toLowerCase())) {
-          pushError(
-            lineNo,
-            `Classificacao invalida '${value}'. Use: ${Array.from(ALLOWED_CLASSIFICATIONS).join(", ")}.`
-          );
-        }
-      }
-      if ((key === "descricao" || key === "description") && !currentColumn && !inTableBlock) {
-        pushWarning(lineNo, "Descricao fora de bloco de tabela.");
-      }
+    if (/^###\s*campos\s*$/i.test(trimmed)) {
+      section = "columns";
+      continue;
+    }
+    if (/^###\s*relacionamentos\s*$/i.test(trimmed)) {
+      section = "relationships";
       continue;
     }
 
-    pushError(lineNo, "Formato nao reconhecido para RAG.");
+    const row = parseMarkdownTableRow(trimmed);
+    if (!row) continue;
+
+    if (section === "columns" && row.length >= 4) {
+      const colName = String(row[0] || "").trim();
+      if (!colName || colName === "Campo tecnico") continue;
+      const synonyms = String(row[3] || "")
+        .split(";")
+        .map((item) => String(item || "").trim())
+        .filter(Boolean);
+      current.columns.push({
+        name: colName,
+        friendly_name: String(row[1] || "").trim() || colName,
+        type: String(row[2] || "").trim() || "text",
+        synonyms,
+      });
+      continue;
+    }
+    if (section === "relationships" && row.length >= 3) {
+      const toTable = String(row[0] || "").trim();
+      if (!toTable || toTable === "Tabela destino" || toTable === "-") continue;
+      current.relationships.push({
+        to_table: toTable,
+        join_condition: String(row[1] || "").trim(),
+        description: String(row[2] || "").trim(),
+      });
+    }
   }
 
-  if (!foundStructuredBlock && !foundKeyValue) {
-    pushWarning(1, "Texto sem estrutura detectada. Use o template RAG para melhor qualidade.");
+  if (entities.length === 0) {
+    errors.push("Nenhuma tabela foi identificada. Use o modelo textual de RAG.");
   }
-  return { errors, warnings };
+  for (const entity of entities) {
+    if (!entity.friendly_name) {
+      entity.friendly_name = entity.table_name;
+      warnings.push(`Tabela ${entity.table_name}: nome amigavel nao informado; foi usado o nome tecnico.`);
+    }
+  }
+  return {
+    model: { tenant_id: "global_default", entities },
+    errors,
+    warnings,
+  };
+}
+
+function validateRagText(rawText) {
+  const parsed = parseRagFriendlyTextToModel(rawText);
+  return { errors: parsed.errors || [], warnings: parsed.warnings || [] };
 }
 
 function normalizeRagText(rawText) {
-  const text = String(rawText || "").trim();
-  if (!text) return "";
-  const lines = text.split(/\r?\n/);
-  const tables = new Map();
-  const rules = [];
-  const extras = [];
-  let currentTableKey = "";
-  let currentColumnName = "";
-  let inRulesBlock = false;
-
-  const ensureTable = (schemaName, tableName) => {
-    const key = `${schemaName}.${tableName}`;
-    if (!tables.has(key)) {
-      tables.set(key, {
-        schema: schemaName,
-        table: tableName,
-        description: "",
-        columns: new Map(),
-      });
-    }
-    return tables.get(key);
-  };
-
-  for (const rawLine of lines) {
-    const line = String(rawLine || "");
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("# ")) continue;
-
-    const tableHeader = /^##\s*tabela\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(trimmed);
-    if (tableHeader) {
-      const schema = tableHeader[1];
-      const table = tableHeader[2];
-      currentTableKey = `${schema}.${table}`;
-      currentColumnName = "";
-      inRulesBlock = false;
-      ensureTable(schema, table);
-      continue;
-    }
-    if (/^##\s*regras_negocio\s*$/i.test(trimmed)) {
-      currentTableKey = "";
-      currentColumnName = "";
-      inRulesBlock = true;
-      continue;
-    }
-    if (/^-\s*coluna\s*:/i.test(trimmed)) {
-      if (!currentTableKey) {
-        extras.push(trimmed);
-        continue;
-      }
-      const col = trimmed.split(":").slice(1).join(":").trim();
-      if (!col) continue;
-      const table = tables.get(currentTableKey);
-      if (!table.columns.has(col)) {
-        table.columns.set(col, { name: col, description: "", classification: "" });
-      }
-      currentColumnName = col;
-      continue;
-    }
-    if (/^-\s+/.test(trimmed)) {
-      const value = trimmed.replace(/^-+\s*/, "").trim();
-      if (!value) continue;
-      if (inRulesBlock) {
-        rules.push(value);
-      } else {
-        extras.push(value);
-      }
-      continue;
-    }
-    const kvMatch = /^([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*(.+)$/.exec(trimmed);
-    if (!kvMatch) {
-      extras.push(trimmed);
-      continue;
-    }
-    const key = String(kvMatch[1] || "").toLowerCase();
-    const value = String(kvMatch[2] || "").trim();
-    if (!value) continue;
-    if (key === "descricao" || key === "description") {
-      if (currentTableKey && currentColumnName) {
-        const table = tables.get(currentTableKey);
-        const col = table.columns.get(currentColumnName);
-        col.description = value;
-      } else if (currentTableKey) {
-        tables.get(currentTableKey).description = value;
-      } else {
-        rules.push(value);
-      }
-      continue;
-    }
-    if (key === "classificacao" || key === "classification") {
-      if (currentTableKey && currentColumnName) {
-        const normalized = value.toLowerCase();
-        const table = tables.get(currentTableKey);
-        const col = table.columns.get(currentColumnName);
-        col.classification = ALLOWED_CLASSIFICATIONS.has(normalized) ? normalized : "";
-      } else {
-        extras.push(`${key}: ${value}`);
-      }
-      continue;
-    }
-    if (key.split(".").length === 3) {
-      const [schema, table, column] = key.split(".");
-      const tab = ensureTable(schema, table);
-      if (!tab.columns.has(column)) {
-        tab.columns.set(column, { name: column, description: value, classification: "" });
-      } else if (!tab.columns.get(column).description) {
-        tab.columns.get(column).description = value;
-      }
-      continue;
-    }
-    if (key === "regra" || key === "rule") {
-      rules.push(value);
-      continue;
-    }
-    extras.push(`${key}: ${value}`);
-  }
-
-  if (tables.size === 0 && rules.length === 0 && extras.length === 0) {
-    return text;
-  }
-
-  const out = [];
-  out.push("# Template RAG - IAOps");
-  out.push("# Ajustado automaticamente");
-  out.push("");
-  for (const table of tables.values()) {
-    out.push(`## tabela: ${table.schema}.${table.table}`);
-    if (table.description) {
-      out.push(`descricao: ${table.description}`);
-      out.push("");
-    }
-    for (const col of table.columns.values()) {
-      out.push(`- coluna: ${col.name}`);
-      if (col.description) {
-        out.push(`  descricao: ${col.description}`);
-      }
-      if (col.classification) {
-        out.push(`  classificacao: ${col.classification}`);
-      }
-      out.push("");
-    }
-  }
-  out.push("## regras_negocio");
-  if (rules.length === 0 && extras.length === 0) {
-    out.push("- Definir regras de negocio para melhorar o entendimento da LLM.");
-  } else {
-    for (const rule of rules) {
-      out.push(`- ${rule}`);
-    }
-    for (const extra of extras) {
-      out.push(`- Observacao: ${extra}`);
-    }
-  }
-  return out.join("\n").trim();
+  const parsed = parseRagFriendlyTextToModel(rawText);
+  if (parsed.errors?.length) return String(rawText || "").trim();
+  return ragModelToFriendlyText(parsed.model);
 }
 
 function parseSecretRef(connSecretRef) {
@@ -405,6 +375,7 @@ export default function DataSourceFormModal({
   const [loadingRagFile, setLoadingRagFile] = useState(false);
   const [ragUploadMode, setRagUploadMode] = useState("replace");
   const [ragPreview, setRagPreview] = useState("");
+  const [showRagSection, setShowRagSection] = useState(false);
   const sourceTypeKey = String(form.source_type || "").trim().toLowerCase();
   const profileDef = PROFILE_BY_TYPE[sourceTypeKey] || PROFILE_BY_TYPE.default;
   const ragValidation = useMemo(() => validateRagText(form.rag_context_text), [form.rag_context_text]);
@@ -415,13 +386,19 @@ export default function DataSourceFormModal({
     setRagPreview("");
     if (initialData) {
       const parsedSecret = parseSecretRef(initialData.conn_secret_ref);
+      const initialRagRaw = String(initialData.rag_context_text || "").trim();
+      const parsedRag = parseRagJsonMaybe(initialRagRaw);
+      const ragDisplayText = parsedRag ? ragModelToFriendlyText(parsedRag) : initialRagRaw;
+      const hasRagText = Boolean(String(ragDisplayText || "").trim());
+      const ragEnabled = Boolean(initialData.rag_enabled);
       setForm({
         source_type: initialData.source_type || sourceCatalog?.[0]?.code || "",
         is_active: Boolean(initialData.is_active),
-        rag_enabled: Boolean(initialData.rag_enabled),
-        rag_context_text: String(initialData.rag_context_text || ""),
+        rag_enabled: ragEnabled,
+        rag_context_text: ragDisplayText,
         profile: getProfileTemplate(initialData.source_type || sourceCatalog?.[0]?.code || "", parsedSecret),
       });
+      setShowRagSection(ragEnabled || hasRagText);
       return;
     }
     const defaultType = sourceCatalog?.[0]?.code || "";
@@ -432,6 +409,7 @@ export default function DataSourceFormModal({
       rag_context_text: "",
       profile: getProfileTemplate(defaultType),
     });
+    setShowRagSection(false);
   }, [open, sourceCatalog, initialData]);
 
   const canSubmit = useMemo(() => {
@@ -467,13 +445,17 @@ export default function DataSourceFormModal({
   const submit = (event) => {
     event.preventDefault();
     if (!canSubmit) return;
+    const ragParsed = parseRagFriendlyTextToModel(form.rag_context_text);
+    const ragJson = String(form.rag_context_text || "").trim()
+      ? JSON.stringify(ragParsed.model || buildDefaultRagModel())
+      : null;
     onSubmit({
       id: initialData?.id,
       source_type: form.source_type,
       conn_secret_ref: buildConnSecretRef(),
       is_active: form.is_active,
       rag_enabled: Boolean(form.rag_enabled),
-      rag_context_text: String(form.rag_context_text || "").trim() || null,
+      rag_context_text: ragJson,
     });
   };
 
@@ -500,38 +482,12 @@ export default function DataSourceFormModal({
   };
 
   const handleDownloadRagTemplate = () => {
-    const template = [
-      "# Template RAG - IAOps",
-      "# Use este arquivo para descrever tabelas, colunas e regras de negocio.",
-      "",
-      "## tabela: vendas.vendas",
-      "descricao: Registra as vendas realizadas por cliente.",
-      "",
-      "- coluna: id",
-      "  descricao: Identificador unico da venda",
-      "  classificacao: identifier",
-      "",
-      "- coluna: cliente_id",
-      "  descricao: Codigo do cliente (FK da tabela vendas.cliente)",
-      "  classificacao: identifier",
-      "",
-      "- coluna: data_venda",
-      "  descricao: Data da venda",
-      "  classificacao: temporal",
-      "",
-      "- coluna: valor_total",
-      "  descricao: Valor total da venda",
-      "  classificacao: financial",
-      "",
-      "## regras_negocio",
-      "- Considerar apenas registros com status='ativo' para analises gerenciais.",
-      "- Datas em timezone America/Sao_Paulo.",
-    ].join("\n");
+    const template = ragModelToFriendlyText(buildDefaultRagModel());
     const blob = new Blob([template], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "rag_template_iaops.md";
+    anchor.download = "modelo_rag_iaops.md";
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
@@ -605,10 +561,21 @@ export default function DataSourceFormModal({
             <input
               type="checkbox"
               checked={Boolean(form.rag_enabled)}
-              onChange={(e) => setForm((prev) => ({ ...prev, rag_enabled: e.target.checked }))}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                setForm((prev) => ({ ...prev, rag_enabled: checked }));
+                if (checked) setShowRagSection(true);
+              }}
             />
             Habilitar contexto RAG para esta fonte
           </label>
+          <div className="inline-form">
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => setShowRagSection((prev) => !prev)}>
+              {showRagSection ? "Ocultar configuracao RAG" : "Configurar RAG (opcional)"}
+            </button>
+          </div>
+          {showRagSection ? (
+            <>
           <label>
             Contexto RAG (descricao de tabelas/campos e regras de negocio)
             <textarea
@@ -636,7 +603,7 @@ export default function DataSourceFormModal({
           {ragPreview ? (
             <label>
               Preview do arquivo RAG
-              <textarea rows={6} value={ragPreview} readOnly />
+              <textarea rows={4} value={ragPreview} readOnly />
             </label>
           ) : null}
           {Boolean(form.rag_enabled) && (ragValidation.errors.length > 0 || ragValidation.warnings.length > 0) ? (
@@ -662,6 +629,8 @@ export default function DataSourceFormModal({
                 </>
               ) : null}
             </div>
+          ) : null}
+            </>
           ) : null}
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>

@@ -294,6 +294,40 @@ select {
   font-size: 12px;
 }
 
+.lgpd-chip {
+  font-weight: 600;
+}
+
+.lgpd-none {
+  background: #edf2f7;
+  color: #3d4d5c;
+}
+
+.lgpd-mask {
+  background: #fff3d6;
+  color: #7d5a10;
+}
+
+.lgpd-anonymize {
+  background: #ddeeff;
+  color: #1b4f7a;
+}
+
+.lgpd-redact {
+  background: #fce8d5;
+  color: #8f4d1a;
+}
+
+.lgpd-block {
+  background: #f8dfde;
+  color: #8f1f1a;
+}
+
+.lgpd-other {
+  background: #e7edf2;
+  color: #20313e;
+}
+
 .sev-critical {
   background: #f8dfde;
   color: #8f1f1a;
@@ -480,8 +514,10 @@ select {
   margin-top: 0;
   background: #fff;
   border-radius: 14px;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid #d1dde7;
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-header {
@@ -494,7 +530,11 @@ select {
 }
 
 .modal-content {
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 18px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .form-grid {
@@ -560,6 +600,17 @@ select {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
+}
+
+.modal-content > .modal-actions:last-child {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: #fff;
+  border-top: 1px solid #e2eaf1;
+  margin-top: 10px;
+  padding-top: 10px;
+  padding-bottom: 2px;
 }
 
 .tone-warning {

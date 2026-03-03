@@ -1,6 +1,6 @@
 export const NAV_ITEMS = [
   { key: "onboarding", label: "Onboarding" },
-  { key: "inventario", label: "Inventario" },
+  { key: "inventario", label: "Catalogo de Dados" },
   { key: "sugestoes", label: "Sugestoes" },
   { key: "chat-bi", label: "Chat BI" },
   { key: "eventos", label: "Eventos" },

@@ -217,7 +217,7 @@ class MCPGateway:
         max_rows: int | None,
     ) -> dict[str, Any]:
         _ = tool_input, max_rows
-        return {"limits": self.repository.get_client_tenant_limits(context.client_id)}
+        return {"limits": self.repository.get_client_tenant_limits(context.client_id, tenant_id=context.tenant_id)}
 
     def _handle_tenant_create(
         self,

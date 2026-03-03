@@ -98,6 +98,7 @@ class PostgresMCPRepository(MCPRepository):
         self.schema = schema
         self._monitored_column_meta_ready = False
         self._data_source_rag_meta_ready = False
+        self._plan_source_limits_ready = False
 
     def _ensure_monitored_column_meta(self) -> None:
         if self._monitored_column_meta_ready:
@@ -106,6 +107,7 @@ class PostgresMCPRepository(MCPRepository):
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS source_description_text TEXT",
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_suggested TEXT",
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_classification_suggested TEXT",
+            f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confidence_score NUMERIC(5,2)",
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_at TIMESTAMPTZ",
             f"ALTER TABLE {self.schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_by_user_id BIGINT",
@@ -128,6 +130,19 @@ class PostgresMCPRepository(MCPRepository):
                 cur.execute(ddl)
             conn.commit()
         self._data_source_rag_meta_ready = True
+
+    def _ensure_plan_source_limits(self) -> None:
+        if self._plan_source_limits_ready:
+            return
+        ddl_statements = [
+            f"ALTER TABLE {self.schema}.plan ADD COLUMN IF NOT EXISTS max_data_sources_per_client INTEGER NOT NULL DEFAULT 10",
+            f"ALTER TABLE {self.schema}.plan ADD COLUMN IF NOT EXISTS max_data_sources_per_tenant INTEGER NOT NULL DEFAULT 5",
+        ]
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            for ddl in ddl_statements:
+                cur.execute(ddl)
+            conn.commit()
+        self._plan_source_limits_ready = True
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         if int(tenant_id) <= 0:
@@ -239,16 +254,25 @@ class PostgresMCPRepository(MCPRepository):
             rows = cur.fetchall()
         return rows
 
-    def get_client_tenant_limits(self, client_id: int) -> dict[str, Any]:
-        sql = f"""
+    def get_client_tenant_limits(self, client_id: int, tenant_id: int | None = None) -> dict[str, Any]:
+        billing_limits_sql = f"""
+            SELECT
+                COALESCE(bp.max_tenants, 1) AS max_tenants,
+                COALESCE(bp.max_data_sources_per_client, 10) AS max_data_sources_per_client,
+                COALESCE(bp.max_data_sources_per_tenant, 5) AS max_data_sources_per_tenant
+            FROM {self.schema}.billing_subscription bs
+            JOIN {self.schema}.billing_plan bp ON bp.id = bs.plan_id
+            WHERE bs.client_id = %(client_id)s
+              AND bs.status = 'active'
+              AND (bs.ends_at IS NULL OR bs.ends_at >= NOW())
+            ORDER BY bs.id DESC
+            LIMIT 1
+        """
+        legacy_limits_sql = f"""
             SELECT
                 COALESCE(p.max_tenants, 1) AS max_tenants,
-                (
-                    SELECT COUNT(*)
-                    FROM {self.schema}.tenant t
-                    WHERE t.client_id = %(client_id)s
-                      AND t.status = 'active'
-                ) AS active_tenants
+                COALESCE(p.max_data_sources_per_client, 10) AS max_data_sources_per_client,
+                COALESCE(p.max_data_sources_per_tenant, 5) AS max_data_sources_per_tenant
             FROM {self.schema}.subscription s
             JOIN {self.schema}.plan p ON p.id = s.plan_id
             WHERE s.client_id = %(client_id)s
@@ -257,15 +281,80 @@ class PostgresMCPRepository(MCPRepository):
             ORDER BY s.id DESC
             LIMIT 1
         """
+        counters_sql = f"""
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.tenant t
+                    WHERE t.client_id = %(client_id)s
+                      AND t.status = 'active'
+                ) AS active_tenants,
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.data_source ds
+                    JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
+                    WHERE t.client_id = %(client_id)s
+                ) AS total_data_sources,
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.data_source ds
+                    JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
+                    WHERE t.client_id = %(client_id)s
+                      AND t.status = 'active'
+                      AND ds.is_active = TRUE
+                ) AS active_data_sources,
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.data_source ds
+                    JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
+                    WHERE t.client_id = %(client_id)s
+                      AND (%(tenant_id)s IS NOT NULL AND ds.tenant_id = %(tenant_id)s)
+                ) AS total_data_sources_tenant,
+                (
+                    SELECT COUNT(*)
+                    FROM {self.schema}.data_source ds
+                    WHERE (%(tenant_id)s IS NOT NULL AND ds.tenant_id = %(tenant_id)s)
+                      AND ds.is_active = TRUE
+                ) AS active_data_sources_tenant
+        """
+        limit_row: dict[str, Any] | None = None
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"client_id": client_id})
-            row = cur.fetchone()
-        max_tenants = int(row["max_tenants"]) if row else 1
-        active_tenants = int(row["active_tenants"]) if row else 0
+            try:
+                cur.execute(billing_limits_sql, {"client_id": client_id})
+                limit_row = cur.fetchone()
+            except Exception:
+                conn.rollback()
+                limit_row = None
+            if not limit_row:
+                try:
+                    self._ensure_plan_source_limits()
+                    cur.execute(legacy_limits_sql, {"client_id": client_id})
+                    limit_row = cur.fetchone()
+                except Exception:
+                    conn.rollback()
+                    limit_row = None
+            cur.execute(counters_sql, {"client_id": client_id, "tenant_id": tenant_id})
+            counters = cur.fetchone() or {}
+        max_tenants = int(limit_row["max_tenants"]) if limit_row else 1
+        active_tenants = int(counters.get("active_tenants", 0) or 0)
+        max_data_sources_per_client = int(limit_row["max_data_sources_per_client"]) if limit_row else 10
+        max_data_sources_per_tenant = int(limit_row["max_data_sources_per_tenant"]) if limit_row else 5
+        total_data_sources = int(counters.get("total_data_sources", 0) or 0)
+        total_data_sources_tenant = int(counters.get("total_data_sources_tenant", 0) or 0)
+        active_data_sources = int(counters.get("active_data_sources", 0) or 0)
+        active_data_sources_tenant = int(counters.get("active_data_sources_tenant", 0) or 0)
         return {
             "active_tenants": active_tenants,
             "max_tenants": max_tenants,
             "can_create": active_tenants < max_tenants,
+            "total_data_sources": total_data_sources,
+            "active_data_sources": active_data_sources,
+            "max_data_sources_per_client": max_data_sources_per_client,
+            "can_create_data_source_client": total_data_sources < max_data_sources_per_client,
+            "total_data_sources_tenant": total_data_sources_tenant,
+            "active_data_sources_tenant": active_data_sources_tenant,
+            "max_data_sources_per_tenant": max_data_sources_per_tenant,
+            "can_create_data_source_tenant": total_data_sources_tenant < max_data_sources_per_tenant,
         }
 
     def create_tenant(self, client_id: int, *, name: str, slug: str) -> dict[str, Any]:
@@ -1211,6 +1300,12 @@ class PostgresMCPRepository(MCPRepository):
             )
             RETURNING id
         """
+        client_lookup_sql = f"""
+            SELECT client_id
+            FROM {self.schema}.tenant
+            WHERE id = %(tenant_id)s
+            LIMIT 1
+        """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             catalog_row = None
             try:
@@ -1220,6 +1315,23 @@ class PostgresMCPRepository(MCPRepository):
                 catalog_row = None
             if not catalog_row and not self._is_source_type_supported(source_type):
                 raise ValueError("source_type nao suportado")
+            cur.execute(client_lookup_sql, {"tenant_id": tenant_id})
+            tenant_row = cur.fetchone()
+            if not tenant_row:
+                raise ValueError("tenant nao encontrado")
+            limits = self.get_client_tenant_limits(int(tenant_row["client_id"]), tenant_id=tenant_id)
+            if not limits.get("can_create_data_source_client", True):
+                raise ValueError(
+                    "Limite de fontes por cliente atingido no plano atual "
+                    f"({limits.get('total_data_sources', 0)}/{limits.get('max_data_sources_per_client', 0)}). "
+                    "Remova uma fonte ou altere o plano."
+                )
+            if not limits.get("can_create_data_source_tenant", True):
+                raise ValueError(
+                    "Limite de fontes por tenant atingido no plano atual "
+                    f"({limits.get('total_data_sources_tenant', 0)}/{limits.get('max_data_sources_per_tenant', 0)}). "
+                    "Remova uma fonte deste tenant ou altere o plano."
+                )
             cur.execute(
                 insert_sql,
                 {
@@ -1241,6 +1353,14 @@ class PostgresMCPRepository(MCPRepository):
         raise ValueError("falha ao recuperar data_source criada")
 
     def update_tenant_data_source_status(self, tenant_id: int, data_source_id: int, is_active: bool) -> dict[str, Any]:
+        lookup_sql = f"""
+            SELECT ds.id, ds.is_active, t.client_id
+            FROM {self.schema}.data_source ds
+            JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
+            WHERE ds.id = %(data_source_id)s
+              AND ds.tenant_id = %(tenant_id)s
+            LIMIT 1
+        """
         update_sql = f"""
             UPDATE {self.schema}.data_source
                SET is_active = %(is_active)s
@@ -1250,6 +1370,16 @@ class PostgresMCPRepository(MCPRepository):
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             cur.execute(
+                lookup_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "data_source_id": data_source_id,
+                },
+            )
+            current = cur.fetchone()
+            if not current:
+                raise ValueError("fonte de dados nao encontrada")
+            cur.execute(
                 update_sql,
                 {
                     "tenant_id": tenant_id,
@@ -1258,8 +1388,6 @@ class PostgresMCPRepository(MCPRepository):
                 },
             )
             row = cur.fetchone()
-            if not row:
-                raise ValueError("fonte de dados nao encontrada")
             conn.commit()
         rows = self.list_tenant_data_sources(tenant_id)
         for item in rows:
@@ -1326,18 +1454,31 @@ class PostgresMCPRepository(MCPRepository):
         raise ValueError("fonte de dados nao encontrada")
 
     def delete_tenant_data_source(self, tenant_id: int, data_source_id: int) -> dict[str, Any]:
-        dependency_sql = f"""
-            SELECT COUNT(*) AS total
-            FROM {self.schema}.monitored_table
-            WHERE tenant_id = %(tenant_id)s
-              AND data_source_id = %(data_source_id)s
-        """
         select_sql = f"""
             SELECT id, source_type
             FROM {self.schema}.data_source
             WHERE id = %(data_source_id)s
               AND tenant_id = %(tenant_id)s
             LIMIT 1
+        """
+        list_tables_sql = f"""
+            SELECT id
+            FROM {self.schema}.monitored_table
+            WHERE tenant_id = %(tenant_id)s
+              AND data_source_id = %(data_source_id)s
+        """
+        delete_events_sql = f"""
+            DELETE FROM {self.schema}.schema_change_event
+            WHERE monitored_table_id = ANY(%(table_ids)s)
+        """
+        delete_columns_sql = f"""
+            DELETE FROM {self.schema}.monitored_column
+            WHERE monitored_table_id = ANY(%(table_ids)s)
+        """
+        delete_tables_sql = f"""
+            DELETE FROM {self.schema}.monitored_table
+            WHERE id = ANY(%(table_ids)s)
+              AND tenant_id = %(tenant_id)s
         """
         delete_sql = f"""
             DELETE FROM {self.schema}.data_source
@@ -1349,16 +1490,28 @@ class PostgresMCPRepository(MCPRepository):
             source_row = cur.fetchone()
             if not source_row:
                 raise ValueError("fonte de dados nao encontrada")
-            cur.execute(dependency_sql, {"tenant_id": tenant_id, "data_source_id": data_source_id})
-            dep_row = cur.fetchone()
-            if int(dep_row["total"] or 0) > 0:
-                raise ValueError("nao e permitido remover fonte com tabelas monitoradas vinculadas")
+            cur.execute(list_tables_sql, {"tenant_id": tenant_id, "data_source_id": data_source_id})
+            table_rows = cur.fetchall() or []
+            table_ids = [int(item["id"]) for item in table_rows if item.get("id") is not None]
+            removed_tables = 0
+            removed_columns = 0
+            removed_events = 0
+            if table_ids:
+                cur.execute(delete_events_sql, {"table_ids": table_ids})
+                removed_events = int(cur.rowcount or 0)
+                cur.execute(delete_columns_sql, {"table_ids": table_ids})
+                removed_columns = int(cur.rowcount or 0)
+                cur.execute(delete_tables_sql, {"tenant_id": tenant_id, "table_ids": table_ids})
+                removed_tables = int(cur.rowcount or 0)
             cur.execute(delete_sql, {"tenant_id": tenant_id, "data_source_id": data_source_id})
             conn.commit()
         return {
             "deleted": True,
             "id": int(source_row["id"]),
             "source_type": source_row["source_type"],
+            "removed_tables": removed_tables,
+            "removed_columns": removed_columns,
+            "removed_events": removed_events,
         }
 
     def get_tool_policy(self, tenant_id: int, tool_name: str) -> ToolPolicy | None:
@@ -1565,10 +1718,13 @@ class PostgresMCPRepository(MCPRepository):
             WHERE tenant_id = %(tenant_id)s
             ORDER BY connection_name
         """
-        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"tenant_id": tenant_id})
-            rows = cur.fetchall()
-        return rows
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(sql, {"tenant_id": tenant_id})
+                rows = cur.fetchall()
+            return rows
+        except Exception:
+            return []
 
     def upsert_mcp_client_connection(
         self,
@@ -1936,6 +2092,7 @@ class PostgresMCPRepository(MCPRepository):
                 mc.source_description_text,
                 mc.llm_description_suggested,
                 mc.llm_classification_suggested,
+                mc.llm_confidence_score,
                 mc.llm_description_confirmed
             FROM {self.schema}.monitored_column mc
             JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
@@ -1969,6 +2126,7 @@ class PostgresMCPRepository(MCPRepository):
                 mc.source_description_text,
                 mc.llm_description_suggested,
                 mc.llm_classification_suggested,
+                mc.llm_confidence_score,
                 mc.llm_description_confirmed
             FROM {self.schema}.monitored_column mc
             JOIN {self.schema}.monitored_table mt ON mt.id = mc.monitored_table_id
@@ -2391,7 +2549,7 @@ class PostgresMCPRepository(MCPRepository):
             WHERE l.tenant_id = %(tenant_id)s
               AND (%(tool_name)s::text IS NULL OR mt.tool_name = %(tool_name)s)
               AND (%(status)s::text IS NULL OR l.status = %(status)s)
-              AND (%(correlation_id)s::text IS NULL OR l.correlation_id ILIKE '%' || %(correlation_id)s || '%')
+              AND (%(correlation_id)s::text IS NULL OR l.correlation_id ILIKE '%%' || %(correlation_id)s || '%%')
             ORDER BY l.requested_at DESC
             LIMIT %(limit)s
         """
@@ -2431,11 +2589,18 @@ class PostgresMCPRepository(MCPRepository):
             WHERE tenant_id = %(tenant_id)s
               AND is_active = TRUE
         """
-        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, {"tenant_id": tenant_id, "window_minutes": window_minutes})
-            row = cur.fetchone()
-            cur.execute(channels_sql, {"tenant_id": tenant_id})
-            channels_rows = cur.fetchall()
+        try:
+            with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(sql, {"tenant_id": tenant_id, "window_minutes": window_minutes})
+                row = cur.fetchone()
+                try:
+                    cur.execute(channels_sql, {"tenant_id": tenant_id})
+                    channels_rows = cur.fetchall()
+                except Exception:
+                    channels_rows = []
+        except Exception:
+            row = {"open_incidents": 0, "critical_events": 0, "last_scan_at": None}
+            channels_rows = []
 
         channels_health = {item["channel_type"]: item["health_status"] for item in channels_rows}
         return {

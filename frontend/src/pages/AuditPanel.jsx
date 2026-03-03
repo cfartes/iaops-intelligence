@@ -13,16 +13,16 @@ export default function AuditPanel({ onSystemMessage }) {
     return `iaops_audit_view_v1:${clientId}:${tenantId}:${userId}`;
   }, [authContext?.client_id, authContext?.tenant_id, authContext?.user_id]);
   const [items, setItems] = useState([]);
-  const visibleItems = useMemo(
-    () => (lgpdOnly ? items.filter((item) => item.error_code === "lgpd_blocked") : items),
-    [items, lgpdOnly],
-  );
   const [loading, setLoading] = useState(false);
   const [toolFilter, setToolFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [correlationFilter, setCorrelationFilter] = useState("");
   const [lgpdOnly, setLgpdOnly] = useState(false);
   const [viewLoaded, setViewLoaded] = useState(false);
+  const visibleItems = useMemo(
+    () => (lgpdOnly ? items.filter((item) => item.error_code === "lgpd_blocked") : items),
+    [items, lgpdOnly],
+  );
 
   const loadCalls = async () => {
     setLoading(true);

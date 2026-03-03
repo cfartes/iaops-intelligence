@@ -62,15 +62,24 @@ export default function SetupAssistantModal({
           </p>
           <progress value={completed} max={total} aria-label={`${progressPct}%`} style={{ width: "100%" }} />
           <div className="data-list">
-            {ASSISTANT_STEPS.map((step, index) => (
-              <div key={step.key} className={`row-card setup-step setup-step-${stepStatusByKey[step.key] || "pending"}`}>
+            {ASSISTANT_STEPS.map((step, index) => {
+              const reason = pendingReasonByStep[step.key] || "";
+              const tooltipReason = reason
+                ? (uiText?.reasonLabel || "Pendencia: {reason}").replace("{reason}", reason)
+                : "";
+              return (
+              <div
+                key={step.key}
+                className={`row-card setup-step setup-step-${stepStatusByKey[step.key] || "pending"}`}
+                title={tooltipReason}
+              >
                 <div>
                   <strong>
                     {index + 1}. {uiText?.steps?.[step.key]?.title || step.title}
                   </strong>
                   <p className="muted">{uiText?.steps?.[step.key]?.description || step.description}</p>
-                  {!completedSet.has(step.key) && pendingReasonByStep[step.key] && (
-                    <p className="muted">{(uiText?.reasonLabel || "Pendencia: {reason}").replace("{reason}", pendingReasonByStep[step.key])}</p>
+                  {!completedSet.has(step.key) && reason && (
+                    <p className="muted">{tooltipReason}</p>
                   )}
                 </div>
                 <div className="chip-row">
@@ -96,7 +105,7 @@ export default function SetupAssistantModal({
                   </button>
                 </div>
               </div>
-            ))}
+            )})}
           </div>
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onContinue}>

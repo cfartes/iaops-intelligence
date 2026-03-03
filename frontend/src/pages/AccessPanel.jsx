@@ -14,6 +14,18 @@ import ConfirmActionModal from "../components/ConfirmActionModal";
 import TenantFormModal from "../components/TenantFormModal";
 import { tUi } from "../i18n/uiText";
 
+function translateLimitMessage(rawMessage) {
+  const text = String(rawMessage || "").trim();
+  const normalized = text.toLowerCase();
+  if (normalized.includes("limite de tenants ativos")) {
+    return `${tUi("access.limit.tenants", "Limite de tenants ativos atingido no plano atual.")} ${tUi("access.limit.actionHint", "Desative um registro existente ou altere o plano para continuar.")}`;
+  }
+  if (normalized.includes("limite de usuarios ativos") || normalized.includes("limite de usuários ativos")) {
+    return `${tUi("access.limit.users", "Limite de usuarios ativos atingido no plano atual.")} ${tUi("access.limit.actionHint", "Desative um registro existente ou altere o plano para continuar.")}`;
+  }
+  return text;
+}
+
 export default function AccessPanel({ onSystemMessage }) {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -134,7 +146,7 @@ export default function AccessPanel({ onSystemMessage }) {
       );
       await loadTenants();
     } catch (error) {
-      onSystemMessage("error", tUi("access.fail.createTenant", "Falha ao criar tenant"), error.message);
+      onSystemMessage("error", tUi("access.fail.createTenant", "Falha ao criar tenant"), translateLimitMessage(error.message));
     } finally {
       setSubmitting(false);
     }
@@ -159,7 +171,7 @@ export default function AccessPanel({ onSystemMessage }) {
       );
       await loadTenants();
     } catch (error) {
-      onSystemMessage("error", tUi("access.fail.updateTenant", "Falha ao atualizar tenant"), error.message);
+      onSystemMessage("error", tUi("access.fail.updateTenant", "Falha ao atualizar tenant"), translateLimitMessage(error.message));
     } finally {
       setSubmitting(false);
     }
@@ -256,6 +268,9 @@ export default function AccessPanel({ onSystemMessage }) {
             active: limits?.active_tenants ?? 0,
             max: limits?.max_tenants ?? 0,
           })}
+        </p>
+        <p className="muted">
+          {`Fontes ativas: ${limits?.active_data_sources ?? 0}/${limits?.max_data_sources_per_client ?? 0} (cliente) | ${limits?.active_data_sources_tenant ?? 0}/${limits?.max_data_sources_per_tenant ?? 0} (tenant atual).`}
         </p>
         {tenants.length === 0 ? (
           <p className="empty-state">{tUi("access.tenants.empty", "Nenhum tenant encontrado.")}</p>

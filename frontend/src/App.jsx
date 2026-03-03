@@ -9,6 +9,7 @@ import AuthScreen from "./components/AuthScreen";
 import PagePanel from "./pages/PagePanel";
 import OnboardingPanel from "./pages/OnboardingPanel";
 import InventoryPanel from "./pages/InventoryPanel";
+import SuggestionsPanel from "./pages/SuggestionsPanel";
 import IncidentPanel from "./pages/IncidentPanel";
 import EventsPanel from "./pages/EventsPanel";
 import OperationPanel from "./pages/OperationPanel";
@@ -58,7 +59,7 @@ const UI_TEXT = {
   pt: {
     nav: {
       onboarding: "Onboarding",
-      inventario: "Inventario",
+      inventario: "Catalogo de Dados",
       sugestoes: "Sugestoes",
       "chat-bi": "Chat BI",
       eventos: "Eventos",
@@ -73,9 +74,9 @@ const UI_TEXT = {
       configuracao: "Configuracao",
     },
     subtitles: {
-      onboarding: "Configure cliente, tenant e fonte de dados com fluxo guiado.",
+      onboarding: "Configure fontes de dados e tabelas monitoradas do tenant no fluxo guiado.",
       inventario: "Explore tabelas, colunas e classificacao de metadados por tenant.",
-      sugestoes: "Receba recomendacoes de classificacao e descricao para governanca.",
+      sugestoes: "Revise sugestoes da LLM por campo, com confirmacao, edicao e lote.",
       "chat-bi": "Perguntas em linguagem natural com contexto de metadados e politicas LGPD.",
       eventos: "Acompanhe mudancas estruturais detectadas e alertas por severidade.",
       incidentes: "Gerencie ciclo de vida de incidentes com SLA e rastreabilidade.",
@@ -236,7 +237,7 @@ const UI_TEXT = {
   en: {
     nav: {
       onboarding: "Onboarding",
-      inventario: "Inventory",
+      inventario: "Data Catalog",
       sugestoes: "Suggestions",
       "chat-bi": "Chat BI",
       eventos: "Events",
@@ -251,9 +252,9 @@ const UI_TEXT = {
       configuracao: "Configuration",
     },
     subtitles: {
-      onboarding: "Configure client, tenant and data source with a guided flow.",
+      onboarding: "Configure tenant data sources and monitored tables in a guided flow.",
       inventario: "Explore tables, columns and metadata classification by tenant.",
-      sugestoes: "Receive governance suggestions for classification and description.",
+      sugestoes: "Review LLM suggestions by field with confirm, edit and batch actions.",
       "chat-bi": "Natural language questions with metadata context and LGPD policies.",
       eventos: "Track structural changes and alerts by severity.",
       incidentes: "Manage incident lifecycle with SLA and traceability.",
@@ -414,7 +415,7 @@ const UI_TEXT = {
   es: {
     nav: {
       onboarding: "Onboarding",
-      inventario: "Inventario",
+      inventario: "Catalogo de Datos",
       sugestoes: "Sugerencias",
       "chat-bi": "Chat BI",
       eventos: "Eventos",
@@ -429,9 +430,9 @@ const UI_TEXT = {
       configuracao: "Configuracion",
     },
     subtitles: {
-      onboarding: "Configure cliente, tenant y fuente de datos con flujo guiado.",
+      onboarding: "Configure fuentes de datos y tablas monitoreadas del tenant en flujo guiado.",
       inventario: "Explore tablas, columnas y clasificacion de metadatos por tenant.",
-      sugestoes: "Reciba sugerencias de clasificacion y descripcion para gobernanza.",
+      sugestoes: "Revise sugerencias de la LLM por campo con confirmar, editar y lote.",
       "chat-bi": "Preguntas en lenguaje natural con contexto de metadatos y politicas LGPD.",
       eventos: "Acompanhe cambios estructurales y alertas por severidad.",
       incidentes: "Gestione el ciclo de vida de incidentes con SLA y trazabilidad.",
@@ -668,7 +669,8 @@ export default function App() {
       const isPartial =
         step.key === "onboarding" &&
         reason === uiText.setupWizard.reasons.onboarding_no_table;
-      status[step.key] = isPartial ? "partial" : reason ? "blocked" : "pending";
+      const keepPendingWithReason = step.key === "operacao" && Boolean(reason);
+      status[step.key] = isPartial ? "partial" : keepPendingWithReason ? "pending" : reason ? "blocked" : "pending";
     }
     return status;
   }, [effectiveCompletedSetupSteps, setupPendingReasons, uiText]);
@@ -1070,7 +1072,6 @@ export default function App() {
       };
       setStoredAuthContext(ctx);
       setAuthContext(ctx);
-      openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
       return data;
     } catch (error) {
       openSystemMessage("error", uiText.loginModal.fail_title, error.message);
@@ -1088,7 +1089,6 @@ export default function App() {
       };
       setStoredAuthContext(ctx);
       setAuthContext(ctx);
-      openSystemMessage("success", uiText.loginModal.ok_title, uiText.loginModal.ok_message);
       return data;
     } catch (error) {
       openSystemMessage("error", uiText.loginModal.fail_title, error.message);
@@ -1245,6 +1245,8 @@ export default function App() {
             {ASSISTANT_STEPS.map((step, index) => {
               const status = setupStepStatusByKey[step.key] || "pending";
               const label = uiText.setupWizard.steps?.[step.key]?.title || step.title;
+              const reason = setupPendingReasons[step.key] || "";
+              const tooltipReason = reason ? uiText.setupWizard.reasonLabel.replace("{reason}", reason) : "";
               const statusText =
                 status === "done"
                   ? uiText.setupWizard.done
@@ -1259,6 +1261,7 @@ export default function App() {
                   type="button"
                   className={`mini-step mini-step-${status} ${activePage === step.targetPage ? "active" : ""}`}
                   onClick={() => setActivePage(step.targetPage)}
+                  title={tooltipReason}
                 >
                   <span className="mini-step-index">{index + 1}</span>
                   <span className="mini-step-text">{label}</span>
@@ -1274,6 +1277,8 @@ export default function App() {
           <OnboardingPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "inventario" ? (
           <InventoryPanel onSystemMessage={openSystemMessage} />
+        ) : activePage === "sugestoes" ? (
+          <SuggestionsPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "chat-bi" ? (
           <ChatBiPanel onSystemMessage={openSystemMessage} />
         ) : activePage === "eventos" ? (

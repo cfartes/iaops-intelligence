@@ -282,6 +282,15 @@ export async function confirmMonitoredColumnDescription(payload) {
   return parseResponse(response);
 }
 
+export async function updateMonitoredColumn(payload) {
+  const response = await fetch("/api/onboarding/monitored-columns/update", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function createIncident(payload) {
   const response = await fetch("/api/incidents", {
     method: "POST",
@@ -811,6 +820,24 @@ export async function listBillingPlans() {
   const response = await fetch("/api/billing/plans", {
     method: "GET",
     headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertBillingPlan(payload) {
+  const response = await fetch("/api/billing/plans/upsert", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function deleteBillingPlan(payload) {
+  const response = await fetch("/api/billing/plans/delete", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
   });
   return parseResponse(response);
 }

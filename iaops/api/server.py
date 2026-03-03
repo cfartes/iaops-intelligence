@@ -75,6 +75,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     jobs_rate_limit_lock_seconds = 60
     local_env_loaded = False
     smtp_runtime_config: dict[str, object] = {}
+    lgpd_schema_ready = False
+    billing_plan_limits_ready = False
+    smtp_table_ready = False
 
     @staticmethod
     def _build_signup_confirm_link(confirm_token: str) -> str:
@@ -280,6 +283,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/onboarding/monitored-columns/confirm-description":
             self._handle_onboarding_monitored_column_confirm_description()
             return
+        if parsed.path == "/api/onboarding/monitored-columns/update":
+            self._handle_onboarding_monitored_column_update()
+            return
         if parsed.path == "/api/onboarding/monitored-columns/delete":
             self._handle_onboarding_monitored_column_delete()
             return
@@ -360,6 +366,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/billing/subscription":
             self._handle_billing_subscription_upsert()
+            return
+        if parsed.path == "/api/billing/plans/upsert":
+            self._handle_billing_plan_upsert()
+            return
+        if parsed.path == "/api/billing/plans/delete":
+            self._handle_billing_plan_delete()
             return
         if parsed.path == "/api/billing/installments/generate":
             self._handle_billing_installments_generate()
@@ -671,6 +683,76 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "correlation_id": None,
                     "data": {},
                     "error": {"code": "confirm_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_onboarding_monitored_column_update(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "inventory.update_column",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_db_enabled():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.update_column",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "db_unavailable", "message": "Banco nao configurado para atualizar coluna monitorada."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        monitored_column_id = body.get("monitored_column_id")
+        if monitored_column_id is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.update_column",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "monitored_column_id obrigatorio"},
+                },
+            )
+            return
+        try:
+            result = self._db_update_monitored_column(
+                tenant_id=int(context["tenant_id"]),
+                monitored_column_id=int(monitored_column_id),
+                classification=body.get("classification"),
+                description_text=body.get("description_text"),
+                llm_description_confirmed=body.get("llm_description_confirmed"),
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "inventory.update_column",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"column": result},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "inventory.update_column",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "update_error", "message": str(exc)},
                 },
             )
 
@@ -2890,11 +2972,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     @classmethod
     def _smtp_effective_config(cls) -> dict[str, object]:
         runtime = cls.smtp_runtime_config or {}
-        host = str(runtime.get("host") or os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST") or "").strip()
-        user = str(runtime.get("user") or os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or "").strip()
-        from_email = str(runtime.get("from_email") or os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or user).strip()
+        db_cfg = cls._db_load_smtp_config()
+        host = str(runtime.get("host") or db_cfg.get("host") or os.getenv("IAOPS_SMTP_HOST") or os.getenv("SMTP_HOST") or "").strip()
+        user = str(runtime.get("user") or db_cfg.get("user") or os.getenv("IAOPS_SMTP_USER") or os.getenv("SMTP_USER") or "").strip()
+        from_email = str(runtime.get("from_email") or db_cfg.get("from_email") or os.getenv("IAOPS_SMTP_FROM") or os.getenv("SMTP_FROM") or user).strip()
 
         raw_port = runtime.get("port")
+        if raw_port in (None, ""):
+            raw_port = db_cfg.get("port")
         if raw_port in (None, ""):
             raw_port = os.getenv("IAOPS_SMTP_PORT") or os.getenv("SMTP_PORT") or "587"
         try:
@@ -2906,9 +2991,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if runtime_has_password:
             password = str(runtime.get("password") or "")
         else:
-            password = str(os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or "")
+            password = str(db_cfg.get("password") or os.getenv("IAOPS_SMTP_PASS") or os.getenv("SMTP_PASS") or "")
 
         raw_tls = runtime.get("starttls")
+        if raw_tls is None:
+            raw_tls = db_cfg.get("starttls")
         if raw_tls is None:
             raw_tls = os.getenv("IAOPS_SMTP_STARTTLS") or "1"
         starttls = str(raw_tls).strip().lower() not in {"0", "false", "no", "off"}
@@ -2965,6 +3052,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             cls.smtp_runtime_config["password"] = ""
         elif password is not None and str(password).strip():
             cls.smtp_runtime_config["password"] = str(password)
+        cls._db_save_smtp_config(payload)
         return cls._smtp_public_config()
 
     @classmethod
@@ -4045,10 +4133,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             nl_response = self._execute_nl_chat_query(runtime["context"], command["question_text"], runtime_language)
             if not nl_response["ok"]:
                 return nl_response
+            channel_reply = str(nl_response["reply_text"] or "")
+            chart_hint = self._render_channel_chart_hint(
+                (nl_response.get("data") or {}).get("visualization"),
+                runtime_language,
+            )
+            if chart_hint:
+                channel_reply = f"{channel_reply}\n\n{chart_hint}".strip()
             return {
                 "ok": True,
                 "command": "nl_query",
-                "reply_text": nl_response["reply_text"],
+                "reply_text": channel_reply,
                 "data": {
                     "active_tenant": runtime["active"],
                     "query": nl_response["data"],
@@ -4061,6 +4156,40 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "reply_text": self._reply_help(message_text, language_code),
             "data": {},
         }
+
+    @staticmethod
+    def _render_channel_chart_hint(visualization: dict | None, language_code: str) -> str:
+        if not isinstance(visualization, dict):
+            return ""
+        labels = visualization.get("labels") or []
+        series = visualization.get("series") or []
+        values = series[0].get("values") if series and isinstance(series[0], dict) else []
+        chart_url = str(visualization.get("chart_url") or "").strip()
+        if not isinstance(labels, list) or not isinstance(values, list) or len(labels) < 2:
+            return ""
+        top_lines = []
+        for idx, label in enumerate(labels[:5]):
+            if idx >= len(values):
+                break
+            top_lines.append(f"- {label}: {values[idx]}")
+        if not top_lines:
+            return ""
+        bucket = IAOpsAPIHandler._language_bucket(language_code)
+        if bucket == "en":
+            header = "Chart summary:"
+        elif bucket == "es":
+            header = "Resumen del grafico:"
+        else:
+            header = "Resumo do grafico:"
+        lines = [header] + top_lines
+        if chart_url:
+            if bucket == "en":
+                lines.append(f"Chart: {chart_url}")
+            elif bucket == "es":
+                lines.append(f"Grafico: {chart_url}")
+            else:
+                lines.append(f"Grafico: {chart_url}")
+        return "\n".join(lines)
 
     def _resolve_channel_runtime_context(
         self,
@@ -4309,11 +4438,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         lines.append(f"Comando: sql {sql_text}")
         return "\n".join(lines)
 
-    def _execute_nl_chat_query(self, context: dict, question_text: str, language_code: str | None = None) -> dict:
+    def _execute_nl_chat_query(
+        self,
+        context: dict,
+        question_text: str,
+        language_code: str | None = None,
+        data_source_id: int | None = None,
+    ) -> dict:
         resolved_language = language_code or self._resolve_language_code(context)
         response_mode = self._resolve_chat_response_mode(context)
-        rag = self._build_rag_context(context, question_text)
-        planned = self._plan_sql_from_question(context, question_text, rag)
+        intent = self._route_nl_intent(question_text)
+        rag = self._build_rag_context(context, question_text, data_source_id=data_source_id)
+        planned = self._plan_sql_from_question(context, question_text, rag, intent)
         sql_text = planned.get("sql_text")
         if not sql_text:
             return {
@@ -4345,6 +4481,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "planned_sql": sql_text,
                         "planning_mode": planned.get("mode", "rules"),
                         "llm_provider": planned.get("llm_provider"),
+                        "natural_response_template": planned.get("natural_response_template"),
+                        "chart_suggestion": planned.get("chart_suggestion"),
                         "language_code": resolved_language,
                         "chat_response_mode": response_mode,
                         "rag": rag,
@@ -4354,20 +4492,40 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             query_data = fallback["data"]
         else:
             query_data = query_result["data"]
+        visualization = self._build_visualization_payload(
+            question_text=question_text,
+            query_data=query_data,
+            language_code=resolved_language,
+            intent=intent,
+            chart_suggestion=planned.get("chart_suggestion"),
+        )
+        final_reply = self._reply_nl_result(
+            question_text,
+            sql_text,
+            query_data,
+            rag,
+            response_mode,
+            resolved_language,
+            intent,
+            planned.get("natural_response_template"),
+        )
         return {
             "ok": True,
-            "reply_text": self._reply_nl_result(
-                question_text, sql_text, query_data, rag, response_mode, resolved_language
-            ),
+            "reply_text": final_reply,
             "data": {
                 "question_text": question_text,
+                "reply_text": final_reply,
+                "intent": intent,
                 "planned_sql": sql_text,
                 "planning_mode": planned.get("mode", "rules"),
                 "llm_provider": planned.get("llm_provider"),
+                "natural_response_template": planned.get("natural_response_template"),
+                "chart_suggestion": planned.get("chart_suggestion"),
                 "language_code": resolved_language,
                 "chat_response_mode": response_mode,
                 "rag": rag,
                 "result": query_data,
+                "visualization": visualization,
             },
         }
 
@@ -4410,14 +4568,140 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"ok": False}
         try:
             profile = self._extract_connection_profile(conn_secret_ref=conn_secret_ref, secret_payload=None)
-            query_data = self._execute_source_fallback_query(
-                source_type=source_type,
-                profile=profile,
-                spec=spec,
-            )
+            lower_sql = str(sql_text or "").strip().lower()
+            if " join " in lower_sql and self._is_planned_sql_allowed(sql_text):
+                try:
+                    query_data = self._execute_source_raw_select(
+                        source_type=source_type,
+                        profile=profile,
+                        sql_text=sql_text,
+                    )
+                    return {"ok": True, "data": query_data}
+                except Exception:
+                    pass
+            query_data = self._execute_source_fallback_query(source_type=source_type, profile=profile, spec=spec)
         except Exception:
             return {"ok": False}
         return {"ok": True, "data": query_data}
+
+    def _execute_source_raw_select(self, *, source_type: str, profile: dict, sql_text: str) -> dict:
+        kind = str(source_type or "").strip().lower()
+        if kind in {"postgres", "postgresql"}:
+            return self._execute_source_raw_postgres(profile=profile, sql_text=sql_text)
+        if kind == "mysql":
+            return self._execute_source_raw_mysql(profile=profile, sql_text=sql_text)
+        if kind in {"sqlserver", "sql_server", "mssql"}:
+            return self._execute_source_raw_sqlserver(profile=profile, sql_text=sql_text)
+        if kind == "oracle":
+            return self._execute_source_raw_oracle(profile=profile, sql_text=sql_text)
+        raise ValueError(f"Execucao SQL direta nao suportada para source_type={kind}")
+
+    def _execute_source_raw_postgres(self, *, profile: dict, sql_text: str) -> dict:
+        if connect is None:
+            raise ValueError("Driver PostgreSQL indisponivel (psycopg).")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            host = str(profile.get("host") or "").strip()
+            user = str(profile.get("user") or "").strip()
+            password = str(profile.get("password") or "").strip()
+            dbname = str(profile.get("dbname") or profile.get("database") or "").strip()
+            port = str(profile.get("port") or "5432").strip()
+            if not host or not user or not dbname:
+                raise ValueError("Informe dsn ou host/user/password/dbname no secret_payload.")
+            dsn = f"host={host} port={port} dbname={dbname} user={user}"
+            if password:
+                dsn += f" password={password}"
+        with connect(dsn, connect_timeout=8) as conn, conn.cursor() as cur:
+            cur.execute(sql_text)
+            rows = cur.fetchall()
+            columns = [str(item[0]) for item in (cur.description or [])]
+        return {"columns": columns, "rows": [dict(zip(columns, row)) for row in rows]}
+
+    def _execute_source_raw_mysql(self, *, profile: dict, sql_text: str) -> dict:
+        if pymysql is None:
+            raise ValueError("Driver pymysql nao instalado para consulta MySQL.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 3306)
+        database = str(profile.get("database") or profile.get("dbname") or "").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        with pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database or None,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            charset="utf8mb4",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_text)
+                rows = cur.fetchall()
+                columns = [str(item[0]) for item in (cur.description or [])]
+        return {"columns": columns, "rows": [dict(zip(columns, row)) for row in rows]}
+
+    def _execute_source_raw_sqlserver(self, *, profile: dict, sql_text: str) -> dict:
+        if pyodbc is None:
+            raise ValueError("Driver pyodbc nao instalado para consulta SQL Server.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1433)
+        database = str(profile.get("database") or profile.get("dbname") or "master").strip()
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        timeout = int(profile.get("timeout_seconds") or 8)
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        conn_str = dsn
+        if not conn_str:
+            configured_driver = str(profile.get("driver") or "").strip()
+            if configured_driver:
+                driver = configured_driver
+            else:
+                available = list(pyodbc.drivers())
+                preferred = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]
+                driver = next((item for item in preferred if item in available), (available[0] if available else "SQL Server"))
+            conn_str = (
+                f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};UID={user};PWD={password};"
+                f"Encrypt=yes;TrustServerCertificate=yes;Connection Timeout={timeout};"
+            )
+        with pyodbc.connect(conn_str, timeout=timeout) as conn:
+            cur = conn.cursor()
+            cur.execute(sql_text)
+            rows = cur.fetchall()
+            columns = [str(item[0]) for item in (cur.description or [])]
+        return {"columns": columns, "rows": [dict(zip(columns, row)) for row in rows]}
+
+    def _execute_source_raw_oracle(self, *, profile: dict, sql_text: str) -> dict:
+        if oracledb is None:
+            raise ValueError("Driver oracledb nao instalado para consulta Oracle.")
+        host = str(profile.get("host") or profile.get("server") or "").strip()
+        port = int(profile.get("port") or 1521)
+        user = str(profile.get("user") or profile.get("username") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        service_name = str(profile.get("service_name") or "").strip()
+        sid = str(profile.get("sid") or "").strip()
+        if not host or not user:
+            raise ValueError("Informe host, user e password no secret_payload.")
+        dsn = str(profile.get("dsn") or "").strip()
+        if not dsn:
+            if service_name:
+                dsn = f"{host}:{port}/{service_name}"
+            elif sid:
+                dsn = f"{host}:{port}/{sid}"
+            else:
+                dsn = f"{host}:{port}/XEPDB1"
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_text)
+                rows = cur.fetchall()
+                columns = [str(item[0]) for item in (cur.description or [])]
+        return {"columns": columns, "rows": [dict(zip(columns, row)) for row in rows]}
 
     @staticmethod
     def _parse_supported_source_query(sql_text: str) -> dict | None:
@@ -4591,7 +4875,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             port=port,
             user=user,
             password=password,
-            database=database or schema,
+            database=database or None,
             connect_timeout=timeout,
             read_timeout=timeout,
             write_timeout=timeout,
@@ -4793,7 +5077,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         return self._resolve_language_code(runtime_context)
 
-    def _build_rag_context(self, context: dict, question_text: str = "") -> dict:
+    def _build_rag_context(self, context: dict, question_text: str = "", data_source_id: int | None = None) -> dict:
         semantic_docs: list[dict] = []
         data_source_rag: list[dict] = []
         try:
@@ -4813,17 +5097,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         )
         if source_result.get("status") == "success":
             for src in ((source_result.get("data") or {}).get("sources") or []):
+                if data_source_id is not None and int(src.get("id") or 0) != int(data_source_id):
+                    continue
                 if not bool(src.get("rag_enabled")):
                     continue
                 rag_text = str(src.get("rag_context_text") or "").strip()
                 if not rag_text:
                     continue
+                rag_prompt_text = self._rag_context_to_prompt_text(rag_text)
                 data_source_rag.append(
                     {
                         "data_source_id": src.get("id"),
                         "source_name": src.get("source_name") or src.get("source_type"),
                         "source_type": src.get("source_type"),
-                        "context_text": rag_text,
+                        "context_text": rag_prompt_text,
                     }
                 )
         data_source_rag = data_source_rag[:6]
@@ -4831,7 +5118,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             {
                 "context": context,
                 "tool": "inventory.list_tenant_tables",
-                "input": {},
+                "input": {"data_source_id": int(data_source_id)} if data_source_id is not None else {},
             }
         )
         if table_result["status"] != "success":
@@ -4910,27 +5197,61 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             unique.append(item)
         return unique
 
-    def _plan_sql_from_question(self, context: dict, question_text: str, rag: dict) -> dict:
+    def _plan_sql_from_question(self, context: dict, question_text: str, rag: dict, intent: dict | None = None) -> dict:
         llm_plan = self._plan_sql_with_llm(context, question_text, rag)
         if llm_plan.get("sql_text"):
             return llm_plan
-        return self._plan_sql_with_rules(question_text, rag)
+        return self._plan_sql_with_rules(question_text, rag, intent=intent)
 
     @staticmethod
-    def _plan_sql_with_rules(question_text: str, rag: dict) -> dict:
+    def _plan_sql_with_rules(question_text: str, rag: dict, intent: dict | None = None) -> dict:
         q = question_text.lower()
         tokens = IAOpsAPIHandler._normalize_query_tokens(question_text)
+        routed = intent or IAOpsAPIHandler._route_nl_intent(question_text)
+        wants_dimension = bool(routed.get("needs_dimension"))
         if ("incidente" in q or "incident" in q) and ("aberto" in q or "abertos" in q or "open" in q):
+            severity = IAOpsAPIHandler._resolve_severity_token(tokens)
+            if severity:
+                return {
+                    "mode": "rules",
+                    "sql_text": (
+                        "SELECT COUNT(*) AS total "
+                        "FROM iaops_gov.incident "
+                        f"WHERE status IN ('open','ack') AND severity = '{severity}'"
+                    ),
+                }
             return {
                 "mode": "rules",
-                "sql_text": "SELECT status, COUNT(*) AS total FROM iaops_gov.incident WHERE status IN ('open','ack') GROUP BY status",
+                "sql_text": (
+                    "SELECT severity, COUNT(*) AS total "
+                    "FROM iaops_gov.incident "
+                    "WHERE status IN ('open','ack') "
+                    "GROUP BY severity "
+                    "ORDER BY total DESC"
+                ),
             }
         if ("evento" in q or "event" in q) and ("critico" in q or "criticos" in q or "critical" in q):
             return {
                 "mode": "rules",
                 "sql_text": "SELECT severity, COUNT(*) AS total FROM iaops_gov.schema_change_event WHERE severity = 'critical' GROUP BY severity",
             }
-        if "tabela" in q or "inventario" in q or "table" in q or "tables" in q:
+        top_relation = IAOpsAPIHandler._plan_top_relation_sql(
+            tokens=tokens,
+            rag=rag,
+            include_dimension=wants_dimension,
+            top_n=int(routed.get("top_n") or 20),
+        )
+        if top_relation:
+            return {"mode": "rules", "sql_text": top_relation}
+        grouped_metric = IAOpsAPIHandler._plan_grouped_metric_sql(tokens=tokens, rag=rag)
+        if grouped_metric:
+            return {"mode": "rules", "sql_text": grouped_metric}
+        asks_inventory = ("inventario" in q or "catalogo" in q or "schema" in q or "schemas" in q)
+        asks_table_list = (
+            ("tabela" in q or "tabelas" in q or "table" in q or "tables" in q)
+            and any(term in q for term in ["monitorad", "cadastrad", "catalog", "schema", "estrutur"])
+        )
+        if asks_inventory or asks_table_list:
             return {
                 "mode": "rules",
                 "sql_text": "SELECT schema_name, table_name, is_active FROM iaops_gov.monitored_table ORDER BY schema_name, table_name LIMIT 50",
@@ -4969,9 +5290,25 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
         prompt_payload = {
             "instruction": (
-                "Converta a pergunta do usuario para SQL SELECT seguro. "
-                "Responda SOMENTE com JSON no formato: {\"sql_text\":\"...\"}. "
-                "Nao use DDL/DML. Sem ponto e virgula."
+                "PERFIL E MISSAO: Voce e o Planejador Semantico do IAOps Governance. "
+                "Traduza perguntas de usuarios de negocio (leigos) em SQL seguro e em resposta humanizada.\n"
+                "DIRETRIZES DE LINGUAGEM NATURAL: "
+                "1) Atue como analista de BI atencioso (ex.: 'Atualmente, temos...', 'Identifiquei que...'). "
+                "2) Nunca exponha nomes tecnicos de coluna ao usuario final. "
+                "3) Contextualize resultados com significado de negocio.\n"
+                "REGRAS DE OURO: "
+                "a) respeitar tenant ativo (multi-tenant), "
+                "b) apenas SELECT, sem DDL/DML, sem ponto e virgula, "
+                "c) usar joins por FK/chaves de negocio quando necessario.\n"
+                "ROTEAMENTO DE INTENCAO: "
+                "'quantos' => COUNT/SUM; "
+                "'quais/listar' => SELECT DISTINCT de nomes/descricoes; "
+                "'melhor/pior/top' => ORDER BY com LIMIT 20 (ou TOP N solicitado).\n"
+                "FORMATO OBRIGATORIO: responder SOMENTE JSON com as chaves: "
+                "{\"sql_text\":\"...\","
+                "\"natural_response_template\":\"...\","
+                "\"chart_suggestion\":\"bar|line|pie|none\"}.\n"
+                "Seguranca: SQL deve ser exclusivamente SELECT seguro."
             ),
             "question": question_text,
             "tables": rag.get("tables") or [],
@@ -5020,7 +5357,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"mode": "llm_empty", "sql_text": None}
         if not self._is_planned_sql_allowed(sql_text):
             return {"mode": "llm_rejected", "sql_text": None}
-        return {"mode": "llm", "sql_text": sql_text, "llm_provider": provider_name}
+        natural_template = str((llm_output or {}).get("natural_response_template") or "").strip() or None
+        chart_suggestion = str((llm_output or {}).get("chart_suggestion") or "").strip().lower()
+        if chart_suggestion not in {"bar", "line", "pie", "none"}:
+            chart_suggestion = None
+        return {
+            "mode": "llm",
+            "sql_text": sql_text,
+            "llm_provider": provider_name,
+            "natural_response_template": natural_template,
+            "chart_suggestion": chart_suggestion,
+        }
 
     def _record_app_llm_usage(
         self,
@@ -5122,7 +5469,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a SQL planner. Return only JSON.",
+                    "content": (
+                        "You are the IAOps semantic SQL planner for business users. "
+                        "Return only valid JSON with keys sql_text, natural_response_template, chart_suggestion. "
+                        "SQL must be SELECT-only and tenant-safe."
+                    ),
                 },
                 {
                     "role": "user",
@@ -5231,6 +5582,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "filmes": "film",
             "ator": "actor",
             "atores": "actor",
+            "quais": "which",
+            "qual": "which",
+            "quem": "who",
             "cliente": "customer",
             "clientes": "customer",
             "aluguel": "rental",
@@ -5248,8 +5602,118 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return [synonyms.get(token, token) for token in tokens]
 
     @staticmethod
+    def _is_dimension_question(tokens: list[str]) -> bool:
+        token_set = set(tokens or [])
+        return bool(token_set & {"which", "who", "list", "mostrar", "mostre", "show", "top", "qual", "quais"})
+
+    @staticmethod
+    def _route_nl_intent(question_text: str) -> dict:
+        tokens = IAOpsAPIHandler._normalize_query_tokens(question_text)
+        token_set = set(tokens)
+        mode = "summary"
+        if token_set & {"list", "listar", "lista"}:
+            mode = "list"
+        elif token_set & {"which", "who", "show", "mostrar", "mostre"}:
+            mode = "which"
+        elif token_set & {"quantos", "qtd", "count", "how", "many", "cuantos", "total"}:
+            mode = "count"
+        if token_set & {"top", "mais", "maiores", "ranking", "highest", "most"}:
+            mode = "top"
+        top_n = 20
+        try:
+            match = re.search(r"\btop\s*(\d{1,3})\b", str(question_text or "").lower())
+            if match:
+                top_n = max(1, min(int(match.group(1)), 100))
+        except Exception:
+            top_n = 20
+        needs_dimension = mode in {"which", "list", "top"} or ("by" in token_set) or ("por" in token_set)
+        intent_type = mode
+        return {
+            "mode": mode,
+            "intent_type": intent_type,
+            "top_n": top_n,
+            "needs_dimension": bool(needs_dimension),
+            "tokens": tokens,
+        }
+
+    @staticmethod
+    def _resolve_severity_token(tokens: list[str]) -> str | None:
+        token_set = set(tokens or [])
+        if token_set & {"low", "baixa", "baixo"}:
+            return "low"
+        if token_set & {"medium", "media", "mediana"}:
+            return "medium"
+        if token_set & {"high", "alta", "alto"}:
+            return "high"
+        if token_set & {"critical", "critica", "critico"}:
+            return "critical"
+        return None
+
+    @staticmethod
+    def _plan_top_relation_sql(tokens: list[str], rag: dict, include_dimension: bool, top_n: int = 20) -> str | None:
+        if not tokens:
+            return None
+        token_set = set(tokens)
+        if not (token_set & {"mais", "top", "ranking", "maiores", "highest", "most"}):
+            return None
+        if not ({"actor", "film"} <= token_set):
+            return None
+        limit_n = int(max(1, min(int(top_n or 20), 100)))
+        tables = rag.get("tables") or []
+        columns_by_table = rag.get("columns") or {}
+        for table in tables:
+            schema_name = str(table.get("schema_name") or "").strip()
+            table_name = str(table.get("table_name") or "").strip()
+            key = f"{schema_name}.{table_name}"
+            cols = {str(col.get("column_name") or "").strip().lower() for col in (columns_by_table.get(key) or [])}
+            if {"actor_id", "film_id"} <= cols:
+                if not include_dimension:
+                    return f"SELECT COUNT(DISTINCT actor_id) AS total FROM {schema_name}.{table_name}"
+                actor_table = next(
+                    (
+                        t
+                        for t in tables
+                        if str(t.get("schema_name") or "").strip().lower() == schema_name.lower()
+                        and str(t.get("table_name") or "").strip().lower() == "actor"
+                    ),
+                    None,
+                )
+                actor_cols = set()
+                if actor_table:
+                    actor_key = f"{actor_table.get('schema_name')}.{actor_table.get('table_name')}"
+                    actor_cols = {str(col.get("column_name") or "").strip().lower() for col in (columns_by_table.get(actor_key) or [])}
+                if {"actor_id", "first_name", "last_name"} <= actor_cols:
+                    return (
+                        "SELECT fa.actor_id, a.first_name, a.last_name, COUNT(DISTINCT fa.film_id) AS total "
+                        f"FROM {schema_name}.{table_name} fa "
+                        f"JOIN {schema_name}.actor a ON a.actor_id = fa.actor_id "
+                        "GROUP BY fa.actor_id, a.first_name, a.last_name "
+                        "ORDER BY total DESC "
+                        f"LIMIT {limit_n}"
+                    )
+                if {"actor_id", "name"} <= actor_cols:
+                    return (
+                        "SELECT fa.actor_id, a.name, COUNT(DISTINCT fa.film_id) AS total "
+                        f"FROM {schema_name}.{table_name} fa "
+                        f"JOIN {schema_name}.actor a ON a.actor_id = fa.actor_id "
+                        "GROUP BY fa.actor_id, a.name "
+                        "ORDER BY total DESC "
+                        f"LIMIT {limit_n}"
+                    )
+                return (
+                    f"SELECT actor_id, COUNT(DISTINCT film_id) AS total "
+                    f"FROM {schema_name}.{table_name} "
+                    f"GROUP BY actor_id "
+                    f"ORDER BY total DESC "
+                    f"LIMIT {limit_n}"
+                )
+        return None
+
+    @staticmethod
     def _plan_grouped_count_sql(tokens: list[str], rag: dict) -> str | None:
         if not tokens:
+            return None
+        if not IAOpsAPIHandler._is_dimension_question(tokens):
             return None
         if "by" not in tokens and "por" not in tokens:
             return None
@@ -5291,6 +5755,72 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 )
         return None
 
+    @staticmethod
+    def _plan_grouped_metric_sql(tokens: list[str], rag: dict) -> str | None:
+        if not tokens:
+            return None
+        token_set = set(tokens)
+        if "by" not in token_set and "por" not in token_set:
+            return None
+        if not any(term in token_set for term in {"valor", "total", "faturamento", "receita", "soma", "amount", "revenue", "sales"}):
+            return None
+        by_idx = tokens.index("by") if "by" in tokens else tokens.index("por")
+        if by_idx >= len(tokens) - 1:
+            return None
+        group_entity = tokens[by_idx + 1]
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", group_entity):
+            return None
+        if group_entity.endswith("s") and len(group_entity) > 3:
+            group_entity = group_entity[:-1]
+
+        tables = rag.get("tables") or []
+        columns_by_table = rag.get("columns") or {}
+        for table in tables:
+            schema_name = str(table.get("schema_name") or "").strip()
+            table_name = str(table.get("table_name") or "").strip()
+            if not schema_name or not table_name:
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema_name):
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+                continue
+            key = f"{schema_name}.{table_name}"
+            cols = columns_by_table.get(key) or []
+            if not cols:
+                continue
+
+            group_col = None
+            metric_col = None
+            for col in cols:
+                col_name = str(col.get("column_name") or "").strip().lower()
+                if not col_name:
+                    continue
+                if group_col is None:
+                    if (
+                        col_name == group_entity
+                        or col_name == f"{group_entity}_id"
+                        or col_name.startswith(f"{group_entity}_")
+                        or group_entity in col_name
+                    ):
+                        group_col = col_name
+
+                if metric_col is None:
+                    class_hint = str(col.get("classification") or col.get("llm_classification_suggested") or "").strip().lower()
+                    if class_hint == "financial":
+                        metric_col = col_name
+                    elif any(term in col_name for term in ["valor", "amount", "price", "preco", "total", "revenue", "fatur", "receita", "sale"]):
+                        metric_col = col_name
+
+            if group_col and metric_col:
+                return (
+                    f"SELECT {group_col}, SUM({metric_col}) AS total "
+                    f"FROM {schema_name}.{table_name} "
+                    f"GROUP BY {group_col} "
+                    f"ORDER BY total DESC "
+                    f"LIMIT 100"
+                )
+        return None
+
     def _reply_nl_result(
         self,
         question_text: str,
@@ -5299,24 +5829,356 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         rag: dict,
         response_mode: str,
         language_code: str,
+        intent: dict | None = None,
+        natural_response_template: str | None = None,
     ) -> str:
         rows = query_data.get("rows") or []
         columns = query_data.get("columns") or []
-        lines = []
-        lines.append(self._t(language_code, "question_label", value=question_text))
-        lines.append(self._t(language_code, "found_records", total=len(rows)))
-        if rows and "total" in columns and isinstance(rows[0], dict) and "total" in rows[0]:
-            lines.append(self._t(language_code, "total_label", value=rows[0]["total"]))
-        if rows and response_mode == "detailed":
-            lines.append(self._t(language_code, "preview_label"))
+        bucket = self._language_bucket(language_code)
+        question = str(question_text or "").strip()
+        lowered = question.lower()
+        routed = intent or {}
+        mode = str(routed.get("mode") or "summary")
+
+        def _row_label(row: dict) -> str:
+            if not isinstance(row, dict):
+                return ""
+            first_name = str(row.get("first_name") or "").strip()
+            last_name = str(row.get("last_name") or "").strip()
+            if first_name or last_name:
+                return " ".join(part for part in [first_name, last_name] if part).strip()
+            preferred = ["name", "nome", "title", "descricao", "description", "label", "ator", "actor"]
+            for key in preferred:
+                value = str(row.get(key) or "").strip()
+                if value:
+                    return value
+            for col in columns:
+                if str(col).lower() == "total":
+                    continue
+                value = str(row.get(col) or "").strip()
+                if value:
+                    return value
+            return ""
+
+        templated = self._apply_natural_response_template(
+            natural_response_template=natural_response_template,
+            rows=rows,
+            columns=columns,
+        )
+        if templated:
+            return templated
+
+        if not rows:
+            if bucket == "en":
+                return "I did not find records for this question."
+            if bucket == "es":
+                return "No encontre registros para esta pregunta."
+            return "Nao encontrei registros para esta pergunta."
+
+        def _fmt_total(total_value: int, groups: int) -> str:
+            if bucket == "en":
+                if groups <= 1:
+                    return f"Total found: {total_value}."
+                return f"Total found: {total_value} (across {groups} groups)."
+            if bucket == "es":
+                if groups <= 1:
+                    return f"Total encontrado: {total_value}."
+                return f"Total encontrado: {total_value} (distribuido en {groups} grupos)."
+            if groups <= 1:
+                return f"Total encontrado: {total_value}."
+            return f"Total encontrado: {total_value} (distribuido em {groups} grupos)."
+
+        def _fmt_main_items(items: list[str], *, top_mode: bool = False) -> str:
+            joined = ", ".join(items)
+            if bucket == "en":
+                return f"{'Top results' if top_mode else 'Main items'}: {joined}."
+            if bucket == "es":
+                return f"{'Top resultados' if top_mode else 'Principales elementos'}: {joined}."
+            return f"{'Top resultados' if top_mode else 'Principais itens'}: {joined}."
+
+        def _fmt_found_rows(total_rows: int) -> str:
+            if bucket == "en":
+                return f"I found {total_rows} result(s)."
+            if bucket == "es":
+                return f"Encontre {total_rows} resultado(s)."
+            return f"Encontrei {total_rows} resultado(s)."
+
+        totals = []
+        if "total" in columns:
+            for row in rows:
+                if isinstance(row, dict):
+                    value = row.get("total")
+                    if isinstance(value, (int, float)):
+                        totals.append(value)
+                    else:
+                        try:
+                            totals.append(float(value))
+                        except Exception:
+                            pass
+        if totals:
+            total_sum = int(sum(totals))
+            if "incidente" in lowered and "aberto" in lowered:
+                if "severity" in columns:
+                    parts = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        sev = str(row.get("severity") or "-").strip().lower()
+                        sev_pt = {"low": "baixa", "medium": "media", "high": "alta", "critical": "critica"}.get(sev, sev)
+                        sev_en = {"low": "low", "medium": "medium", "high": "high", "critical": "critical"}.get(sev, sev)
+                        sev_es = {"low": "baja", "medium": "media", "high": "alta", "critical": "critica"}.get(sev, sev)
+                        qtd = row.get("total")
+                        if bucket == "en":
+                            parts.append(f"{qtd} with {sev_en} severity")
+                        elif bucket == "es":
+                            parts.append(f"{qtd} de gravedad {sev_es}")
+                        else:
+                            parts.append(f"{qtd} de gravidade {sev_pt}")
+                    if parts:
+                        if bucket == "en":
+                            return f"{total_sum} open incidents: {', '.join(parts)}."
+                        if bucket == "es":
+                            return f"{total_sum} incidentes abiertos: {', '.join(parts)}."
+                        return f"{total_sum} incidentes abertos: {', '.join(parts)}."
+                if bucket == "en":
+                    return f"{total_sum} open incidents."
+                if bucket == "es":
+                    return f"{total_sum} incidentes abiertos."
+                return f"{total_sum} incidentes abertos."
+            if ("ator" in lowered or "atores" in lowered or "actor" in lowered) and ("filme" in lowered or "film" in lowered):
+                top = []
+                for row in rows[:5]:
+                    if not isinstance(row, dict):
+                        continue
+                    qtd = row.get("total")
+                    if qtd is None:
+                        continue
+                    first_name = str(row.get("first_name") or "").strip()
+                    last_name = str(row.get("last_name") or "").strip()
+                    actor_name = str(row.get("name") or "").strip()
+                    actor_id = row.get("actor_id")
+                    label = actor_name or " ".join(part for part in [first_name, last_name] if part).strip()
+                    if not label and actor_id is not None:
+                        label = f"ator {actor_id}"
+                    if label:
+                        if bucket == "en":
+                            top.append(f"{label} ({qtd} films)")
+                        elif bucket == "es":
+                            top.append(f"{label} ({qtd} peliculas)")
+                        else:
+                            top.append(f"{label} ({qtd} filmes)")
+                if top:
+                    if bucket == "en":
+                        return f"Top actors by number of films: {', '.join(top)}."
+                    if bucket == "es":
+                        return f"Actores principales por cantidad de peliculas: {', '.join(top)}."
+                    return f"Top atores por quantidade de filmes: {', '.join(top)}."
+            if mode in {"which", "list", "top"}:
+                details = []
+                for row in rows[:5]:
+                    if not isinstance(row, dict):
+                        continue
+                    label = _row_label(row)
+                    qtd = row.get("total")
+                    if label and qtd is not None:
+                        details.append(f"{label} ({qtd})")
+                    elif label:
+                        details.append(label)
+                if details:
+                    return _fmt_main_items(details, top_mode=(mode == "top"))
+                return _fmt_found_rows(len(rows))
+            return _fmt_total(total_sum, len(rows))
+
+        if ("ator" in lowered or "atores" in lowered or "actor" in lowered) and ("filme" in lowered or "film" in lowered):
+            top_lines = []
+            for row in rows[:5]:
+                if isinstance(row, dict):
+                    top_lines.append(", ".join(f"{k}: {row.get(k)}" for k in columns[:3]))
+            if top_lines:
+                if bucket == "en":
+                    return "Top results found: " + " | ".join(top_lines)
+                if bucket == "es":
+                    return "Resultados principales encontrados: " + " | ".join(top_lines)
+                return "Top resultados encontrados: " + " | ".join(top_lines)
+
+        if response_mode == "detailed":
+            preview = []
             for idx, row in enumerate(rows[:5], start=1):
-                lines.append(f"{idx}. {json.dumps(row, ensure_ascii=True)}")
-        elif rows:
-            lines.append(self._t(language_code, "executive_summary"))
-        tables = rag.get("tables") or []
-        if tables and response_mode == "detailed":
-            lines.append(self._t(language_code, "rag_context_tables", total=len(tables)))
-        return "\n".join(lines)
+                preview.append(f"{idx}. {json.dumps(row, ensure_ascii=True)}")
+            return f"{self._t(language_code, 'found_records', total=len(rows))}\n{self._t(language_code, 'preview_label')}\n" + "\n".join(preview)
+        return f"{self._t(language_code, 'found_records', total=len(rows))} {self._t(language_code, 'executive_summary')}"
+
+    @staticmethod
+    def _apply_natural_response_template(
+        *,
+        natural_response_template: str | None,
+        rows: list[dict],
+        columns: list[str],
+    ) -> str | None:
+        template = str(natural_response_template or "").strip()
+        if not template:
+            return None
+        safe_rows = [row for row in (rows or []) if isinstance(row, dict)]
+        if not safe_rows:
+            return None
+        first_row = safe_rows[0]
+        total_value = None
+        if "total" in columns:
+            try:
+                total_value = float(first_row.get("total"))
+                if float(total_value).is_integer():
+                    total_value = int(total_value)
+            except Exception:
+                total_value = None
+        top_items = []
+        for row in safe_rows[:5]:
+            label = ""
+            if str(row.get("first_name") or "").strip() or str(row.get("last_name") or "").strip():
+                label = " ".join(
+                    part for part in [str(row.get("first_name") or "").strip(), str(row.get("last_name") or "").strip()] if part
+                ).strip()
+            if not label:
+                for key in ("name", "nome", "title", "descricao", "description", "label"):
+                    value = str(row.get(key) or "").strip()
+                    if value:
+                        label = value
+                        break
+            if not label:
+                for col in columns:
+                    if str(col).lower() == "total":
+                        continue
+                    value = str(row.get(col) or "").strip()
+                    if value:
+                        label = value
+                        break
+            qtd = row.get("total")
+            if label and qtd is not None:
+                top_items.append(f"{label} ({qtd})")
+            elif label:
+                top_items.append(label)
+        rendered = template
+        rendered = rendered.replace("{{row_count}}", str(len(safe_rows)))
+        rendered = rendered.replace("{{top_items}}", ", ".join(top_items))
+        if total_value is not None:
+            rendered = rendered.replace("{{total}}", str(total_value))
+        # Substitui placeholders diretos por colunas da primeira linha: {{coluna}}
+        for match in re.findall(r"\{\{([A-Za-z0-9_]+)\}\}", rendered):
+            key = str(match or "").strip()
+            if not key:
+                continue
+            replacement = first_row.get(key)
+            if replacement is None and key.lower() != key:
+                replacement = first_row.get(key.lower())
+            rendered = rendered.replace(f"{{{{{key}}}}}", "" if replacement is None else str(replacement))
+        rendered = re.sub(r"\s+", " ", rendered).strip()
+        return rendered or None
+
+    @staticmethod
+    def _build_visualization_payload(
+        *,
+        question_text: str,
+        query_data: dict,
+        language_code: str,
+        intent: dict | None = None,
+        chart_suggestion: str | None = None,
+    ) -> dict | None:
+        rows = list(query_data.get("rows") or [])
+        columns = list(query_data.get("columns") or [])
+        if len(rows) < 2 or not columns:
+            return None
+        routed = intent or {}
+        mode = str(routed.get("mode") or "")
+        if mode == "count" and not routed.get("needs_dimension"):
+            return None
+        metric_col = "total" if "total" in columns else None
+        if metric_col is None:
+            numeric_candidates = []
+            for col in columns:
+                if any(isinstance((row or {}).get(col), (int, float)) for row in rows if isinstance(row, dict)):
+                    numeric_candidates.append(col)
+            if not numeric_candidates:
+                return None
+            metric_col = numeric_candidates[0]
+        dimension_col = next((col for col in columns if col != metric_col), None)
+        if not dimension_col:
+            return None
+        labels = []
+        values = []
+        for row in rows[:20]:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get(dimension_col) or "").strip()
+            if not label:
+                continue
+            value = row.get(metric_col)
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            labels.append(label)
+            values.append(numeric)
+        if len(labels) < 2:
+            return None
+        bucket = IAOpsAPIHandler._language_bucket(language_code)
+        if bucket == "en":
+            title = f"{dimension_col} by {metric_col}"
+        elif bucket == "es":
+            title = f"{dimension_col} por {metric_col}"
+        else:
+            title = f"{dimension_col} por {metric_col}"
+        chart_type = "bar"
+        suggested = str(chart_suggestion or "").strip().lower()
+        if suggested in {"bar", "line", "pie"}:
+            chart_type = suggested
+        elif "evolucao" in str(question_text or "").lower() or "trend" in str(question_text or "").lower():
+            chart_type = "line"
+        chart_url = IAOpsAPIHandler._build_quickchart_url(
+            chart_type=chart_type,
+            title=title,
+            labels=labels,
+            values=values,
+            series_name=str(metric_col),
+        )
+        return {
+            "chart_type": chart_type,
+            "title": title,
+            "x_field": dimension_col,
+            "y_field": metric_col,
+            "labels": labels,
+            "series": [{"name": metric_col, "values": values}],
+            "chart_url": chart_url,
+        }
+
+    @staticmethod
+    def _build_quickchart_url(
+        *,
+        chart_type: str,
+        title: str,
+        labels: list[str],
+        values: list[float],
+        series_name: str,
+    ) -> str:
+        payload = {
+            "type": chart_type if chart_type in {"bar", "line", "pie"} else "bar",
+            "data": {
+                "labels": labels[:20],
+                "datasets": [
+                    {
+                        "label": series_name,
+                        "data": values[:20],
+                        "backgroundColor": "#0f5c84",
+                        "borderColor": "#0f5c84",
+                        "fill": False,
+                    }
+                ],
+            },
+            "options": {
+                "plugins": {"title": {"display": True, "text": title}},
+                "legend": {"display": False},
+            },
+        }
+        encoded = quote_plus(json.dumps(payload, ensure_ascii=True))
+        return f"https://quickchart.io/chart?c={encoded}"
 
     @staticmethod
     def _t(language_code: str, key: str, **kwargs: object) -> str:
@@ -5536,6 +6398,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 return
         language_code = self._resolve_language_code(request_context)
         question_text = str(body.get("question_text") or body.get("question") or "").strip()
+        raw_source_id = body.get("data_source_id")
+        data_source_id: int | None
+        try:
+            data_source_id = int(raw_source_id) if raw_source_id not in (None, "", 0, "0") else None
+        except Exception:
+            data_source_id = None
         if not question_text:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -5548,7 +6416,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        response = self._execute_nl_chat_query(request_context, question_text, language_code)
+        response = self._execute_nl_chat_query(
+            request_context,
+            question_text,
+            language_code,
+            data_source_id=data_source_id,
+        )
         if not response["ok"]:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -5700,6 +6573,90 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"status": "success", "tool": "billing.subscription.upsert", "correlation_id": str(uuid.uuid4()), "data": {"subscription": sub}, "error": None})
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.subscription.upsert", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
+
+    def _handle_billing_plan_upsert(self) -> None:
+        context = self._request_context()
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing.plan.upsert",
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            plan = self._db_upsert_billing_plan(
+                plan_id=body.get("id"),
+                code=body.get("code"),
+                name=body.get("name"),
+                max_tenants=body.get("max_tenants"),
+                max_users=body.get("max_users"),
+                max_data_sources_per_client=body.get("max_data_sources_per_client"),
+                max_data_sources_per_tenant=body.get("max_data_sources_per_tenant"),
+                monthly_price_cents=body.get("monthly_price_cents"),
+                is_active=body.get("is_active"),
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing.plan.upsert",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"plan": plan},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing.plan.upsert",
+                    "data": {},
+                    "error": {"code": "billing_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_billing_plan_delete(self) -> None:
+        context = self._request_context()
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing.plan.delete",
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            result = self._db_delete_billing_plan(plan_id=body.get("id"))
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing.plan.delete",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": result,
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing.plan.delete",
+                    "data": {},
+                    "error": {"code": "billing_error", "message": str(exc)},
+                },
+            )
 
     def _handle_billing_installments_list(self, query: str) -> None:
         context = self._request_context()
@@ -6190,6 +7147,180 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             conn.commit()
         cls.signup_tables_ready = True
 
+    @classmethod
+    def _ensure_billing_plan_limits_columns(cls) -> None:
+        if cls.billing_plan_limits_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.billing_plan
+                ADD COLUMN IF NOT EXISTS max_data_sources_per_client INTEGER NOT NULL DEFAULT 10
+                """
+            )
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.billing_plan
+                ADD COLUMN IF NOT EXISTS max_data_sources_per_tenant INTEGER NOT NULL DEFAULT 5
+                """
+            )
+            conn.commit()
+        cls.billing_plan_limits_ready = True
+
+    @classmethod
+    def _ensure_smtp_table(cls) -> None:
+        if cls.smtp_table_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {schema}.app_smtp_config (
+                    id SMALLINT PRIMARY KEY DEFAULT 1,
+                    host TEXT,
+                    port INTEGER NOT NULL DEFAULT 587,
+                    smtp_user TEXT,
+                    from_email TEXT,
+                    starttls BOOLEAN NOT NULL DEFAULT TRUE,
+                    password_enc TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            conn.commit()
+        cls.smtp_table_ready = True
+
+    @classmethod
+    def _db_load_smtp_config(cls) -> dict[str, object]:
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return {}
+        cls._ensure_smtp_table()
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT host, port, smtp_user, from_email, starttls, password_enc
+                FROM {schema}.app_smtp_config
+                WHERE id = 1
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+        if not row:
+            return {}
+        host = str(row[0] or "").strip()
+        try:
+            port = int(row[1] or 587)
+        except Exception:
+            port = 587
+        user = str(row[2] or "").strip()
+        from_email = str(row[3] or "").strip()
+        starttls = bool(row[4]) if row[4] is not None else True
+        password = ""
+        password_enc = str(row[5] or "").strip()
+        if password_enc:
+            try:
+                password = decrypt_text(password_enc)
+            except Exception:
+                password = ""
+        return {
+            "host": host,
+            "port": port,
+            "user": user,
+            "from_email": from_email,
+            "starttls": starttls,
+            "password": password,
+        }
+
+    @classmethod
+    def _db_save_smtp_config(cls, payload: dict[str, object]) -> None:
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        cls._ensure_smtp_table()
+        schema = cls.signup_schema
+        host = str(payload.get("host") or "").strip() or None
+        user = str(payload.get("user") or "").strip() or None
+        from_email = str(payload.get("from_email") or "").strip() or None
+        starttls = bool(payload.get("starttls", True))
+        try:
+            port = int(payload.get("port") or 587)
+        except Exception:
+            port = 587
+        password_raw = payload.get("password")
+        clear_password = bool(payload.get("clear_password"))
+        password_enc = None
+        include_password = False
+        if clear_password:
+            include_password = True
+            password_enc = None
+        elif password_raw is not None and str(password_raw).strip():
+            include_password = True
+            password_enc = encrypt_text(str(password_raw))
+
+        with connect(dsn) as conn, conn.cursor() as cur:
+            if include_password:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.app_smtp_config (
+                        id, host, port, smtp_user, from_email, starttls, password_enc, updated_at
+                    )
+                    VALUES (
+                        1, %(host)s, %(port)s, %(smtp_user)s, %(from_email)s, %(starttls)s, %(password_enc)s, NOW()
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        host = EXCLUDED.host,
+                        port = EXCLUDED.port,
+                        smtp_user = EXCLUDED.smtp_user,
+                        from_email = EXCLUDED.from_email,
+                        starttls = EXCLUDED.starttls,
+                        password_enc = EXCLUDED.password_enc,
+                        updated_at = NOW()
+                    """,
+                    {
+                        "host": host,
+                        "port": port,
+                        "smtp_user": user,
+                        "from_email": from_email,
+                        "starttls": starttls,
+                        "password_enc": password_enc,
+                    },
+                )
+            else:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.app_smtp_config (
+                        id, host, port, smtp_user, from_email, starttls, updated_at
+                    )
+                    VALUES (
+                        1, %(host)s, %(port)s, %(smtp_user)s, %(from_email)s, %(starttls)s, NOW()
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        host = EXCLUDED.host,
+                        port = EXCLUDED.port,
+                        smtp_user = EXCLUDED.smtp_user,
+                        from_email = EXCLUDED.from_email,
+                        starttls = EXCLUDED.starttls,
+                        updated_at = NOW()
+                    """,
+                    {
+                        "host": host,
+                        "port": port,
+                        "smtp_user": user,
+                        "from_email": from_email,
+                        "starttls": starttls,
+                    },
+                )
+            conn.commit()
+
     @staticmethod
     def _extract_connection_profile(*, conn_secret_ref: str, secret_payload: object) -> dict:
         if isinstance(secret_payload, dict):
@@ -6444,6 +7575,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS source_description_text TEXT",
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_suggested TEXT",
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_classification_suggested TEXT",
+            f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confidence_score NUMERIC(5,2)",
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_description_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_at TIMESTAMPTZ",
             f"ALTER TABLE {schema}.monitored_column ADD COLUMN IF NOT EXISTS llm_confirmed_by_user_id BIGINT",
@@ -6502,6 +7634,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 mc.source_description_text,
                 mc.llm_description_suggested,
                 mc.llm_classification_suggested,
+                mc.llm_confidence_score,
                 mc.llm_description_confirmed
             FROM {schema}.monitored_column mc
             JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
@@ -6513,6 +7646,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             UPDATE {schema}.monitored_column mc
                SET llm_classification_suggested = %(classification)s,
                    llm_description_suggested = %(description_text)s,
+                   llm_confidence_score = %(confidence_score)s,
                    llm_description_confirmed = CASE
                        WHEN COALESCE(NULLIF(TRIM(mc.description_text), ''), '') <> ''
                             AND COALESCE(NULLIF(TRIM(mc.description_text), ''), '') = COALESCE(NULLIF(TRIM(%(description_text)s), ''), '')
@@ -6551,7 +7685,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "source_description_text": str(item[4] or "").strip() or None,
                     "llm_description_suggested": str(item[5] or "").strip() or None,
                     "llm_classification_suggested": str(item[6] or "").strip() or None,
-                    "llm_description_confirmed": bool(item[7]),
+                    "llm_confidence_score": (float(item[7]) if item[7] is not None else None),
+                    "llm_description_confirmed": bool(item[8]),
                 }
                 for item in rows
             ]
@@ -6572,11 +7707,25 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 proposed = suggestions.get(col_name.lower()) or {}
                 classification = str(proposed.get("classification") or "").strip() or None
                 description_text = str(proposed.get("description_text") or "").strip() or None
+                confidence_score = proposed.get("confidence_score")
+                if confidence_score is None:
+                    confidence_score = self._estimate_suggestion_confidence(
+                        existing_column=item,
+                        proposed_classification=classification,
+                        proposed_description=description_text,
+                    )
+                try:
+                    confidence_score = float(confidence_score)
+                except Exception:
+                    confidence_score = 0.0
+                confidence_score = max(0.0, min(1.0, confidence_score))
                 if not classification and not description_text:
                     continue
                 if (
                     (item["llm_classification_suggested"] or "") == (classification or "")
                     and (item["llm_description_suggested"] or "") == (description_text or "")
+                    and (item.get("llm_confidence_score") is not None)
+                    and abs(float(item.get("llm_confidence_score") or 0.0) - confidence_score) < 0.001
                 ):
                     continue
                 cur.execute(
@@ -6587,6 +7736,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "column_name": col_name,
                         "classification": classification,
                         "description_text": description_text,
+                        "confidence_score": confidence_score,
                     },
                 )
                 if cur.rowcount:
@@ -6662,6 +7812,104 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "confirmed": True,
         }
 
+    def _db_update_monitored_column(
+        self,
+        *,
+        tenant_id: int,
+        monitored_column_id: int,
+        classification: object | None,
+        description_text: object | None,
+        llm_description_confirmed: object | None,
+    ) -> dict[str, object]:
+        dsn = self._get_db_dsn()
+        if not dsn or connect is None:
+            raise ValueError("Banco indisponivel para atualizar coluna.")
+        schema = self.signup_schema
+        self._db_ensure_monitored_column_metadata_fields()
+        select_sql = f"""
+            SELECT
+                mc.classification,
+                mc.description_text,
+                mc.llm_description_suggested,
+                mc.llm_confidence_score,
+                mc.llm_description_confirmed
+            FROM {schema}.monitored_column mc
+            JOIN {schema}.monitored_table mt ON mt.id = mc.monitored_table_id
+            WHERE mt.tenant_id = %(tenant_id)s
+              AND mc.id = %(monitored_column_id)s
+            LIMIT 1
+        """
+        update_sql = f"""
+            UPDATE {schema}.monitored_column mc
+               SET classification = %(classification)s,
+                   description_text = %(description_text)s,
+                   llm_description_confirmed = %(llm_description_confirmed)s
+            FROM {schema}.monitored_table mt
+            WHERE mc.monitored_table_id = mt.id
+              AND mt.tenant_id = %(tenant_id)s
+              AND mc.id = %(monitored_column_id)s
+            RETURNING
+                mc.id,
+                mc.column_name,
+                mc.data_type,
+                mc.classification,
+                mc.description_text,
+                mc.source_description_text,
+                mc.llm_description_suggested,
+                mc.llm_classification_suggested,
+                mc.llm_confidence_score,
+                mc.llm_description_confirmed
+        """
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(select_sql, {"tenant_id": tenant_id, "monitored_column_id": monitored_column_id})
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("coluna monitorada nao encontrada para o tenant")
+
+            next_classification = str(row[0] or "").strip() or None
+            next_description = str(row[1] or "").strip() or None
+            llm_description = str(row[2] or "").strip() or None
+            next_confirmed = bool(row[4])
+
+            if classification is not None:
+                next_classification = str(classification or "").strip() or None
+            if description_text is not None:
+                next_description = str(description_text or "").strip() or None
+
+            if llm_description_confirmed is None:
+                if description_text is not None:
+                    next_confirmed = bool(llm_description and next_description and next_description == llm_description)
+            else:
+                next_confirmed = bool(llm_description_confirmed)
+
+            cur.execute(
+                update_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "monitored_column_id": monitored_column_id,
+                    "classification": next_classification,
+                    "description_text": next_description,
+                    "llm_description_confirmed": next_confirmed,
+                },
+            )
+            updated = cur.fetchone()
+            if not updated:
+                raise ValueError("falha ao atualizar coluna monitorada")
+            conn.commit()
+
+        return {
+            "id": int(updated[0]),
+            "column_name": str(updated[1] or ""),
+            "data_type": str(updated[2] or "").strip() or None,
+            "classification": str(updated[3] or "").strip() or None,
+            "description_text": str(updated[4] or "").strip() or None,
+            "source_description_text": str(updated[5] or "").strip() or None,
+            "llm_description_suggested": str(updated[6] or "").strip() or None,
+            "llm_classification_suggested": str(updated[7] or "").strip() or None,
+            "llm_confidence_score": (float(updated[8]) if updated[8] is not None else None),
+            "llm_description_confirmed": bool(updated[9]),
+        }
+
     def _suggest_column_enrichment(
         self,
         *,
@@ -6672,7 +7920,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         sample_rows: list[dict[str, object]],
         context: dict,
         language_code: str = "pt-BR",
-    ) -> dict[str, dict[str, str]]:
+    ) -> dict[str, dict[str, object]]:
         columns_index = {
             str(col.get("column_name") or "").strip().lower(): col
             for col in columns
@@ -7108,6 +8356,31 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return desc
 
     @staticmethod
+    def _estimate_suggestion_confidence(
+        *,
+        existing_column: dict[str, object],
+        proposed_classification: str | None,
+        proposed_description: str | None,
+    ) -> float:
+        score = 0.25
+        if str(proposed_classification or "").strip():
+            score += 0.2
+        if str(proposed_description or "").strip():
+            score += 0.2
+        if str(existing_column.get("source_description_text") or "").strip():
+            score += 0.15
+        if str(existing_column.get("data_type") or "").strip():
+            score += 0.1
+        lowered = str(proposed_description or "").strip().lower()
+        if lowered and not (
+            lowered.startswith("informacao de ")
+            or lowered.startswith("campo ")
+            or lowered == "data de referencia"
+        ):
+            score += 0.1
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
     def _language_bucket(language_code: str | None) -> str:
         code = str(language_code or "pt-BR").strip().lower()
         if code.startswith("en"):
@@ -7141,8 +8414,126 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         return result
 
     @staticmethod
+    def _parse_rag_context_model(text: str) -> dict | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        if raw.startswith("json:"):
+            candidates.insert(0, raw[5:].strip())
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("entities"), list):
+                return parsed
+        return None
+
+    @staticmethod
+    def _rag_context_to_prompt_text(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        model = IAOpsAPIHandler._parse_rag_context_model(raw)
+        if not model:
+            return raw
+        lines: list[str] = []
+        tenant_id = str(model.get("tenant_id") or "").strip()
+        if tenant_id:
+            lines.append(f"tenant_id: {tenant_id}")
+            lines.append("")
+        entities = model.get("entities") or []
+        for entity in entities[:50]:
+            if not isinstance(entity, dict):
+                continue
+            table_name = str(entity.get("table_name") or "").strip()
+            friendly_name = str(entity.get("friendly_name") or "").strip()
+            description = str(entity.get("description") or "").strip()
+            if not table_name:
+                continue
+            lines.append(f"## tabela: {table_name}")
+            if friendly_name:
+                lines.append(f"nome_amigavel: {friendly_name}")
+            if description:
+                lines.append(f"descricao: {description}")
+            columns = entity.get("columns") or []
+            for col in columns[:200]:
+                if not isinstance(col, dict):
+                    continue
+                col_name = str(col.get("name") or "").strip()
+                if not col_name:
+                    continue
+                lines.append(f"- coluna: {col_name}")
+                col_friendly = str(col.get("friendly_name") or "").strip()
+                col_type = str(col.get("type") or "").strip()
+                synonyms = col.get("synonyms") or []
+                if col_friendly:
+                    lines.append(f"  nome_amigavel: {col_friendly}")
+                if col_type:
+                    lines.append(f"  tipo: {col_type}")
+                if isinstance(synonyms, list) and synonyms:
+                    syn_text = ", ".join(str(item).strip() for item in synonyms if str(item).strip())
+                    if syn_text:
+                        lines.append(f"  sinonimos: {syn_text}")
+            relationships = entity.get("relationships") or []
+            for rel in relationships[:100]:
+                if not isinstance(rel, dict):
+                    continue
+                to_table = str(rel.get("to_table") or "").strip()
+                join_condition = str(rel.get("join_condition") or "").strip()
+                rel_desc = str(rel.get("description") or "").strip()
+                if not to_table and not join_condition and not rel_desc:
+                    continue
+                lines.append("- relacionamento:")
+                if to_table:
+                    lines.append(f"  to_table: {to_table}")
+                if join_condition:
+                    lines.append(f"  join_condition: {join_condition}")
+                if rel_desc:
+                    lines.append(f"  descricao: {rel_desc}")
+            lines.append("")
+        return "\n".join(lines).strip() or raw
+
+    @staticmethod
     def _parse_glossary_text(*, text: str, schema_name: str, table_name: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
+        model = IAOpsAPIHandler._parse_rag_context_model(str(text or ""))
+        if model:
+            target_schema = str(schema_name or "").strip().lower()
+            target_table = str(table_name or "").strip().lower()
+            for entity in (model.get("entities") or []):
+                if not isinstance(entity, dict):
+                    continue
+                raw_table = str(entity.get("table_name") or "").strip()
+                if not raw_table:
+                    continue
+                parts = raw_table.split(".")
+                if len(parts) == 2:
+                    ent_schema = parts[0].strip().lower()
+                    ent_table = parts[1].strip().lower()
+                else:
+                    ent_schema = target_schema
+                    ent_table = raw_table.strip().lower()
+                if ent_table != target_table:
+                    continue
+                if target_schema and ent_schema and ent_schema != target_schema:
+                    continue
+                for col in (entity.get("columns") or []):
+                    if not isinstance(col, dict):
+                        continue
+                    col_name = str(col.get("name") or "").strip().lower()
+                    if not col_name:
+                        continue
+                    friendly = str(col.get("friendly_name") or "").strip()
+                    desc = str(col.get("description") or "").strip()
+                    chosen = friendly or desc
+                    if chosen:
+                        mapping[f"{ent_table}.{col_name}"] = chosen
+                        mapping[col_name] = chosen
+            if mapping:
+                return mapping
+
         schema = str(schema_name or "").strip().lower()
         table = str(table_name or "").strip().lower()
         lines = str(text or "").splitlines()
@@ -7306,7 +8697,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "'customer_id' -> 'Codigo do cliente'; "
                     "'payment_date' -> 'Data do pagamento'; "
                     "'inventory_id' em tabela diferente de 'inventory' -> 'Codigo do inventario (FK da tabela sakila.inventory)'. "
-                    "Responda APENAS JSON no formato {'columns':[{'column_name':'','classification':'','description_text':''}]}."
+                    "Responda APENAS JSON no formato {'columns':[{'column_name':'','classification':'','description_text':'','confidence_score':0.0}]}. "
+                    "confidence_score deve ir de 0.0 a 1.0."
                 ),
                 "output_language": language_code,
                 "source_type": source_type,
@@ -7351,7 +8743,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             rows = llm_output.get("columns")
             if not isinstance(rows, list):
                 return {}
-            result: dict[str, dict[str, str]] = {}
+            result: dict[str, dict[str, object]] = {}
             for item in rows:
                 if not isinstance(item, dict):
                     continue
@@ -7360,11 +8752,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     continue
                 classification = str(item.get("classification") or "").strip()
                 description_text = str(item.get("description_text") or "").strip()
+                confidence_score = item.get("confidence_score")
                 if not classification and not description_text:
                     continue
+                if confidence_score is not None:
+                    try:
+                        confidence_score = max(0.0, min(1.0, float(confidence_score)))
+                    except Exception:
+                        confidence_score = None
                 result[col_name.lower()] = {
                     "classification": classification,
                     "description_text": description_text,
+                    "confidence_score": confidence_score,
                 }
             return result
         except Exception:
@@ -7965,6 +9364,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _db_get_lgpd_policy(self, *, tenant_id: int) -> dict:
         if not self._is_db_enabled():
             return {}
+        self._ensure_lgpd_schema_meta()
         schema = self.signup_schema
         sql = f"""
             SELECT dpo_name, dpo_email, retention_days, legal_notes, updated_by_user_id, updated_at
@@ -7998,6 +9398,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     ) -> dict:
         if not self._is_db_enabled():
             raise ValueError("Banco nao configurado")
+        self._ensure_lgpd_schema_meta()
         schema = self.signup_schema
         sql = f"""
             INSERT INTO {schema}.lgpd_policy (
@@ -8033,6 +9434,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _db_list_lgpd_rules(self, *, tenant_id: int) -> list[dict]:
         if not self._is_db_enabled():
             return []
+        self._ensure_lgpd_schema_meta()
         schema = self.signup_schema
         sql = f"""
             SELECT id, schema_name, table_name, column_name, rule_type, rule_config, is_active, updated_at
@@ -8072,10 +9474,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     ) -> dict:
         if not self._is_db_enabled():
             raise ValueError("Banco nao configurado")
+        self._ensure_lgpd_schema_meta()
         schema_name_v = str(schema_name or "").strip()
         table_name_v = str(table_name or "").strip()
         column_name_v = str(column_name or "").strip()
         rule_type_v = str(rule_type or "").strip()
+        rule_name_v = f"{schema_name_v}.{table_name_v}.{column_name_v}:{rule_type_v}"[:190]
+        rule_expression_v = f"{rule_type_v}({schema_name_v}.{table_name_v}.{column_name_v})"[:240]
         if not schema_name_v or not table_name_v or not column_name_v or not rule_type_v:
             raise ValueError("schema_name, table_name, column_name e rule_type obrigatorios")
         schema = self.signup_schema
@@ -8084,7 +9489,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 cur.execute(
                     f"""
                     UPDATE {schema}.lgpd_rule
-                       SET schema_name = %(schema_name)s,
+                       SET rule_name = %(rule_name)s,
+                           rule_expression = %(rule_expression)s,
+                           schema_name = %(schema_name)s,
                            table_name = %(table_name)s,
                            column_name = %(column_name)s,
                            rule_type = %(rule_type)s,
@@ -8098,6 +9505,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     {
                         "id": int(rule_id),
                         "tenant_id": tenant_id,
+                        "rule_name": rule_name_v,
+                        "rule_expression": rule_expression_v,
                         "schema_name": schema_name_v,
                         "table_name": table_name_v,
                         "column_name": column_name_v,
@@ -8114,15 +9523,17 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 cur.execute(
                     f"""
                     INSERT INTO {schema}.lgpd_rule (
-                        tenant_id, schema_name, table_name, column_name, rule_type, rule_config, is_active, created_by_user_id
+                        tenant_id, rule_name, rule_expression, schema_name, table_name, column_name, rule_type, rule_config, is_active, created_by_user_id
                     )
                     VALUES (
-                        %(tenant_id)s, %(schema_name)s, %(table_name)s, %(column_name)s, %(rule_type)s, %(rule_config)s::jsonb, %(is_active)s, %(user_id)s
+                        %(tenant_id)s, %(rule_name)s, %(rule_expression)s, %(schema_name)s, %(table_name)s, %(column_name)s, %(rule_type)s, %(rule_config)s::jsonb, %(is_active)s, %(user_id)s
                     )
                     RETURNING id
                     """,
                     {
                         "tenant_id": tenant_id,
+                        "rule_name": rule_name_v,
+                        "rule_expression": rule_expression_v,
                         "schema_name": schema_name_v,
                         "table_name": table_name_v,
                         "column_name": column_name_v,
@@ -8137,6 +9548,122 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         rows = self._db_list_lgpd_rules(tenant_id=tenant_id)
         return next((item for item in rows if int(item["id"]) == int(new_id)), {})
 
+    def _ensure_lgpd_schema_meta(self) -> None:
+        if self.lgpd_schema_ready or not self._is_db_enabled():
+            return
+        schema = self.signup_schema
+        ddls = [
+            f"ALTER TABLE {schema}.lgpd_policy ADD COLUMN IF NOT EXISTS updated_by_user_id BIGINT",
+            f"ALTER TABLE {schema}.lgpd_policy ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS rule_name TEXT",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS rule_expression TEXT",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS rule_config JSONB NOT NULL DEFAULT '{{}}'::jsonb",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS created_by_user_id BIGINT",
+            f"ALTER TABLE {schema}.lgpd_rule ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+            f"ALTER TABLE {schema}.lgpd_dsr_request ADD COLUMN IF NOT EXISTS notes TEXT",
+            f"ALTER TABLE {schema}.lgpd_dsr_request ADD COLUMN IF NOT EXISTS resolved_by_user_id BIGINT",
+            f"ALTER TABLE {schema}.lgpd_dsr_request ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
+        ]
+        try:
+            with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+                for ddl in ddls:
+                    try:
+                        cur.execute(ddl)
+                    except Exception:
+                        # compatibilidade com esquemas antigos/parciais
+                        pass
+                try:
+                    cur.execute(
+                        f"""
+                        CREATE OR REPLACE FUNCTION {schema}.fn_fill_lgpd_rule_fields()
+                        RETURNS trigger
+                        LANGUAGE plpgsql
+                        AS $$
+                        BEGIN
+                            IF NEW.rule_name IS NULL OR BTRIM(NEW.rule_name) = '' THEN
+                                NEW.rule_name := CONCAT(
+                                    COALESCE(NULLIF(BTRIM(NEW.schema_name), ''), 'schema'),
+                                    '.',
+                                    COALESCE(NULLIF(BTRIM(NEW.table_name), ''), 'table'),
+                                    '.',
+                                    COALESCE(NULLIF(BTRIM(NEW.column_name), ''), 'column'),
+                                    ':',
+                                    COALESCE(NULLIF(BTRIM(NEW.rule_type), ''), 'rule')
+                                );
+                            END IF;
+                            IF NEW.rule_expression IS NULL OR BTRIM(NEW.rule_expression) = '' THEN
+                                NEW.rule_expression := CONCAT(
+                                    COALESCE(NULLIF(BTRIM(NEW.rule_type), ''), 'rule'),
+                                    '(',
+                                    COALESCE(NULLIF(BTRIM(NEW.schema_name), ''), 'schema'),
+                                    '.',
+                                    COALESCE(NULLIF(BTRIM(NEW.table_name), ''), 'table'),
+                                    '.',
+                                    COALESCE(NULLIF(BTRIM(NEW.column_name), ''), 'column'),
+                                    ')'
+                                );
+                            END IF;
+                            RETURN NEW;
+                        END;
+                        $$;
+                        """
+                    )
+                    cur.execute(f"DROP TRIGGER IF EXISTS trg_fill_lgpd_rule_name ON {schema}.lgpd_rule")
+                    cur.execute(f"DROP TRIGGER IF EXISTS trg_fill_lgpd_rule_fields ON {schema}.lgpd_rule")
+                    cur.execute(
+                        f"""
+                        CREATE TRIGGER trg_fill_lgpd_rule_fields
+                        BEFORE INSERT OR UPDATE ON {schema}.lgpd_rule
+                        FOR EACH ROW
+                        EXECUTE FUNCTION {schema}.fn_fill_lgpd_rule_fields()
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    cur.execute(
+                        f"""
+                        UPDATE {schema}.lgpd_rule
+                           SET rule_name = CONCAT(
+                               COALESCE(NULLIF(TRIM(schema_name), ''), 'schema'),
+                               '.',
+                               COALESCE(NULLIF(TRIM(table_name), ''), 'table'),
+                               '.',
+                               COALESCE(NULLIF(TRIM(column_name), ''), 'column'),
+                               ':',
+                               COALESCE(NULLIF(TRIM(rule_type), ''), 'rule')
+                           )
+                         WHERE rule_name IS NULL OR TRIM(rule_name) = ''
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    cur.execute(
+                        f"""
+                        UPDATE {schema}.lgpd_rule
+                           SET rule_expression = CONCAT(
+                               COALESCE(NULLIF(TRIM(rule_type), ''), 'rule'),
+                               '(',
+                               COALESCE(NULLIF(TRIM(schema_name), ''), 'schema'),
+                               '.',
+                               COALESCE(NULLIF(TRIM(table_name), ''), 'table'),
+                               '.',
+                               COALESCE(NULLIF(TRIM(column_name), ''), 'column'),
+                               ')'
+                           )
+                         WHERE rule_expression IS NULL OR TRIM(rule_expression) = ''
+                        """
+                    )
+                except Exception:
+                    pass
+                conn.commit()
+            self.lgpd_schema_ready = True
+        except Exception:
+            # nao bloquear fluxo caso migracao automatica falhe
+            return
+
     def _db_list_lgpd_dsr(self, *, tenant_id: int, status: str | None) -> list[dict]:
         if not self._is_db_enabled():
             return []
@@ -8145,7 +9672,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             SELECT id, requester_name, requester_email, request_type, subject_key, status, notes, created_at, resolved_at
             FROM {schema}.lgpd_dsr_request
             WHERE tenant_id = %(tenant_id)s
-              AND (%(status)s IS NULL OR status = %(status)s)
+              AND (%(status)s::text IS NULL OR status = %(status)s::text)
             ORDER BY id DESC
         """
         with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
@@ -8247,10 +9774,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not self._is_db_enabled():
             return []
         schema = self.signup_schema
+        self._ensure_billing_plan_limits_columns()
         with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT id, code, name, max_tenants, max_users, monthly_price_cents, is_active
+                SELECT
+                    id,
+                    code,
+                    name,
+                    max_tenants,
+                    max_users,
+                    COALESCE(max_data_sources_per_client, 10),
+                    COALESCE(max_data_sources_per_tenant, 5),
+                    monthly_price_cents,
+                    is_active
                 FROM {schema}.billing_plan
                 ORDER BY id
                 """
@@ -8263,8 +9800,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 "name": row[2],
                 "max_tenants": int(row[3]),
                 "max_users": int(row[4]),
-                "monthly_price_cents": int(row[5]),
-                "is_active": bool(row[6]),
+                "max_data_sources_per_client": int(row[5]),
+                "max_data_sources_per_tenant": int(row[6]),
+                "monthly_price_cents": int(row[7]),
+                "is_active": bool(row[8]),
             }
             for row in rows
         ]
@@ -8273,10 +9812,24 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not self._is_db_enabled():
             return {}
         schema = self.signup_schema
+        self._ensure_billing_plan_limits_columns()
         with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT s.id, s.client_id, s.plan_id, p.code, p.name, s.status, s.tolerance_days, s.starts_at, s.ends_at
+                SELECT
+                    s.id,
+                    s.client_id,
+                    s.plan_id,
+                    p.code,
+                    p.name,
+                    p.max_tenants,
+                    p.max_users,
+                    COALESCE(p.max_data_sources_per_client, 10),
+                    COALESCE(p.max_data_sources_per_tenant, 5),
+                    s.status,
+                    s.tolerance_days,
+                    s.starts_at,
+                    s.ends_at
                 FROM {schema}.billing_subscription s
                 JOIN {schema}.billing_plan p ON p.id = s.plan_id
                 WHERE s.client_id = %(client_id)s
@@ -8294,10 +9847,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "plan_id": int(row[2]),
             "plan_code": row[3],
             "plan_name": row[4],
-            "status": row[5],
-            "tolerance_days": int(row[6]),
-            "starts_at": row[7].isoformat() if row[7] else None,
-            "ends_at": row[8].isoformat() if row[8] else None,
+            "max_tenants": int(row[5]),
+            "max_users": int(row[6]),
+            "max_data_sources_per_client": int(row[7]),
+            "max_data_sources_per_tenant": int(row[8]),
+            "status": row[9],
+            "tolerance_days": int(row[10]),
+            "starts_at": row[11].isoformat() if row[11] else None,
+            "ends_at": row[12].isoformat() if row[12] else None,
         }
 
     def _db_upsert_billing_subscription(self, *, client_id: int, plan_code: object, tolerance_days: object) -> dict:
@@ -8344,6 +9901,124 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             conn.commit()
         return self._db_get_billing_subscription(client_id=client_id)
+
+    def _db_upsert_billing_plan(
+        self,
+        *,
+        plan_id: object,
+        code: object,
+        name: object,
+        max_tenants: object,
+        max_users: object,
+        max_data_sources_per_client: object,
+        max_data_sources_per_tenant: object,
+        monthly_price_cents: object,
+        is_active: object,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        self._ensure_billing_plan_limits_columns()
+        schema = self.signup_schema
+        code_v = str(code or "").strip().lower()
+        name_v = str(name or "").strip()
+        if not code_v:
+            raise ValueError("code obrigatorio")
+        if not name_v:
+            raise ValueError("name obrigatorio")
+        max_tenants_v = max(1, int(max_tenants or 1))
+        max_users_v = max(1, int(max_users or 1))
+        max_sources_client_v = max(1, int(max_data_sources_per_client or 10))
+        max_sources_tenant_v = max(1, int(max_data_sources_per_tenant or 5))
+        monthly_price_cents_v = max(0, int(monthly_price_cents or 0))
+        is_active_v = bool(True if is_active is None else is_active)
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            if plan_id in (None, ""):
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.billing_plan (
+                        code, name, max_tenants, max_users, max_data_sources_per_client, max_data_sources_per_tenant, monthly_price_cents, is_active
+                    )
+                    VALUES (
+                        %(code)s, %(name)s, %(max_tenants)s, %(max_users)s, %(max_data_sources_per_client)s, %(max_data_sources_per_tenant)s, %(monthly_price_cents)s, %(is_active)s
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        "code": code_v,
+                        "name": name_v,
+                        "max_tenants": max_tenants_v,
+                        "max_users": max_users_v,
+                        "max_data_sources_per_client": max_sources_client_v,
+                        "max_data_sources_per_tenant": max_sources_tenant_v,
+                        "monthly_price_cents": monthly_price_cents_v,
+                        "is_active": is_active_v,
+                    },
+                )
+                row = cur.fetchone()
+                target_id = int(row[0])
+            else:
+                target_id = int(plan_id)
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.billing_plan
+                       SET code = %(code)s,
+                           name = %(name)s,
+                           max_tenants = %(max_tenants)s,
+                           max_users = %(max_users)s,
+                           max_data_sources_per_client = %(max_data_sources_per_client)s,
+                           max_data_sources_per_tenant = %(max_data_sources_per_tenant)s,
+                           monthly_price_cents = %(monthly_price_cents)s,
+                           is_active = %(is_active)s
+                     WHERE id = %(id)s
+                    """,
+                    {
+                        "id": target_id,
+                        "code": code_v,
+                        "name": name_v,
+                        "max_tenants": max_tenants_v,
+                        "max_users": max_users_v,
+                        "max_data_sources_per_client": max_sources_client_v,
+                        "max_data_sources_per_tenant": max_sources_tenant_v,
+                        "monthly_price_cents": monthly_price_cents_v,
+                        "is_active": is_active_v,
+                    },
+                )
+                if cur.rowcount <= 0:
+                    raise ValueError("plano nao encontrado")
+            conn.commit()
+        plans = self._db_list_billing_plans()
+        for item in plans:
+            if int(item["id"]) == int(target_id):
+                return item
+        raise ValueError("plano nao encontrado")
+
+    def _db_delete_billing_plan(self, *, plan_id: object) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        if plan_id in (None, ""):
+            raise ValueError("id obrigatorio")
+        schema = self.signup_schema
+        target_id = int(plan_id)
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {schema}.billing_subscription WHERE plan_id = %(id)s",
+                {"id": target_id},
+            )
+            ref_count = int((cur.fetchone() or [0])[0])
+            if ref_count > 0:
+                cur.execute(
+                    f"UPDATE {schema}.billing_plan SET is_active = FALSE WHERE id = %(id)s",
+                    {"id": target_id},
+                )
+                if cur.rowcount <= 0:
+                    raise ValueError("plano nao encontrado")
+                conn.commit()
+                return {"deleted": False, "inactivated": True, "id": target_id}
+            cur.execute(f"DELETE FROM {schema}.billing_plan WHERE id = %(id)s", {"id": target_id})
+            if cur.rowcount <= 0:
+                raise ValueError("plano nao encontrado")
+            conn.commit()
+        return {"deleted": True, "inactivated": False, "id": target_id}
 
     def _db_list_billing_installments(self, *, client_id: int, status: str | None) -> list[dict]:
         if not self._is_db_enabled():

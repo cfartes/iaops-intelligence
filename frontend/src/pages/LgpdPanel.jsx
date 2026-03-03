@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   getLgpdPolicy,
+  listOnboardingMonitoredColumns,
+  listOnboardingMonitoredTables,
   listLgpdDsr,
   listLgpdRules,
   openLgpdDsr,
@@ -10,22 +12,69 @@ import {
 } from "../api/mcpApi";
 
 export default function LgpdPanel({ onSystemMessage }) {
+  const ruleTypeOptions = [
+    { value: "mask", label: "Mascarar valor" },
+    { value: "email_mask", label: "Ocultar e-mail" },
+    { value: "hash", label: "Hash irreversivel" },
+    { value: "last4", label: "Exibir apenas ultimos 4 digitos" },
+    { value: "cpf_mask", label: "Mascarar CPF" },
+    { value: "block", label: "Bloquear exibicao" },
+  ];
   const [policy, setPolicy] = useState({});
   const [rules, setRules] = useState([]);
   const [requests, setRequests] = useState([]);
   const [showPolicyModal, setShowPolicyModal] = useState(false);
   const [showRuleModal, setShowRuleModal] = useState(false);
   const [showRequestModal, setShowRequestModal] = useState(false);
+  const [monitoredTables, setMonitoredTables] = useState([]);
+  const [columnsByTableId, setColumnsByTableId] = useState({});
   const [policyDraft, setPolicyDraft] = useState({ dpo_name: "", dpo_email: "", retention_days: "", legal_notes: "" });
-  const [ruleDraft, setRuleDraft] = useState({ schema_name: "public", table_name: "", column_name: "", rule_type: "mask", rule_config: "{}", is_active: true });
+  const [ruleDraft, setRuleDraft] = useState({
+    monitored_table_id: "",
+    schema_name: "",
+    table_name: "",
+    column_name: "",
+    rule_type: "mask",
+    is_active: true,
+  });
   const [requestDraft, setRequestDraft] = useState({ requester_name: "", requester_email: "", request_type: "access", subject_key: "", notes: "" });
+
+  const buildRuleConfig = (ruleType) => {
+    const kind = String(ruleType || "").trim().toLowerCase();
+    if (kind === "mask") return { strategy: "full_mask" };
+    if (kind === "email_mask") return { strategy: "email_mask" };
+    if (kind === "hash") return { strategy: "sha256" };
+    if (kind === "last4") return { strategy: "last4" };
+    if (kind === "cpf_mask") return { strategy: "cpf_mask" };
+    if (kind === "block") return { strategy: "deny_access" };
+    return {};
+  };
 
   const loadAll = async () => {
     try {
-      const [p, r, d] = await Promise.all([getLgpdPolicy(), listLgpdRules(), listLgpdDsr()]);
+      const [p, r, d, tableData] = await Promise.all([
+        getLgpdPolicy(),
+        listLgpdRules(),
+        listLgpdDsr(),
+        listOnboardingMonitoredTables(),
+      ]);
       setPolicy(p.policy || {});
       setRules(r.rules || []);
       setRequests(d.requests || []);
+      const tables = tableData.tables || [];
+      setMonitoredTables(tables);
+
+      const colEntries = await Promise.all(
+        tables.map(async (table) => {
+          try {
+            const cols = await listOnboardingMonitoredColumns(table.id);
+            return [String(table.id), cols.columns || []];
+          } catch (_) {
+            return [String(table.id), []];
+          }
+        }),
+      );
+      setColumnsByTableId(Object.fromEntries(colEntries));
     } catch (error) {
       onSystemMessage("error", "Falha LGPD", error.message);
     }
@@ -51,9 +100,17 @@ export default function LgpdPanel({ onSystemMessage }) {
 
   const saveRule = async () => {
     try {
+      if (!ruleDraft.schema_name || !ruleDraft.table_name || !ruleDraft.column_name) {
+        onSystemMessage("warning", "LGPD", "Selecione tabela e coluna para aplicar a regra.");
+        return;
+      }
       await upsertLgpdRule({
-        ...ruleDraft,
-        rule_config: JSON.parse(ruleDraft.rule_config || "{}"),
+        schema_name: ruleDraft.schema_name,
+        table_name: ruleDraft.table_name,
+        column_name: ruleDraft.column_name,
+        rule_type: ruleDraft.rule_type,
+        rule_config: buildRuleConfig(ruleDraft.rule_type),
+        is_active: Boolean(ruleDraft.is_active),
       });
       setShowRuleModal(false);
       onSystemMessage("success", "LGPD", "Regra salva com sucesso.");
@@ -62,6 +119,8 @@ export default function LgpdPanel({ onSystemMessage }) {
       onSystemMessage("error", "Falha LGPD", error.message);
     }
   };
+
+  const selectedColumns = columnsByTableId[String(ruleDraft.monitored_table_id || "")] || [];
 
   const openRequest = async () => {
     try {
@@ -196,21 +255,58 @@ export default function LgpdPanel({ onSystemMessage }) {
           <div className="modal-card form-modal">
             <header className="modal-header"><h3>Regra LGPD</h3></header>
             <div className="modal-content form-grid">
-              <label>Schema<input value={ruleDraft.schema_name} onChange={(e) => setRuleDraft((p) => ({ ...p, schema_name: e.target.value }))} /></label>
-              <label>Tabela<input value={ruleDraft.table_name} onChange={(e) => setRuleDraft((p) => ({ ...p, table_name: e.target.value }))} /></label>
-              <label>Coluna<input value={ruleDraft.column_name} onChange={(e) => setRuleDraft((p) => ({ ...p, column_name: e.target.value }))} /></label>
+              <label>
+                Database/Schema + Tabela
+                <select
+                  value={String(ruleDraft.monitored_table_id || "")}
+                  onChange={(e) => {
+                    const tableId = String(e.target.value || "");
+                    const table = monitoredTables.find((item) => String(item.id) === tableId);
+                    setRuleDraft((prev) => ({
+                      ...prev,
+                      monitored_table_id: tableId,
+                      schema_name: table?.schema_name || "",
+                      table_name: table?.table_name || "",
+                      column_name: "",
+                    }));
+                  }}
+                >
+                  <option value="">Selecione...</option>
+                  {monitoredTables.map((item) => (
+                    <option key={item.id} value={String(item.id)}>
+                      {(item.source_name || item.source_type || "Fonte")} - {item.schema_name}.{item.table_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Coluna
+                <select
+                  value={ruleDraft.column_name}
+                  onChange={(e) => setRuleDraft((p) => ({ ...p, column_name: e.target.value }))}
+                  disabled={!ruleDraft.monitored_table_id}
+                >
+                  <option value="">{ruleDraft.monitored_table_id ? "Selecione..." : "Selecione uma tabela primeiro"}</option>
+                  {selectedColumns.map((item) => (
+                    <option key={item.id || item.column_name} value={item.column_name}>
+                      {item.column_name} ({item.data_type || "n/a"})
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label>
                 Tipo
                 <select value={ruleDraft.rule_type} onChange={(e) => setRuleDraft((p) => ({ ...p, rule_type: e.target.value }))}>
-                  <option value="mask">mask</option>
-                  <option value="email_mask">email_mask</option>
-                  <option value="hash">hash</option>
-                  <option value="last4">last4</option>
-                  <option value="cpf_mask">cpf_mask</option>
-                  <option value="block">block</option>
+                  {ruleTypeOptions.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
                 </select>
               </label>
-              <label>Config JSON<input value={ruleDraft.rule_config} onChange={(e) => setRuleDraft((p) => ({ ...p, rule_config: e.target.value }))} /></label>
+              <div className="form-note">
+                A configuracao tecnica da regra sera aplicada automaticamente.
+              </div>
               <div className="modal-actions">
                 <button type="button" className="btn btn-secondary" onClick={() => setShowRuleModal(false)}>Cancelar</button>
                 <button type="button" className="btn btn-primary" onClick={saveRule}>Salvar</button>
