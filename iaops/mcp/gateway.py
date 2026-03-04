@@ -22,9 +22,13 @@ class MCPGateway:
         "tenant.get_limits",
         "tenant.create",
         "tenant.update_status",
+        "tenant.update_identity",
         "channel.list_user_tenants",
         "channel.set_active_tenant",
         "channel.get_active_tenant",
+        "channel.binding.list",
+        "channel.binding.upsert",
+        "channel.binding.delete",
         "llm_admin.list_providers",
         "llm_admin.list_models",
         "llm_admin.get_app_config",
@@ -40,6 +44,9 @@ class MCPGateway:
         "channel.list_user_tenants",
         "channel.set_active_tenant",
         "channel.get_active_tenant",
+        "channel.binding.list",
+        "channel.binding.upsert",
+        "channel.binding.delete",
     }
 
     def __init__(self, repository: MCPRepository) -> None:
@@ -49,9 +56,13 @@ class MCPGateway:
             "tenant.get_limits": self._handle_tenant_get_limits,
             "tenant.create": self._handle_tenant_create,
             "tenant.update_status": self._handle_tenant_update_status,
+            "tenant.update_identity": self._handle_tenant_update_identity,
             "channel.list_user_tenants": self._handle_channel_list_user_tenants,
             "channel.set_active_tenant": self._handle_channel_set_active_tenant,
             "channel.get_active_tenant": self._handle_channel_get_active_tenant,
+            "channel.binding.list": self._handle_channel_binding_list,
+            "channel.binding.upsert": self._handle_channel_binding_upsert,
+            "channel.binding.delete": self._handle_channel_binding_delete,
             "tenant_llm.get_config": self._handle_tenant_llm_get_config,
             "tenant_llm.update_config": self._handle_tenant_llm_update_config,
             "tenant_llm.list_providers": self._handle_tenant_llm_list_providers,
@@ -250,6 +261,27 @@ class MCPGateway:
         tenant = self.repository.update_tenant_status(context.client_id, int(tool_input["tenant_id"]), status)
         return {"tenant": tenant}
 
+    def _handle_tenant_update_identity(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("tenant_id") is None:
+            raise ValueError("tenant_id obrigatorio")
+        name = str(tool_input.get("name", "")).strip()
+        slug = str(tool_input.get("slug", "")).strip().lower() or None
+        if not name:
+            raise ValueError("name obrigatorio")
+        tenant = self.repository.update_tenant_identity(
+            context.client_id,
+            int(tool_input["tenant_id"]),
+            name=name,
+            slug=slug,
+        )
+        return {"tenant": tenant}
+
     def _handle_llm_admin_list_providers(
         self,
         context: RequestContext,
@@ -436,6 +468,63 @@ class MCPGateway:
             channel_type=channel_type,
             conversation_key=conversation_key,
             external_user_key=external_user_key,
+        )
+        return data
+
+    def _handle_channel_binding_list(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        channel_type_raw = tool_input.get("channel_type")
+        channel_type = str(channel_type_raw).strip().lower() if channel_type_raw not in (None, "") else None
+        if channel_type and channel_type not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        rows = self.repository.list_channel_user_bindings(context.client_id, channel_type=channel_type)
+        if max_rows is not None:
+            rows = rows[:max_rows]
+        return {"bindings": rows}
+
+    def _handle_channel_binding_upsert(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("tenant_id") is None:
+            raise ValueError("tenant_id obrigatorio")
+        channel_type = str(tool_input.get("channel_type", "")).strip().lower()
+        external_user_key = str(tool_input.get("external_user_key", "")).strip()
+        is_active = bool(tool_input.get("is_active", True))
+        user_id = int(tool_input["user_id"]) if tool_input.get("user_id") not in (None, "") else None
+        if channel_type not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not external_user_key:
+            raise ValueError("external_user_key obrigatorio")
+        row = self.repository.upsert_channel_user_binding(
+            context.client_id,
+            tenant_id=int(tool_input["tenant_id"]),
+            user_id=user_id,
+            channel_type=channel_type,
+            external_user_key=external_user_key,
+            is_active=is_active,
+        )
+        return {"binding": row}
+
+    def _handle_channel_binding_delete(
+        self,
+        context: RequestContext,
+        tool_input: dict[str, Any],
+        max_rows: int | None,
+    ) -> dict[str, Any]:
+        _ = max_rows
+        if tool_input.get("binding_id") is None:
+            raise ValueError("binding_id obrigatorio")
+        data = self.repository.delete_channel_user_binding(
+            context.client_id,
+            binding_id=int(tool_input["binding_id"]),
         )
         return data
 

@@ -207,6 +207,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/mcp/connections":
             self._handle_mcp_connections_list()
             return
+        if parsed.path == "/api/channel/bindings":
+            self._handle_channel_bindings_list(parsed.query)
+            return
+        if parsed.path == "/webhooks/meta/whatsapp":
+            self._handle_meta_whatsapp_verify(parsed.query)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -316,6 +322,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tenants/status":
             self._handle_tenant_update_status()
             return
+        if parsed.path == "/api/tenants/identity":
+            self._handle_tenant_update_identity()
+            return
         if parsed.path == "/api/admin/llm/config":
             self._handle_admin_llm_config_update()
             return
@@ -351,6 +360,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channel/webhook/whatsapp":
             self._handle_channel_webhook("whatsapp")
+            return
+        if parsed.path == "/webhooks/meta/whatsapp":
+            self._handle_meta_whatsapp_webhook()
+            return
+        if parsed.path == "/api/channel/bindings/upsert":
+            self._handle_channel_binding_upsert()
+            return
+        if parsed.path == "/api/channel/bindings/delete":
+            self._handle_channel_binding_delete()
             return
         if parsed.path == "/api/lgpd/policy":
             self._handle_lgpd_policy_upsert()
@@ -3886,6 +3904,57 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_tenant_update_identity(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "tenant.update_identity",
+            "input": {
+                "tenant_id": body.get("tenant_id"),
+                "name": body.get("name"),
+                "slug": body.get("slug"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_bindings_list(self, query: str) -> None:
+        qs = parse_qs(query)
+        channel_type = qs.get("channel_type", [None])[0]
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.binding.list",
+            "input": {
+                "channel_type": channel_type,
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_binding_upsert(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.binding.upsert",
+            "input": {
+                "tenant_id": body.get("tenant_id"),
+                "user_id": body.get("user_id"),
+                "channel_type": body.get("channel_type"),
+                "external_user_key": body.get("external_user_key"),
+                "is_active": body.get("is_active", True),
+            },
+        }
+        self._dispatch_mcp(payload)
+
+    def _handle_channel_binding_delete(self) -> None:
+        body = self._read_json_body()
+        payload = {
+            "context": self._request_context(),
+            "tool": "channel.binding.delete",
+            "input": {
+                "binding_id": body.get("binding_id"),
+            },
+        }
+        self._dispatch_mcp(payload)
+
     def _handle_channel_select_tenant(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -3952,6 +4021,183 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             message_text=message_text,
         )
         self._send_json(HTTPStatus.OK, response_data)
+
+    def _handle_meta_whatsapp_verify(self, query: str) -> None:
+        qs = parse_qs(query)
+        mode = str(qs.get("hub.mode", [""])[0] or "").strip()
+        verify_token = str(qs.get("hub.verify_token", [""])[0] or "").strip()
+        challenge = str(qs.get("hub.challenge", [""])[0] or "").strip()
+        expected = str(os.getenv("IAOPS_WHATSAPP_VERIFY_TOKEN", "") or "").strip()
+        if mode == "subscribe" and expected and verify_token == expected:
+            body = challenge.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._send_json(
+            HTTPStatus.FORBIDDEN,
+            {"ok": False, "error": "Falha na verificacao do webhook da Meta."},
+        )
+
+    def _handle_meta_whatsapp_webhook(self) -> None:
+        body = self._read_json_body()
+        entries = body.get("entry") if isinstance(body, dict) else None
+        if not isinstance(entries, list):
+            self._send_json(HTTPStatus.OK, {"ok": True, "processed": 0, "replied": 0})
+            return
+        default_client_id = int(os.getenv("IAOPS_WHATSAPP_DEFAULT_CLIENT_ID", "1") or "1")
+        default_tenant_id = int(os.getenv("IAOPS_WHATSAPP_DEFAULT_TENANT_ID", "0") or "0")
+        default_user_id = int(os.getenv("IAOPS_WHATSAPP_DEFAULT_USER_ID", "100") or "100")
+        processed = 0
+        replied = 0
+        failures: list[dict] = []
+
+        for entry in entries:
+            changes = entry.get("changes") if isinstance(entry, dict) else None
+            if not isinstance(changes, list):
+                continue
+            for change in changes:
+                value = change.get("value") if isinstance(change, dict) else None
+                messages = value.get("messages") if isinstance(value, dict) else None
+                if not isinstance(messages, list):
+                    continue
+                for message in messages:
+                    external_user_key = str(message.get("from") or "").strip()
+                    if not external_user_key:
+                        continue
+                    message_text = self._extract_meta_whatsapp_text(message)
+                    if not message_text:
+                        continue
+                    conversation_key = external_user_key
+                    context = {
+                        "client_id": default_client_id,
+                        "tenant_id": default_tenant_id,
+                        "user_id": default_user_id,
+                        "correlation_id": str(uuid.uuid4()),
+                    }
+                    command = self._parse_channel_command(message_text)
+                    response_data = self._execute_channel_command(
+                        context=context,
+                        channel_type="whatsapp",
+                        external_user_key=external_user_key,
+                        conversation_key=conversation_key,
+                        command=command,
+                        message_text=message_text,
+                    )
+                    processed += 1
+                    reply_text = str((response_data or {}).get("reply_text") or "").strip()
+                    if not reply_text:
+                        continue
+                    send_result = self._send_meta_whatsapp_text(
+                        to_number=external_user_key,
+                        reply_text=reply_text,
+                    )
+                    if send_result.get("ok"):
+                        replied += 1
+                    else:
+                        failures.append(
+                            {
+                                "to": external_user_key,
+                                "error": send_result.get("error") or "send_failed",
+                            }
+                        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "processed": processed,
+                "replied": replied,
+                "failures": failures[:20],
+            },
+        )
+
+    @staticmethod
+    def _extract_meta_whatsapp_text(message: dict) -> str:
+        if not isinstance(message, dict):
+            return ""
+        text = message.get("text")
+        if isinstance(text, dict):
+            body = str(text.get("body") or "").strip()
+            if body:
+                return body
+        interactive = message.get("interactive")
+        if isinstance(interactive, dict):
+            button_reply = interactive.get("button_reply")
+            if isinstance(button_reply, dict):
+                title = str(button_reply.get("title") or "").strip()
+                if title:
+                    return title
+            list_reply = interactive.get("list_reply")
+            if isinstance(list_reply, dict):
+                title = str(list_reply.get("title") or "").strip()
+                if title:
+                    return title
+        button = message.get("button")
+        if isinstance(button, dict):
+            text_value = str(button.get("text") or "").strip()
+            if text_value:
+                return text_value
+        return ""
+
+    @staticmethod
+    def _chunk_whatsapp_text(text: str, chunk_size: int = 3900) -> list[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        chunks = []
+        current = raw
+        while len(current) > chunk_size:
+            split_at = current.rfind("\n", 0, chunk_size)
+            if split_at <= 0:
+                split_at = chunk_size
+            chunks.append(current[:split_at].strip())
+            current = current[split_at:].strip()
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _send_meta_whatsapp_text(self, *, to_number: str, reply_text: str) -> dict:
+        access_token = str(os.getenv("IAOPS_WHATSAPP_ACCESS_TOKEN", "") or "").strip()
+        phone_number_id = str(os.getenv("IAOPS_WHATSAPP_PHONE_NUMBER_ID", "") or "").strip()
+        api_version = str(os.getenv("IAOPS_WHATSAPP_API_VERSION", "v21.0") or "v21.0").strip()
+        if not access_token or not phone_number_id:
+            return {"ok": False, "error": "Credenciais WhatsApp nao configuradas (ACCESS_TOKEN/PHONE_NUMBER_ID)."}
+        url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+        chunks = self._chunk_whatsapp_text(reply_text)
+        if not chunks:
+            return {"ok": False, "error": "Resposta vazia para envio."}
+        for chunk in chunks[:3]:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": str(to_number).strip(),
+                "type": "text",
+                "text": {"body": chunk},
+            }
+            request = urllib.request.Request(
+                url=url,
+                method="POST",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {access_token}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    _ = response.read()
+            except urllib.error.HTTPError as exc:
+                details = ""
+                try:
+                    details = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    details = ""
+                return {"ok": False, "error": f"HTTP {exc.code}: {details or exc.reason}"}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        return {"ok": True}
 
     def _execute_channel_command(
         self,
@@ -4288,6 +4534,8 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 }
             }
         if active_user_id is None:
+            active_user_id = int(context.get("user_id") or 0)
+        if int(active_user_id) <= 0:
             return {
                 "error": {
                     "ok": False,

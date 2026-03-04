@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import {
   beginMfaSetup,
+  channelGetActiveTenant,
+  channelListUserTenants,
+  channelSelectTenant,
+  channelWebhookTelegram,
+  channelWebhookWhatsapp,
   disableMfa,
+  listAccessUsers,
+  listChannelBindings,
+  upsertChannelBinding,
+  deleteChannelBinding,
   enableMfa,
   getAdminLlmConfig,
   getAdminSmtpConfig,
@@ -9,6 +18,7 @@ import {
   getUserTenantPreference,
   getTenantLlmConfig,
   getAuthContext,
+  listClientTenants,
   listAdminLlmModels,
   listAdminLlmProviders,
   listAuthSessions,
@@ -29,7 +39,7 @@ import SmtpConfigModal from "../components/SmtpConfigModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
 import { tUi } from "../i18n/uiText";
 
-export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied, onSessionRevokedCurrent }) {
+export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPreferenceApplied, onSessionRevokedCurrent }) {
   const auth = getAuthContext();
   const isGlobalSuperadmin = Boolean(auth?.is_superadmin) && Number(auth?.tenant_id || 0) <= 0;
   const [mfa, setMfa] = useState(null);
@@ -55,6 +65,30 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
   const [sessions, setSessions] = useState([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [pendingSessionRevoke, setPendingSessionRevoke] = useState(null);
+  const [channelType, setChannelType] = useState("telegram");
+  const [externalUserKey, setExternalUserKey] = useState("");
+  const [conversationKey, setConversationKey] = useState("");
+  const [messageText, setMessageText] = useState("tenant list");
+  const [webhookResponse, setWebhookResponse] = useState(null);
+  const [tenantOptions, setTenantOptions] = useState([]);
+  const [selectedTenantId, setSelectedTenantId] = useState("");
+  const [activeTenantLabel, setActiveTenantLabel] = useState("");
+  const [isSendingChannelMessage, setIsSendingChannelMessage] = useState(false);
+  const [isLoadingChannelTenants, setIsLoadingChannelTenants] = useState(false);
+  const [isLoadingChannelActiveTenant, setIsLoadingChannelActiveTenant] = useState(false);
+  const [isSelectingChannelTenant, setIsSelectingChannelTenant] = useState(false);
+  const [channelBindings, setChannelBindings] = useState([]);
+  const [tenantItems, setTenantItems] = useState([]);
+  const [channelUsers, setChannelUsers] = useState([]);
+  const [isLoadingChannelBindings, setIsLoadingChannelBindings] = useState(false);
+  const [selectedBindingId, setSelectedBindingId] = useState("");
+  const [channelBindingDraft, setChannelBindingDraft] = useState({
+    tenant_id: String(auth?.tenant_id || ""),
+    user_id: "",
+    channel_type: "telegram",
+    external_user_key: "",
+    is_active: true,
+  });
 
   const loadStatus = async () => {
     setLoading(true);
@@ -77,6 +111,9 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       loadTenantLlmConfig();
       loadUserPreference();
       loadSessions();
+      loadChannelTenantsCatalog();
+      loadChannelBindings();
+      loadChannelUsers();
     }
   }, [isGlobalSuperadmin]);
 
@@ -315,6 +352,136 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
     }
   };
 
+  const loadChannelUsers = async () => {
+    try {
+      const data = await listAccessUsers();
+      const users = data.users || [];
+      setChannelUsers(users);
+      setChannelBindingDraft((prev) => {
+        if (prev.user_id && users.some((item) => String(item.user_id) === String(prev.user_id))) return prev;
+        return { ...prev, user_id: users[0] ? String(users[0].user_id) : String(auth?.user_id || "") };
+      });
+    } catch (_) {
+      setChannelUsers([]);
+    }
+  };
+
+  const loadChannelTenantsCatalog = async () => {
+    try {
+      const data = await listClientTenants();
+      const rows = data.tenants || [];
+      setTenantItems(rows);
+      setChannelBindingDraft((prev) => {
+        if (prev.tenant_id && rows.some((item) => String(item.id) === String(prev.tenant_id))) return prev;
+        return { ...prev, tenant_id: rows[0] ? String(rows[0].id) : "" };
+      });
+    } catch (_) {
+      setTenantItems([]);
+    }
+  };
+
+  const loadChannelBindings = async () => {
+    setIsLoadingChannelBindings(true);
+    try {
+      const data = await listChannelBindings();
+      const bindings = data.bindings || [];
+      setChannelBindings(bindings);
+      const selected = selectedBindingId
+        ? bindings.find((item) => String(item.id) === String(selectedBindingId))
+        : null;
+      const activeDefault = selected || bindings.find((item) => Boolean(item.is_active)) || null;
+      if (activeDefault) {
+        setSelectedBindingId(String(activeDefault.id));
+        setChannelType(String(activeDefault.channel_type || "telegram"));
+        setExternalUserKey(String(activeDefault.external_user_key || ""));
+        if (!conversationKey.trim()) setConversationKey(String(activeDefault.external_user_key || ""));
+      } else {
+        setSelectedBindingId("");
+      }
+    } catch (error) {
+      onSystemMessage("error", "Falha ao listar vinculos de canal", error.message);
+    } finally {
+      setIsLoadingChannelBindings(false);
+    }
+  };
+
+  const saveChannelBinding = async () => {
+    const tenantId = Number(channelBindingDraft.tenant_id || 0);
+    const userId = Number(channelBindingDraft.user_id || 0);
+    const externalUserKey = String(channelBindingDraft.external_user_key || "").trim();
+    const channelTypeDraft = String(channelBindingDraft.channel_type || "").trim().toLowerCase();
+    if (!Number.isFinite(tenantId) || tenantId <= 0) {
+      onSystemMessage("warning", "Campos obrigatorios", "Selecione o tenant.");
+      return;
+    }
+    if (!externalUserKey) {
+      onSystemMessage("warning", "Campos obrigatorios", "Informe o identificador do usuario no canal.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await upsertChannelBinding({
+        tenant_id: tenantId,
+        user_id: Number.isFinite(userId) && userId > 0 ? userId : null,
+        channel_type: channelTypeDraft,
+        external_user_key: externalUserKey,
+        is_active: Boolean(channelBindingDraft.is_active),
+      });
+      onSystemMessage("success", "Vinculo salvo", "Identidade do canal vinculada ao tenant com sucesso.");
+      setChannelBindingDraft((prev) => ({ ...prev, external_user_key: "" }));
+      await loadChannelBindings();
+      if (String(channelTypeDraft) === String(channelType)) {
+        const updated = await listChannelBindings();
+        const rows = updated.bindings || [];
+        const matched = rows.find(
+          (item) =>
+            String(item.channel_type || "") === String(channelTypeDraft) &&
+            String(item.external_user_key || "") === String(externalUserKey)
+        );
+        if (matched) setSelectedBindingId(String(matched.id));
+        setExternalUserKey(externalUserKey);
+      }
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar vinculo", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const removeChannelBinding = async (bindingId) => {
+    if (!bindingId) return;
+    setSubmitting(true);
+    try {
+      await deleteChannelBinding({ binding_id: Number(bindingId) });
+      onSystemMessage("success", "Vinculo removido", "Vinculo de canal removido.");
+      await loadChannelBindings();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao remover vinculo", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const toggleChannelBinding = async (item) => {
+    if (!item) return;
+    setSubmitting(true);
+    try {
+      await upsertChannelBinding({
+        tenant_id: Number(item.tenant_id),
+        user_id: item.user_id != null ? Number(item.user_id) : null,
+        channel_type: String(item.channel_type || "").toLowerCase(),
+        external_user_key: String(item.external_user_key || ""),
+        is_active: !Boolean(item.is_active),
+      });
+      onSystemMessage("success", "Vinculo atualizado", "Status do vinculo atualizado com sucesso.");
+      await loadChannelBindings();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao atualizar vinculo", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const formatEpoch = (value) => {
     const num = Number(value || 0);
     if (!num) return "-";
@@ -372,6 +539,146 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
       setSubmitting(false);
     }
   };
+
+  const baseChannelPayload = () => ({
+    channel_type: channelType,
+    external_user_key: externalUserKey.trim(),
+    conversation_key: conversationKey.trim(),
+  });
+
+  const ensureChannelKeys = () => {
+    if (!externalUserKey.trim() || !conversationKey.trim()) {
+      onSystemMessage(
+        "warning",
+        tUi("op.required.title", "Campos obrigatorios"),
+        tUi("op.required.message", "Informe o identificador do usuario no canal e o identificador da conversa.")
+      );
+      return false;
+    }
+    return true;
+  };
+
+  const loadChannelTenants = async () => {
+    if (!ensureChannelKeys()) return;
+    setIsLoadingChannelTenants(true);
+    try {
+      const data = await channelListUserTenants(baseChannelPayload());
+      const tenants = data.tenants || [];
+      setTenantOptions(tenants);
+      setSelectedTenantId((prev) => {
+        if (prev && tenants.some((item) => String(item.tenant_id) === String(prev))) return prev;
+        return tenants[0] ? String(tenants[0].tenant_id) : "";
+      });
+      onSystemMessage(
+        "success",
+        tUi("op.tenant.loaded.title", "Tenants carregados"),
+        tUi("op.tenant.loaded.message", "{count} tenant(s) disponivel(is) para este usuario/canal.", {
+          count: tenants.length,
+        })
+      );
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsLoadingChannelTenants(false);
+    }
+  };
+
+  const loadChannelActiveTenant = async () => {
+    if (!ensureChannelKeys()) return;
+    setIsLoadingChannelActiveTenant(true);
+    try {
+      const data = await channelGetActiveTenant(baseChannelPayload());
+      const activeTenantId = data.active_tenant_id;
+      const tenants = data.tenants || tenantOptions;
+      if (tenants.length > 0 && tenantOptions.length === 0) setTenantOptions(tenants);
+      if (activeTenantId == null) {
+        setActiveTenantLabel(tUi("op.tenant.active.none", "Nenhum tenant ativo na conversa."));
+        return;
+      }
+      const selected = tenants.find((item) => String(item.tenant_id) === String(activeTenantId));
+      const label = selected
+        ? `${selected.tenant_id} - ${selected.name} (${selected.status}, ${selected.role})`
+        : tUi("op.tenant.active.onlyId", "Tenant ativo: {tenant_id}", { tenant_id: activeTenantId });
+      setActiveTenantLabel(label);
+      setSelectedTenantId(String(activeTenantId));
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsLoadingChannelActiveTenant(false);
+    }
+  };
+
+  const selectChannelActiveTenant = async () => {
+    if (!ensureChannelKeys()) return;
+    if (!selectedTenantId) {
+      onSystemMessage(
+        "warning",
+        tUi("op.required.title", "Campos obrigatorios"),
+        tUi("op.tenant.select.required", "Selecione um tenant para ativar no canal.")
+      );
+      return;
+    }
+    setIsSelectingChannelTenant(true);
+    try {
+      await channelSelectTenant({
+        ...baseChannelPayload(),
+        tenant_id: Number(selectedTenantId),
+      });
+      await loadChannelActiveTenant();
+      onSystemMessage(
+        "success",
+        tUi("op.tenant.select.ok.title", "Tenant ativo atualizado"),
+        tUi("op.tenant.select.ok.message", "Tenant da conversa atualizado com sucesso.")
+      );
+    } catch (error) {
+      onSystemMessage("error", tUi("op.tenant.fail.title", "Falha na gestao de tenant"), error.message);
+    } finally {
+      setIsSelectingChannelTenant(false);
+    }
+  };
+
+  const sendChannelMessage = async () => {
+    if (!ensureChannelKeys()) return;
+    setWebhookResponse(null);
+    setIsSendingChannelMessage(true);
+    try {
+      const payload = {
+        external_user_key: externalUserKey.trim(),
+        conversation_key: conversationKey.trim(),
+        text: messageText.trim(),
+      };
+      const data =
+        channelType === "telegram"
+          ? await channelWebhookTelegram(payload)
+          : await channelWebhookWhatsapp(payload);
+      setWebhookResponse(data);
+      onSystemMessage(
+        "success",
+        tUi("op.webhook.ok.title", "Webhook processado"),
+        tUi("op.webhook.ok.message", "Mensagem processada com sucesso no canal.")
+      );
+    } catch (error) {
+      onSystemMessage("error", tUi("op.webhook.fail.title", "Erro no webhook"), error.message);
+    } finally {
+      setIsSendingChannelMessage(false);
+    }
+  };
+
+  useEffect(() => {
+    const selected = selectedBindingId
+      ? (channelBindings || []).find((item) => String(item.id) === String(selectedBindingId))
+      : null;
+    if (selected) {
+      setChannelType(String(selected.channel_type || "telegram"));
+      const key = String(selected.external_user_key || "");
+      setExternalUserKey(key);
+      if (!conversationKey.trim()) setConversationKey(key);
+    }
+    setTenantOptions([]);
+    setSelectedTenantId("");
+    setActiveTenantLabel("");
+    setWebhookResponse(null);
+  }, [channelType, channelBindings, selectedBindingId]);
 
   return (
     <section className="page-panel">
@@ -455,6 +762,235 @@ export default function ConfiguracaoPanel({ onSystemMessage, onPreferenceApplied
           </button>
           <button type="button" className="btn btn-secondary" onClick={loadUserPreference} disabled={submitting}>
             {tUi("config.pref.refresh", "Atualizar Preferencia")}
+          </button>
+        </div>
+      </section>
+      )}
+
+      {!isGlobalSuperadmin && (
+      <section className="catalog-block">
+        <header>
+          <h3>Vinculo Canal x Tenant</h3>
+        </header>
+        <p className="muted">
+          Defina para qual tenant cada identidade de canal (Telegram/WhatsApp) deve apontar.
+        </p>
+        <p className="muted">Identificador do usuario no canal: Telegram (`from.id`/`chat_id`) ou WhatsApp (`from`). Usuario e opcional (auditoria).</p>
+        <div className="inline-form">
+          <select
+            value={channelBindingDraft.tenant_id}
+            onChange={(event) =>
+              setChannelBindingDraft((prev) => ({ ...prev, tenant_id: event.target.value }))
+            }
+          >
+            <option value="">Selecione um tenant</option>
+            {tenantItems.map((item) => (
+              <option key={item.id} value={String(item.id)}>
+                {`${item.name} (#${item.id})`}
+              </option>
+            ))}
+          </select>
+          <select
+            value={channelBindingDraft.channel_type}
+            onChange={(event) =>
+              setChannelBindingDraft((prev) => ({ ...prev, channel_type: event.target.value }))
+            }
+          >
+            <option value="telegram">Telegram</option>
+            <option value="whatsapp">WhatsApp</option>
+          </select>
+          <select
+            value={channelBindingDraft.user_id}
+            onChange={(event) =>
+              setChannelBindingDraft((prev) => ({ ...prev, user_id: event.target.value }))
+            }
+          >
+            <option value="">Usuario (opcional)</option>
+            {channelUsers.map((item) => (
+              <option key={item.user_id} value={String(item.user_id)}>
+                {`${item.full_name || item.email} (#${item.user_id})`}
+              </option>
+            ))}
+          </select>
+          <input
+            value={channelBindingDraft.external_user_key}
+            onChange={(event) =>
+              setChannelBindingDraft((prev) => ({ ...prev, external_user_key: event.target.value }))
+            }
+            placeholder="Identificador do usuario no canal"
+          />
+          <label className="checkbox-inline">
+            <input
+              type="checkbox"
+              checked={Boolean(channelBindingDraft.is_active)}
+              onChange={(event) =>
+                setChannelBindingDraft((prev) => ({ ...prev, is_active: event.target.checked }))
+              }
+            />
+            Ativo
+          </label>
+          <button type="button" className="btn btn-primary" onClick={saveChannelBinding} disabled={submitting}>
+            Salvar vinculo
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadChannelBindings} disabled={isLoadingChannelBindings}>
+            {isLoadingChannelBindings ? "Atualizando..." : "Atualizar lista"}
+          </button>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Canal</th>
+                <th>Identificador no canal</th>
+                <th>Tenant</th>
+                <th>Usuario (opcional)</th>
+                <th>Status</th>
+                <th>Acoes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {channelBindings.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="empty-state">Nenhum vinculo cadastrado.</td>
+                </tr>
+              ) : (
+                channelBindings.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.id}</td>
+                    <td>{item.channel_type}</td>
+                    <td>{item.external_user_key}</td>
+                    <td>{item.tenant_name || (item.tenant_id ? `#${item.tenant_id}` : "-")}</td>
+                    <td>{item.user_full_name || item.user_email || (item.user_id ? `#${item.user_id}` : "-")}</td>
+                    <td>{item.is_active ? "Ativo" : "Inativo"}</td>
+                    <td>
+                      <div className="table-actions">
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() => toggleChannelBinding(item)}
+                          disabled={submitting}
+                        >
+                          {item.is_active ? "Inativar" : "Ativar"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-small btn-secondary"
+                          onClick={() => removeChannelBinding(item.id)}
+                          disabled={submitting}
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      )}
+
+      {!isGlobalSuperadmin && (
+      <section className="catalog-block">
+        <header>
+          <h3>Canais do Tenant (Telegram/WhatsApp)</h3>
+        </header>
+        <p className="muted">
+          Configure aqui o contexto do canal para este tenant e valide o fluxo de mensagens.
+        </p>
+        <p className="muted">Dica: selecione uma identidade de canal ja vinculada ao tenant.</p>
+        <div className="inline-form">
+          <select value={channelType} onChange={(event) => setChannelType(event.target.value)}>
+            <option value="telegram">Telegram</option>
+            <option value="whatsapp">WhatsApp</option>
+          </select>
+          <select
+            value={selectedBindingId}
+            onChange={(event) => {
+              const bindingId = event.target.value;
+              setSelectedBindingId(bindingId);
+              const selected = (channelBindings || []).find((item) => String(item.id) === String(bindingId));
+              if (!selected) return;
+              const selectedChannel = String(selected.channel_type || "telegram");
+              const key = String(selected.external_user_key || "");
+              setChannelType(selectedChannel);
+              setExternalUserKey(key);
+              setConversationKey((prev) => (prev.trim() ? prev : key));
+            }}
+          >
+            <option value="">Selecione identidade vinculada</option>
+            {channelBindings
+              .filter((item) => Boolean(item.is_active))
+              .map((item) => (
+                <option key={`${item.id}-${item.external_user_key}`} value={String(item.id)}>
+                  {`${item.channel_type} | ${item.external_user_key} -> ${item.tenant_name || `#${item.tenant_id}`}`}
+                </option>
+              ))}
+          </select>
+          <input
+            value={externalUserKey}
+            onChange={(event) => setExternalUserKey(event.target.value)}
+            placeholder="Identificador do usuario no canal"
+          />
+          <input
+            value={conversationKey}
+            onChange={(event) => setConversationKey(event.target.value)}
+            placeholder="Identificador da conversa"
+          />
+        </div>
+        <div className="inline-form">
+          <button type="button" className="btn btn-secondary" onClick={loadChannelTenants} disabled={isLoadingChannelTenants}>
+            {isLoadingChannelTenants ? tUi("op.tenant.loading", "Carregando...") : tUi("op.tenant.list", "Listar Tenants")}
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadChannelActiveTenant} disabled={isLoadingChannelActiveTenant}>
+            {isLoadingChannelActiveTenant ? tUi("op.tenant.loading", "Carregando...") : tUi("op.tenant.active.get", "Ver Tenant Ativo")}
+          </button>
+          <select value={selectedTenantId} onChange={(event) => setSelectedTenantId(event.target.value)}>
+            <option value="">{tUi("op.tenant.select.placeholder", "Selecione um tenant")}</option>
+            {tenantOptions.map((item) => (
+              <option key={item.tenant_id} value={String(item.tenant_id)}>
+                {`${item.tenant_id} - ${item.name} (${item.status}, ${item.role})`}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={selectChannelActiveTenant}
+            disabled={isSelectingChannelTenant || !selectedTenantId}
+          >
+            {isSelectingChannelTenant ? tUi("op.tenant.select.saving", "Atualizando...") : tUi("op.tenant.select.set", "Definir Tenant Ativo")}
+          </button>
+        </div>
+        <article className="metric-card">
+          <h4>{tUi("op.tenant.active.title", "Tenant ativo da conversa")}</h4>
+          <p>{activeTenantLabel || tUi("op.tenant.active.none", "Nenhum tenant ativo na conversa.")}</p>
+        </article>
+        <div className="inline-form" style={{ marginTop: "0.75rem" }}>
+          <input
+            value={messageText}
+            onChange={(event) => setMessageText(event.target.value)}
+            placeholder={tUi("op.tester.message.placeholder", "Mensagem / comando")}
+          />
+          <button type="button" className="btn btn-primary" onClick={sendChannelMessage} disabled={isSendingChannelMessage}>
+            {isSendingChannelMessage ? tUi("op.tester.sending", "Enviando...") : tUi("op.tester.send", "Enviar para Webhook")}
+          </button>
+        </div>
+        {webhookResponse ? (
+          <article className="metric-card" style={{ marginTop: "0.75rem" }}>
+            <h4>{tUi("op.tester.reply", "Resposta do Bot")}</h4>
+            <pre>{webhookResponse.reply_text || tUi("op.tester.noReply", "Sem resposta textual")}</pre>
+          </article>
+        ) : null}
+        <div className="page-actions">
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => onNavigate?.("operacao")}
+          >
+            Abrir Operacao avancada
           </button>
         </div>
       </section>

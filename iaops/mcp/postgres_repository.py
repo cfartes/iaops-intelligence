@@ -20,6 +20,7 @@ DEFAULT_TOOL_POLICIES = {
     "tenant.get_limits": ToolPolicy("tenant.get_limits", "viewer", True, None, 120, True, None),
     "tenant.create": ToolPolicy("tenant.create", "owner", True, None, 60, True, None),
     "tenant.update_status": ToolPolicy("tenant.update_status", "owner", True, None, 120, True, None),
+    "tenant.update_identity": ToolPolicy("tenant.update_identity", "owner", True, None, 120, True, None),
     "inventory.list_tables": ToolPolicy("inventory.list_tables", "viewer", True, 1000, 120, True, None),
     "inventory.list_columns": ToolPolicy("inventory.list_columns", "viewer", True, 1000, 120, True, None),
     "access.list_users": ToolPolicy("access.list_users", "admin", True, 1000, 120, True, None),
@@ -41,6 +42,9 @@ DEFAULT_TOOL_POLICIES = {
     "channel.list_user_tenants": ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
     "channel.set_active_tenant": ToolPolicy("channel.set_active_tenant", "viewer", True, None, 120, True, None),
     "channel.get_active_tenant": ToolPolicy("channel.get_active_tenant", "viewer", True, None, 120, True, None),
+    "channel.binding.list": ToolPolicy("channel.binding.list", "admin", True, 500, 120, True, None),
+    "channel.binding.upsert": ToolPolicy("channel.binding.upsert", "admin", True, None, 120, True, None),
+    "channel.binding.delete": ToolPolicy("channel.binding.delete", "admin", True, None, 120, True, None),
     "inventory.list_tenant_tables": ToolPolicy("inventory.list_tenant_tables", "viewer", True, 1000, 120, True, None),
     "inventory.register_table": ToolPolicy("inventory.register_table", "admin", True, None, 120, True, None),
     "inventory.delete_table": ToolPolicy("inventory.delete_table", "admin", True, None, 120, True, None),
@@ -99,6 +103,7 @@ class PostgresMCPRepository(MCPRepository):
         self._monitored_column_meta_ready = False
         self._data_source_rag_meta_ready = False
         self._plan_source_limits_ready = False
+        self._channel_tables_ready = False
 
     def _ensure_monitored_column_meta(self) -> None:
         if self._monitored_column_meta_ready:
@@ -143,6 +148,56 @@ class PostgresMCPRepository(MCPRepository):
                 cur.execute(ddl)
             conn.commit()
         self._plan_source_limits_ready = True
+
+    def _ensure_channel_tables(self) -> None:
+        if self._channel_tables_ready:
+            return
+        ddl_statements = [
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.schema}.channel_user_binding (
+                id BIGSERIAL PRIMARY KEY,
+                client_id BIGINT NOT NULL REFERENCES {self.schema}.client(id),
+                tenant_id BIGINT REFERENCES {self.schema}.tenant(id),
+                user_id BIGINT REFERENCES {self.schema}.app_user(id),
+                channel_type TEXT NOT NULL CHECK (channel_type IN ('telegram', 'whatsapp')),
+                external_user_key TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (channel_type, external_user_key)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.schema}.channel_tenant_context (
+                id BIGSERIAL PRIMARY KEY,
+                client_id BIGINT NOT NULL REFERENCES {self.schema}.client(id),
+                user_id BIGINT NOT NULL REFERENCES {self.schema}.app_user(id),
+                channel_type TEXT NOT NULL CHECK (channel_type IN ('telegram', 'whatsapp')),
+                conversation_key TEXT NOT NULL,
+                active_tenant_id BIGINT REFERENCES {self.schema}.tenant(id),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (channel_type, conversation_key)
+            )
+            """,
+            f"ALTER TABLE {self.schema}.channel_user_binding ADD COLUMN IF NOT EXISTS tenant_id BIGINT REFERENCES {self.schema}.tenant(id)",
+            f"ALTER TABLE {self.schema}.channel_user_binding ALTER COLUMN user_id DROP NOT NULL",
+            f"CREATE INDEX IF NOT EXISTS idx_channel_binding_client_user ON {self.schema}.channel_user_binding(client_id, user_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_channel_binding_client_tenant ON {self.schema}.channel_user_binding(client_id, tenant_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_channel_context_client_user ON {self.schema}.channel_tenant_context(client_id, user_id)",
+        ]
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            for ddl in ddl_statements:
+                cur.execute(ddl)
+            conn.commit()
+        self._channel_tables_ready = True
+
+    def _ensure_channel_binding_tenant_column(self) -> None:
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"ALTER TABLE {self.schema}.channel_user_binding ADD COLUMN IF NOT EXISTS tenant_id BIGINT REFERENCES {self.schema}.tenant(id)"
+            )
+            cur.execute(f"ALTER TABLE {self.schema}.channel_user_binding ALTER COLUMN user_id DROP NOT NULL")
+            conn.commit()
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         if int(tenant_id) <= 0:
@@ -308,16 +363,19 @@ class PostgresMCPRepository(MCPRepository):
                     FROM {self.schema}.data_source ds
                     JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
                     WHERE t.client_id = %(client_id)s
-                      AND (%(tenant_id)s IS NOT NULL AND ds.tenant_id = %(tenant_id)s)
+                      AND ds.tenant_id = %(tenant_id)s
                 ) AS total_data_sources_tenant,
                 (
                     SELECT COUNT(*)
                     FROM {self.schema}.data_source ds
-                    WHERE (%(tenant_id)s IS NOT NULL AND ds.tenant_id = %(tenant_id)s)
+                    JOIN {self.schema}.tenant t ON t.id = ds.tenant_id
+                    WHERE t.client_id = %(client_id)s
+                      AND ds.tenant_id = %(tenant_id)s
                       AND ds.is_active = TRUE
                 ) AS active_data_sources_tenant
         """
         limit_row: dict[str, Any] | None = None
+        tenant_scope_id = int(tenant_id) if tenant_id is not None else -1
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             try:
                 cur.execute(billing_limits_sql, {"client_id": client_id})
@@ -333,7 +391,7 @@ class PostgresMCPRepository(MCPRepository):
                 except Exception:
                     conn.rollback()
                     limit_row = None
-            cur.execute(counters_sql, {"client_id": client_id, "tenant_id": tenant_id})
+            cur.execute(counters_sql, {"client_id": client_id, "tenant_id": tenant_scope_id})
             counters = cur.fetchone() or {}
         max_tenants = int(limit_row["max_tenants"]) if limit_row else 1
         active_tenants = int(counters.get("active_tenants", 0) or 0)
@@ -409,6 +467,18 @@ class PostgresMCPRepository(MCPRepository):
                AND client_id = %(client_id)s
          RETURNING id, client_id, name, slug, status, created_at
         """
+        disable_sources_sql = f"""
+            UPDATE {self.schema}.data_source
+               SET is_active = FALSE
+             WHERE tenant_id = %(tenant_id)s
+               AND is_active = TRUE
+        """
+        disable_tables_sql = f"""
+            UPDATE {self.schema}.monitored_table
+               SET is_active = FALSE
+             WHERE tenant_id = %(tenant_id)s
+               AND is_active = TRUE
+        """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             cur.execute(select_sql, {"tenant_id": tenant_id, "client_id": client_id})
             current = cur.fetchone()
@@ -427,6 +497,9 @@ class PostgresMCPRepository(MCPRepository):
                 },
             )
             row = cur.fetchone()
+            if status == "disabled":
+                cur.execute(disable_sources_sql, {"tenant_id": tenant_id})
+                cur.execute(disable_tables_sql, {"tenant_id": tenant_id})
             conn.commit()
         return row
 
@@ -859,6 +932,55 @@ class PostgresMCPRepository(MCPRepository):
             conn.commit()
         return row
 
+    def update_tenant_identity(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        name: str,
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_name = str(name or "").strip()
+        normalized_slug = str(slug or "").strip().lower() or None
+        if not normalized_name:
+            raise ValueError("name obrigatorio")
+        check_sql = f"""
+            SELECT 1
+            FROM {self.schema}.tenant
+            WHERE client_id = %(client_id)s
+              AND slug = %(slug)s
+              AND id <> %(tenant_id)s
+            LIMIT 1
+        """
+        update_sql = f"""
+            UPDATE {self.schema}.tenant
+            SET
+                name = %(name)s,
+                slug = COALESCE(%(slug)s, slug)
+            WHERE id = %(tenant_id)s
+              AND client_id = %(client_id)s
+            RETURNING id, client_id, name, slug, status, created_at
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            if normalized_slug:
+                cur.execute(check_sql, {"client_id": client_id, "slug": normalized_slug, "tenant_id": tenant_id})
+                if cur.fetchone():
+                    raise ValueError("slug ja utilizado para este cliente")
+            cur.execute(
+                update_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "client_id": client_id,
+                    "name": normalized_name,
+                    "slug": normalized_slug,
+                },
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("tenant nao encontrado")
+            conn.commit()
+        return row
+
     def get_tenant_llm_config(self, client_id: int, tenant_id: int) -> dict[str, Any]:
         cfg_sql = f"""
             SELECT
@@ -1010,13 +1132,17 @@ class PostgresMCPRepository(MCPRepository):
         channel_type: str,
         external_user_key: str,
     ) -> dict[str, Any]:
-        user_sql = f"""
+        self._ensure_channel_tables()
+        self._ensure_channel_binding_tenant_column()
+        binding_sql = f"""
             SELECT
+                b.id,
+                b.tenant_id,
                 b.user_id,
                 u.email,
                 u.full_name
             FROM {self.schema}.channel_user_binding b
-            JOIN {self.schema}.app_user u ON u.id = b.user_id
+            LEFT JOIN {self.schema}.app_user u ON u.id = b.user_id
             WHERE b.client_id = %(client_id)s
               AND b.channel_type = %(channel_type)s
               AND b.external_user_key = %(external_user_key)s
@@ -1038,34 +1164,214 @@ class PostgresMCPRepository(MCPRepository):
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
             cur.execute(
-                user_sql,
+                binding_sql,
                 {
                     "client_id": client_id,
                     "channel_type": channel_type,
                     "external_user_key": external_user_key,
                 },
             )
-            user_row = cur.fetchone()
-            if not user_row:
-                raise ValueError("identidade do canal nao vinculada a usuario")
-            cur.execute(
-                tenants_sql,
-                {
-                    "user_id": user_row["user_id"],
-                    "client_id": client_id,
-                },
-            )
-            tenants = cur.fetchall()
+            binding_row = cur.fetchone()
+            if not binding_row:
+                raise ValueError("identidade do canal nao vinculada a tenant")
+            tenants: list[dict[str, Any]] = []
+            tenant_id = int(binding_row["tenant_id"]) if binding_row.get("tenant_id") is not None else None
+            if tenant_id is not None and tenant_id > 0:
+                cur.execute(
+                    f"""
+                    SELECT id AS tenant_id, name, slug, status
+                    FROM {self.schema}.tenant
+                    WHERE id = %(tenant_id)s
+                      AND client_id = %(client_id)s
+                    LIMIT 1
+                    """,
+                    {"tenant_id": tenant_id, "client_id": client_id},
+                )
+                tenant_row = cur.fetchone()
+                if not tenant_row:
+                    raise ValueError("tenant vinculado ao canal nao encontrado")
+                role = "viewer"
+                if binding_row.get("user_id") is not None:
+                    cur.execute(
+                        f"""
+                        SELECT role
+                        FROM {self.schema}.tenant_user_role
+                        WHERE tenant_id = %(tenant_id)s
+                          AND user_id = %(user_id)s
+                        LIMIT 1
+                        """,
+                        {"tenant_id": tenant_id, "user_id": int(binding_row["user_id"])},
+                    )
+                    role_row = cur.fetchone()
+                    if role_row and role_row.get("role"):
+                        role = str(role_row["role"])
+                tenants = [{**tenant_row, "role": role}]
+            elif binding_row.get("user_id") is not None:
+                cur.execute(
+                    tenants_sql,
+                    {
+                        "user_id": int(binding_row["user_id"]),
+                        "client_id": client_id,
+                    },
+                )
+                tenants = cur.fetchall()
         if not tenants:
-            raise ValueError("usuario sem tenants vinculados")
+            raise ValueError("canal sem tenant vinculado")
         return {
             "user": {
-                "user_id": int(user_row["user_id"]),
-                "email": user_row["email"],
-                "full_name": user_row["full_name"],
-            },
+                "user_id": int(binding_row["user_id"]) if binding_row.get("user_id") is not None else None,
+                "email": binding_row["email"],
+                "full_name": binding_row["full_name"],
+            } if binding_row.get("user_id") is not None else {},
             "tenants": tenants,
         }
+
+    def list_channel_user_bindings(self, client_id: int, *, channel_type: str | None = None) -> list[dict[str, Any]]:
+        self._ensure_channel_tables()
+        self._ensure_channel_binding_tenant_column()
+        sql = f"""
+            SELECT
+                b.id,
+                b.client_id,
+                b.tenant_id,
+                b.user_id,
+                b.channel_type,
+                b.external_user_key,
+                b.is_active,
+                b.created_at,
+                b.updated_at,
+                t.name AS tenant_name,
+                u.email AS user_email,
+                u.full_name AS user_full_name
+            FROM {self.schema}.channel_user_binding b
+            LEFT JOIN {self.schema}.tenant t ON t.id = b.tenant_id
+            LEFT JOIN {self.schema}.app_user u ON u.id = b.user_id
+            WHERE b.client_id = %(client_id)s
+        """
+        params: dict[str, Any] = {"client_id": int(client_id)}
+        normalized_channel = str(channel_type).strip().lower() if channel_type else None
+        if normalized_channel:
+            sql += " AND b.channel_type = %(channel_type)s"
+            params["channel_type"] = normalized_channel
+        sql += " ORDER BY b.channel_type, b.external_user_key"
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return rows
+
+    def upsert_channel_user_binding(
+        self,
+        client_id: int,
+        *,
+        tenant_id: int,
+        user_id: int | None = None,
+        channel_type: str,
+        external_user_key: str,
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        self._ensure_channel_tables()
+        self._ensure_channel_binding_tenant_column()
+        normalized_channel = str(channel_type or "").strip().lower()
+        normalized_external = str(external_user_key or "").strip()
+        if normalized_channel not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not normalized_external:
+            raise ValueError("external_user_key obrigatorio")
+        tenant_sql = f"""
+            SELECT id
+            FROM {self.schema}.tenant
+            WHERE id = %(tenant_id)s
+              AND client_id = %(client_id)s
+            LIMIT 1
+        """
+        user_sql = f"""
+            SELECT id, client_id
+            FROM {self.schema}.app_user
+            WHERE id = %(user_id)s
+            LIMIT 1
+        """
+        upsert_sql = f"""
+            INSERT INTO {self.schema}.channel_user_binding (
+                client_id,
+                tenant_id,
+                user_id,
+                channel_type,
+                external_user_key,
+                is_active,
+                updated_at
+            )
+            VALUES (
+                %(client_id)s,
+                %(tenant_id)s,
+                %(user_id)s,
+                %(channel_type)s,
+                %(external_user_key)s,
+                %(is_active)s,
+                NOW()
+            )
+            ON CONFLICT (channel_type, external_user_key)
+            DO UPDATE SET
+                client_id = EXCLUDED.client_id,
+                tenant_id = EXCLUDED.tenant_id,
+                user_id = EXCLUDED.user_id,
+                is_active = EXCLUDED.is_active,
+                updated_at = NOW()
+            RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(tenant_sql, {"tenant_id": int(tenant_id), "client_id": int(client_id)})
+            tenant_row = cur.fetchone()
+            if not tenant_row:
+                raise ValueError("tenant_id invalido")
+            user_row = None
+            if user_id is not None:
+                cur.execute(user_sql, {"user_id": int(user_id)})
+                user_row = cur.fetchone()
+                if not user_row:
+                    raise ValueError("user_id invalido")
+                if int(user_row["client_id"]) != int(client_id):
+                    raise ValueError("usuario nao pertence ao cliente")
+            cur.execute(
+                upsert_sql,
+                {
+                    "client_id": int(client_id),
+                    "tenant_id": int(tenant_id),
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "channel_type": normalized_channel,
+                    "external_user_key": normalized_external,
+                    "is_active": bool(is_active),
+                },
+            )
+            saved = cur.fetchone()
+            conn.commit()
+        rows = self.list_channel_user_bindings(client_id, channel_type=normalized_channel)
+        for row in rows:
+            if int(row.get("id", 0)) == int(saved["id"]):
+                return row
+        raise ValueError("falha ao salvar vinculo de canal")
+
+    def delete_channel_user_binding(self, client_id: int, *, binding_id: int) -> dict[str, Any]:
+        self._ensure_channel_tables()
+        self._ensure_channel_binding_tenant_column()
+        delete_sql = f"""
+            DELETE FROM {self.schema}.channel_user_binding
+            WHERE id = %(binding_id)s
+              AND client_id = %(client_id)s
+            RETURNING id
+        """
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                delete_sql,
+                {
+                    "binding_id": int(binding_id),
+                    "client_id": int(client_id),
+                },
+            )
+            deleted = cur.fetchone()
+            if not deleted:
+                raise ValueError("vinculo de canal nao encontrado")
+            conn.commit()
+        return {"binding_id": int(deleted["id"]), "deleted": True}
 
     def set_channel_active_tenant(
         self,
@@ -1076,6 +1382,7 @@ class PostgresMCPRepository(MCPRepository):
         external_user_key: str,
         tenant_id: int,
     ) -> dict[str, Any]:
+        self._ensure_channel_tables()
         resolved = self.resolve_channel_user_tenants(
             client_id,
             channel_type=channel_type,
@@ -1130,6 +1437,7 @@ class PostgresMCPRepository(MCPRepository):
         conversation_key: str,
         external_user_key: str,
     ) -> dict[str, Any]:
+        self._ensure_channel_tables()
         resolved = self.resolve_channel_user_tenants(
             client_id,
             channel_type=channel_type,
@@ -1151,8 +1459,11 @@ class PostgresMCPRepository(MCPRepository):
                 },
             )
             row = cur.fetchone()
+        active_tenant_id = int(row["active_tenant_id"]) if row and row["active_tenant_id"] else None
+        if active_tenant_id is None and len(resolved["tenants"]) == 1:
+            active_tenant_id = int(resolved["tenants"][0]["tenant_id"])
         return {
-            "active_tenant_id": int(row["active_tenant_id"]) if row and row["active_tenant_id"] else None,
+            "active_tenant_id": active_tenant_id,
             "conversation_key": conversation_key,
             "tenants": resolved["tenants"],
             "user": resolved["user"],

@@ -570,7 +570,10 @@ export default function OnboardingPanel({ onSystemMessage }) {
           >
             {tenantSources.map((item) => (
               <option key={item.id} value={item.id}>
-                {(item.source_name || item.source_type) + ` (#${item.id})`}
+                {`${(() => {
+                  const location = parseSourceLocation(item.conn_secret_ref);
+                  return location !== "-" ? location : item.source_name || item.source_type;
+                })()} (#${item.id})`}
               </option>
             ))}
           </select>

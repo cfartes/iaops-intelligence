@@ -482,6 +482,15 @@ export async function updateTenantStatus(payload) {
   return parseResponse(response);
 }
 
+export async function updateTenantIdentity(payload) {
+  const response = await fetch("/api/tenants/identity", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
 export async function listAdminLlmProviders() {
   const response = await fetch("/api/admin/llm/providers", {
     method: "GET",
@@ -753,6 +762,33 @@ export async function channelWebhookWhatsapp(payload) {
     body: JSON.stringify(payload),
   });
   return parseWebhookResponse(response);
+}
+
+export async function listChannelBindings(channelType) {
+  const query = channelType ? `?channel_type=${encodeURIComponent(channelType)}` : "";
+  const response = await fetch(`/api/channel/bindings${query}`, {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function upsertChannelBinding(payload) {
+  const response = await fetch("/api/channel/bindings/upsert", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function deleteChannelBinding(payload) {
+  const response = await fetch("/api/channel/bindings/delete", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
 }
 
 export async function getLgpdPolicy() {

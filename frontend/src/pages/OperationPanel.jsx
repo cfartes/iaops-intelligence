@@ -29,8 +29,8 @@ export default function OperationPanel({ onSystemMessage }) {
   const [health, setHealth] = useState(null);
   const [observability, setObservability] = useState(null);
   const [channelType, setChannelType] = useState("telegram");
-  const [externalUserKey, setExternalUserKey] = useState("tg-owner-demo");
-  const [conversationKey, setConversationKey] = useState("chat-owner-demo");
+  const [externalUserKey, setExternalUserKey] = useState("");
+  const [conversationKey, setConversationKey] = useState("");
   const [messageText, setMessageText] = useState("tenant list");
   const [webhookResponse, setWebhookResponse] = useState(null);
   const [isSending, setIsSending] = useState(false);
@@ -67,7 +67,7 @@ export default function OperationPanel({ onSystemMessage }) {
       onSystemMessage(
         "warning",
         tUi("op.required.title", "Campos obrigatorios"),
-        tUi("op.required.message", "Informe external_user_key e conversation_key.")
+        tUi("op.required.message", "Informe o identificador do usuario no canal e o identificador da conversa.")
       );
       return false;
     }
@@ -225,13 +225,8 @@ export default function OperationPanel({ onSystemMessage }) {
   }, [autoRefreshJobs, jobsPage, jobsPageSize]);
 
   useEffect(() => {
-    if (channelType === "telegram") {
-      setExternalUserKey("tg-owner-demo");
-      setConversationKey("chat-owner-demo");
-      return;
-    }
-    setExternalUserKey("wa-owner-demo");
-    setConversationKey("wa-owner-demo");
+    setExternalUserKey("");
+    setConversationKey("");
     setTenantOptions([]);
     setSelectedTenantId("");
     setActiveTenantLabel("");
@@ -509,12 +504,12 @@ export default function OperationPanel({ onSystemMessage }) {
           <input
             value={externalUserKey}
             onChange={(event) => setExternalUserKey(event.target.value)}
-            placeholder="external_user_key"
+            placeholder="Identificador do usuario no canal"
           />
           <input
             value={conversationKey}
             onChange={(event) => setConversationKey(event.target.value)}
-            placeholder="conversation_key"
+            placeholder="Identificador da conversa"
           />
         </div>
 

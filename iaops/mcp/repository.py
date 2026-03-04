@@ -92,6 +92,17 @@ class MCPRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def update_tenant_identity(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        name: str,
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
     def list_tenant_users(self, tenant_id: int) -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -180,6 +191,27 @@ class MCPRepository(ABC):
         channel_type: str,
         external_user_key: str,
     ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_channel_user_bindings(self, client_id: int, *, channel_type: str | None = None) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_channel_user_binding(
+        self,
+        client_id: int,
+        *,
+        tenant_id: int,
+        user_id: int | None = None,
+        channel_type: str,
+        external_user_key: str,
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_channel_user_binding(self, client_id: int, *, binding_id: int) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -492,6 +524,7 @@ class InMemoryMCPRepository(MCPRepository):
             (10, "tenant.get_limits"): ToolPolicy("tenant.get_limits", "viewer", True, None, 120, True, None),
             (10, "tenant.create"): ToolPolicy("tenant.create", "owner", True, None, 60, True, None),
             (10, "tenant.update_status"): ToolPolicy("tenant.update_status", "owner", True, None, 120, True, None),
+            (10, "tenant.update_identity"): ToolPolicy("tenant.update_identity", "owner", True, None, 120, True, None),
             (10, "inventory.list_tables"): ToolPolicy("inventory.list_tables", "viewer", True, 1000, 120, True, None),
             (10, "inventory.list_columns"): ToolPolicy("inventory.list_columns", "viewer", True, 1000, 120, True, None),
             (10, "access.list_users"): ToolPolicy("access.list_users", "admin", True, 1000, 120, True, None),
@@ -513,6 +546,9 @@ class InMemoryMCPRepository(MCPRepository):
             (10, "channel.list_user_tenants"): ToolPolicy("channel.list_user_tenants", "viewer", True, 100, 120, True, None),
             (10, "channel.set_active_tenant"): ToolPolicy("channel.set_active_tenant", "viewer", True, None, 120, True, None),
             (10, "channel.get_active_tenant"): ToolPolicy("channel.get_active_tenant", "viewer", True, None, 120, True, None),
+            (10, "channel.binding.list"): ToolPolicy("channel.binding.list", "admin", True, 500, 120, True, None),
+            (10, "channel.binding.upsert"): ToolPolicy("channel.binding.upsert", "admin", True, None, 120, True, None),
+            (10, "channel.binding.delete"): ToolPolicy("channel.binding.delete", "admin", True, None, 120, True, None),
             (10, "inventory.list_tenant_tables"): ToolPolicy("inventory.list_tenant_tables", "viewer", True, 1000, 120, True, None),
             (10, "inventory.register_table"): ToolPolicy("inventory.register_table", "admin", True, None, 120, True, None),
             (10, "inventory.delete_table"): ToolPolicy("inventory.delete_table", "admin", True, None, 120, True, None),
@@ -708,10 +744,31 @@ class InMemoryMCPRepository(MCPRepository):
                 "secret_ref": "secret://tenant-10/llm/openai",
             }
         }
-        self._channel_bindings = {
-            ("telegram", "tg-owner-demo"): {"client_id": 1, "user_id": 100},
-            ("whatsapp", "wa-owner-demo"): {"client_id": 1, "user_id": 100},
-        }
+        self._channel_binding_seq = 3
+        self._channel_bindings: list[dict[str, Any]] = [
+            {
+                "id": 1,
+                "client_id": 1,
+                "tenant_id": 10,
+                "user_id": 100,
+                "channel_type": "telegram",
+                "external_user_key": "tg-owner-demo",
+                "is_active": True,
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            {
+                "id": 2,
+                "client_id": 1,
+                "tenant_id": 10,
+                "user_id": 100,
+                "channel_type": "whatsapp",
+                "external_user_key": "wa-owner-demo",
+                "is_active": True,
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        ]
         self._channel_context: dict[tuple[str, str], dict[str, Any]] = {}
 
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
@@ -792,7 +849,35 @@ class InMemoryMCPRepository(MCPRepository):
                     if not currently_active and not limits["can_create"]:
                         raise ValueError("limite de tenants ativos do plano foi atingido")
                 item["status"] = status
+                if status == "disabled":
+                    for source in self._tenant_data_sources.get(int(tenant_id), []):
+                        source["is_active"] = False
+                    for table in self._tables.get(int(tenant_id), []):
+                        table["is_active"] = False
                 self._tenant_state[(client_id, int(tenant_id))] = status == "active"
+                return item
+        raise ValueError("tenant nao encontrado")
+
+    def update_tenant_identity(
+        self,
+        client_id: int,
+        tenant_id: int,
+        *,
+        name: str,
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        rows = self._client_tenants.get(client_id, [])
+        normalized_name = str(name or "").strip()
+        normalized_slug = str(slug or "").strip().lower() or None
+        if not normalized_name:
+            raise ValueError("name obrigatorio")
+        if normalized_slug and any(int(item["id"]) != int(tenant_id) and item["slug"] == normalized_slug for item in rows):
+            raise ValueError("slug ja utilizado para este cliente")
+        for item in rows:
+            if int(item["id"]) == int(tenant_id):
+                item["name"] = normalized_name
+                if normalized_slug:
+                    item["slug"] = normalized_slug
                 return item
         raise ValueError("tenant nao encontrado")
 
@@ -1032,32 +1117,161 @@ class InMemoryMCPRepository(MCPRepository):
         channel_type: str,
         external_user_key: str,
     ) -> dict[str, Any]:
-        binding = self._channel_bindings.get((channel_type, external_user_key))
-        if not binding or int(binding["client_id"]) != int(client_id):
-            raise ValueError("identidade do canal nao vinculada a usuario")
-        user_id = int(binding["user_id"])
-        user = self._users.get(user_id)
-        if not user:
-            raise ValueError("usuario nao encontrado")
+        binding = next(
+            (
+                item
+                for item in self._channel_bindings
+                if str(item.get("channel_type")) == str(channel_type)
+                and str(item.get("external_user_key")) == str(external_user_key)
+                and bool(item.get("is_active"))
+            ),
+            None,
+        )
+        if not binding or int(binding.get("client_id", 0)) != int(client_id):
+            raise ValueError("identidade do canal nao vinculada a tenant")
+        tenant_id = int(binding.get("tenant_id") or 0)
+        user = self._users.get(int(binding.get("user_id") or 0)) if binding.get("user_id") else None
         tenants = []
-        for item in self._client_tenants.get(client_id, []):
-            role = self._roles.get((int(item["id"]), user_id))
-            if role:
-                tenants.append(
-                    {
-                        "tenant_id": item["id"],
-                        "name": item["name"],
-                        "slug": item["slug"],
-                        "status": item["status"],
-                        "role": role,
-                    }
-                )
+        all_tenants = self._client_tenants.get(client_id, [])
+        if tenant_id > 0:
+            selected_tenant = next((item for item in all_tenants if int(item["id"]) == tenant_id), None)
+            if not selected_tenant:
+                raise ValueError("tenant vinculado ao canal nao encontrado")
+            role = self._roles.get((tenant_id, int(user["id"]))) if user else "viewer"
+            tenants = [
+                {
+                    "tenant_id": selected_tenant["id"],
+                    "name": selected_tenant["name"],
+                    "slug": selected_tenant["slug"],
+                    "status": selected_tenant["status"],
+                    "role": role or "viewer",
+                }
+            ]
+        elif user:
+            for item in all_tenants:
+                role = self._roles.get((int(item["id"]), int(user["id"])))
+                if role:
+                    tenants.append(
+                        {
+                            "tenant_id": item["id"],
+                            "name": item["name"],
+                            "slug": item["slug"],
+                            "status": item["status"],
+                            "role": role,
+                        }
+                    )
         if not tenants:
-            raise ValueError("usuario sem tenants vinculados")
+            raise ValueError("canal sem tenant vinculado")
         return {
-            "user": {"user_id": user["id"], "email": user["email"], "full_name": user["full_name"]},
+            "user": {"user_id": user["id"], "email": user["email"], "full_name": user["full_name"]} if user else {},
             "tenants": tenants,
         }
+
+    def list_channel_user_bindings(self, client_id: int, *, channel_type: str | None = None) -> list[dict[str, Any]]:
+        rows = []
+        for item in self._channel_bindings:
+            if int(item.get("client_id", 0)) != int(client_id):
+                continue
+            if channel_type and str(item.get("channel_type")) != str(channel_type):
+                continue
+            user = self._users.get(int(item.get("user_id", 0))) or {}
+            rows.append(
+                {
+                    **item,
+                    "tenant_name": next(
+                        (
+                            ten["name"]
+                            for ten in self._client_tenants.get(client_id, [])
+                            if int(ten["id"]) == int(item.get("tenant_id") or 0)
+                        ),
+                        None,
+                    ),
+                    "user_email": user.get("email"),
+                    "user_full_name": user.get("full_name"),
+                }
+            )
+        return sorted(rows, key=lambda entry: (entry.get("channel_type") or "", entry.get("external_user_key") or ""))
+
+    def upsert_channel_user_binding(
+        self,
+        client_id: int,
+        *,
+        tenant_id: int,
+        user_id: int | None = None,
+        channel_type: str,
+        external_user_key: str,
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        normalized_channel = str(channel_type or "").strip().lower()
+        normalized_external = str(external_user_key or "").strip()
+        if normalized_channel not in {"telegram", "whatsapp"}:
+            raise ValueError("channel_type invalido")
+        if not normalized_external:
+            raise ValueError("external_user_key obrigatorio")
+        selected_tenant = next(
+            (
+                item
+                for item in self._client_tenants.get(client_id, [])
+                if int(item["id"]) == int(tenant_id)
+            ),
+            None,
+        )
+        if not selected_tenant:
+            raise ValueError("tenant_id invalido")
+        user = None
+        if user_id is not None:
+            user = self._users.get(int(user_id))
+            if not user:
+                raise ValueError("user_id invalido")
+            if int(user.get("client_id", 0)) != int(client_id):
+                raise ValueError("usuario nao pertence ao cliente")
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        existing = next(
+            (
+                item
+                for item in self._channel_bindings
+                if str(item.get("channel_type")) == normalized_channel
+                and str(item.get("external_user_key")) == normalized_external
+            ),
+            None,
+        )
+        if existing:
+            existing["client_id"] = int(client_id)
+            existing["tenant_id"] = int(tenant_id)
+            existing["user_id"] = int(user_id) if user_id is not None else None
+            existing["is_active"] = bool(is_active)
+            existing["updated_at"] = now_iso
+            row = existing
+        else:
+            row = {
+                "id": int(self._channel_binding_seq),
+                "client_id": int(client_id),
+                "tenant_id": int(tenant_id),
+                "user_id": int(user_id) if user_id is not None else None,
+                "channel_type": normalized_channel,
+                "external_user_key": normalized_external,
+                "is_active": bool(is_active),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+            self._channel_binding_seq += 1
+            self._channel_bindings.append(row)
+        return {
+            **row,
+            "tenant_name": selected_tenant.get("name"),
+            "user_email": user.get("email") if user else None,
+            "user_full_name": user.get("full_name") if user else None,
+        }
+
+    def delete_channel_user_binding(self, client_id: int, *, binding_id: int) -> dict[str, Any]:
+        for index, item in enumerate(self._channel_bindings):
+            if int(item.get("id", 0)) != int(binding_id):
+                continue
+            if int(item.get("client_id", 0)) != int(client_id):
+                raise ValueError("vinculo nao pertence ao cliente")
+            removed = self._channel_bindings.pop(index)
+            return {"binding_id": int(removed["id"]), "deleted": True}
+        raise ValueError("vinculo de canal nao encontrado")
 
     def set_channel_active_tenant(
         self,
@@ -1101,8 +1315,11 @@ class InMemoryMCPRepository(MCPRepository):
             external_user_key=external_user_key,
         )
         context = self._channel_context.get((channel_type, conversation_key))
+        active_tenant_id = context.get("active_tenant_id") if context else None
+        if active_tenant_id is None and len(resolved["tenants"]) == 1:
+            active_tenant_id = int(resolved["tenants"][0]["tenant_id"])
         return {
-            "active_tenant_id": context.get("active_tenant_id") if context else None,
+            "active_tenant_id": active_tenant_id,
             "conversation_key": conversation_key,
             "tenants": resolved["tenants"],
             "user": resolved["user"],

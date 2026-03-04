@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { UI_TEXT } from "./locales/translations";
+import { UI_TEXT } from "./translations";
 import SideMenu from "./components/SideMenu";
 import EntityFormModal from "./components/EntityFormModal";
 import SystemMessageModal from "./components/SystemMessageModal";
@@ -89,20 +89,22 @@ export default function App() {
   }, [uiLanguage]);
 
   const uiText = useMemo(() => UI_TEXT[languageBucket], [languageBucket]);
+  const isSuperadmin = useMemo(() => Boolean(authContext?.is_superadmin), [authContext?.is_superadmin]);
   const isGlobalSuperadmin = useMemo(
-    () => Boolean(authContext?.is_superadmin) && Number(authContext?.tenant_id || 0) <= 0,
+    () => isSuperadmin && Number(authContext?.tenant_id || 0) <= 0,
     [authContext?.is_superadmin, authContext?.tenant_id]
   );
   const localizedNavItems = useMemo(
     () =>
       NAV_ITEMS.filter((item) => {
+        if (item.key === "seguranca-sql" && !isSuperadmin) return false;
         if (!isGlobalSuperadmin) return true;
-        return ["configuracao", "faturamento", "parcelas"].includes(item.key);
+        return ["configuracao", "faturamento", "parcelas", "seguranca-sql"].includes(item.key);
       }).map((item) => ({
         ...item,
         label: uiText.nav[item.key] || item.label,
       })),
-    [isGlobalSuperadmin, uiText]
+    [isGlobalSuperadmin, isSuperadmin, uiText]
   );
   const localizedSubtitleByPage = useMemo(() => uiText.subtitles || {}, [uiText]);
 
@@ -619,6 +621,7 @@ export default function App() {
       configuracao: (
         <ConfiguracaoPanel
           onSystemMessage={openSystemMessage}
+          onNavigate={setActivePage}
           onPreferenceApplied={(preference) => {
             setUiLanguage(preference?.language_code || "pt-BR");
             setUserTheme(preference?.theme_code || "light");

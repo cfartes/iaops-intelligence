@@ -8,6 +8,7 @@ import {
   listAuthSessions,
   listClientTenants,
   revokeAuthSession,
+  updateTenantIdentity,
   updateTenantStatus,
 } from "../api/mcpApi";
 import ConfirmActionModal from "../components/ConfirmActionModal";
@@ -34,6 +35,8 @@ export default function AccessPanel({ onSystemMessage }) {
   const [limits, setLimits] = useState(null);
   const [pendingTenantAction, setPendingTenantAction] = useState(null);
   const [tenantModalOpen, setTenantModalOpen] = useState(false);
+  const [tenantEditModalOpen, setTenantEditModalOpen] = useState(false);
+  const [editingTenant, setEditingTenant] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [tenantSetupById, setTenantSetupById] = useState({});
   const [sessions, setSessions] = useState([]);
@@ -41,6 +44,7 @@ export default function AccessPanel({ onSystemMessage }) {
   const [sessionRole, setSessionRole] = useState("viewer");
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [pendingSessionRevoke, setPendingSessionRevoke] = useState(null);
+  const tenantCreateBlocked = limits ? Number(limits.active_tenants || 0) >= Number(limits.max_tenants || 0) : false;
 
   const loadUsers = async () => {
     setLoading(true);
@@ -147,6 +151,30 @@ export default function AccessPanel({ onSystemMessage }) {
       await loadTenants();
     } catch (error) {
       onSystemMessage("error", tUi("access.fail.createTenant", "Falha ao criar tenant"), translateLimitMessage(error.message));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitTenantEdit = async (payload) => {
+    if (!editingTenant) return;
+    setSubmitting(true);
+    try {
+      await updateTenantIdentity({
+        tenant_id: editingTenant.id,
+        name: payload.name,
+        slug: payload.slug,
+      });
+      setTenantEditModalOpen(false);
+      setEditingTenant(null);
+      onSystemMessage(
+        "success",
+        "Tenant atualizado",
+        `Tenant ${payload.name} atualizado com sucesso.`
+      );
+      await loadTenants();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao atualizar tenant", translateLimitMessage(error.message));
     } finally {
       setSubmitting(false);
     }
@@ -259,7 +287,20 @@ export default function AccessPanel({ onSystemMessage }) {
       <section className="catalog-block">
         <div className="section-header">
           <h3>{tUi("access.tenants.title", "Tenants do cliente")}</h3>
-          <button type="button" className="btn btn-primary btn-small" onClick={() => setTenantModalOpen(true)}>
+          <button
+            type="button"
+            className="btn btn-primary btn-small"
+            onClick={() => setTenantModalOpen(true)}
+            disabled={tenantCreateBlocked}
+            title={
+              tenantCreateBlocked
+                ? tUi(
+                    "access.limit.tenants",
+                    "Limite de tenants ativos atingido no plano atual."
+                  )
+                : ""
+            }
+          >
             {tUi("access.tenants.new", "Novo Tenant")}
           </button>
         </div>
@@ -269,6 +310,11 @@ export default function AccessPanel({ onSystemMessage }) {
             max: limits?.max_tenants ?? 0,
           })}
         </p>
+        {tenantCreateBlocked ? (
+          <p className="muted">
+            {`Limite atingido (${limits?.active_tenants ?? 0}/${limits?.max_tenants ?? 0}). Desabilite um tenant ativo ou altere o plano.`}
+          </p>
+        ) : null}
         <p className="muted">
           {`Fontes ativas: ${limits?.active_data_sources ?? 0}/${limits?.max_data_sources_per_client ?? 0} (cliente) | ${limits?.active_data_sources_tenant ?? 0}/${limits?.max_data_sources_per_tenant ?? 0} (tenant atual).`}
         </p>
@@ -298,6 +344,16 @@ export default function AccessPanel({ onSystemMessage }) {
                       <span className="chip">{setupStatus(item.id)}</span>
                     </td>
                     <td>
+                      <button
+                        type="button"
+                        className="btn btn-small btn-secondary"
+                        onClick={() => {
+                          setEditingTenant(item);
+                          setTenantEditModalOpen(true);
+                        }}
+                      >
+                        Renomear
+                      </button>
                       <button
                         type="button"
                         className="btn btn-small btn-secondary"
@@ -461,6 +517,24 @@ export default function AccessPanel({ onSystemMessage }) {
           if (!submitting) setTenantModalOpen(false);
         }}
         onSubmit={submitTenantCreate}
+      />
+
+      <TenantFormModal
+        open={tenantEditModalOpen}
+        loading={submitting}
+        title="Editar Tenant"
+        submitLabel="Salvar"
+        initialValues={{
+          name: editingTenant?.name || "",
+          slug: editingTenant?.slug || "",
+        }}
+        onClose={() => {
+          if (!submitting) {
+            setTenantEditModalOpen(false);
+            setEditingTenant(null);
+          }
+        }}
+        onSubmit={submitTenantEdit}
       />
     </section>
   );

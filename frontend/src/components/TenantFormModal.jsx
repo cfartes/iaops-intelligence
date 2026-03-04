@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import useModalBehavior from "./useModalBehavior";
 
 const INITIAL_FORM = {
@@ -6,10 +6,22 @@ const INITIAL_FORM = {
   slug: "",
 };
 
-export default function TenantFormModal({ open, onClose, onSubmit, loading }) {
+export default function TenantFormModal({
+  open,
+  onClose,
+  onSubmit,
+  loading,
+  title = "Novo Tenant",
+  submitLabel = "Cadastrar",
+  initialValues = INITIAL_FORM,
+}) {
   useModalBehavior({ open, onClose });
-  const [form, setForm] = useState(INITIAL_FORM);
+  const [form, setForm] = useState(initialValues || INITIAL_FORM);
   const canSubmit = useMemo(() => form.name.trim().length > 1 && form.slug.trim().length > 1, [form]);
+
+  useEffect(() => {
+    setForm(initialValues || INITIAL_FORM);
+  }, [initialValues, open]);
 
   if (!open) return null;
 
@@ -26,7 +38,7 @@ export default function TenantFormModal({ open, onClose, onSubmit, loading }) {
     <div className="modal-overlay" role="dialog" aria-modal="true">
       <div className="modal-card form-modal">
         <header className="modal-header">
-          <h3>Novo Tenant</h3>
+          <h3>{title}</h3>
         </header>
         <form className="modal-content form-grid" onSubmit={submit}>
           <label>
@@ -42,7 +54,7 @@ export default function TenantFormModal({ open, onClose, onSubmit, loading }) {
               Cancelar
             </button>
             <button type="submit" className="btn btn-primary" disabled={loading || !canSubmit}>
-              Cadastrar
+              {submitLabel}
             </button>
           </div>
         </form>
