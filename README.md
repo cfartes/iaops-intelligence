@@ -135,6 +135,15 @@ Para criptografia de segredos (incluindo MFA) em producao:
 $env:IAOPS_CRYPTO_KEY="<fernet_key_urlsafe_base64>"
 ```
 
+Integracao com HUB Faturamento (intake de clientes):
+```powershell
+$env:IAOPS_HUB_BASE_URL="http://hub.local"
+# opcional (sobrescreve URL calculada por IAOPS_HUB_BASE_URL):
+$env:IAOPS_HUB_INTAKE_URL="http://hub.local/api/hub/intake/client-upsert"
+# opcional via env (tambem pode ser salva em Configuracao > Superadmin):
+$env:IAOPS_HUB_INTAKE_API_KEY="<api_key_intake_do_app_no_hub>"
+```
+
 Preco por 1k token ao usar LLM padrao do app (fallback):
 ```powershell
 $env:IAOPS_APP_LLM_PRICE_PER_1K_CENTS="50"

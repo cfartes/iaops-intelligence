@@ -33,12 +33,20 @@ class MCPGateway:
         "llm_admin.list_models",
         "llm_admin.get_app_config",
         "llm_admin.update_app_config",
+        "security_sql.get_policy",
+        "security_sql.update_policy",
+        "security_mcp.list_policies",
+        "security_mcp.update_policy",
     }
     _SUPERADMIN_TOOLS = {
         "llm_admin.list_providers",
         "llm_admin.list_models",
         "llm_admin.get_app_config",
         "llm_admin.update_app_config",
+        "security_sql.get_policy",
+        "security_sql.update_policy",
+        "security_mcp.list_policies",
+        "security_mcp.update_policy",
     }
     _CHANNEL_TOOLS = {
         "channel.list_user_tenants",
@@ -493,8 +501,7 @@ class MCPGateway:
         max_rows: int | None,
     ) -> dict[str, Any]:
         _ = max_rows
-        if tool_input.get("tenant_id") is None:
-            raise ValueError("tenant_id obrigatorio")
+        tenant_id = int(tool_input["tenant_id"]) if tool_input.get("tenant_id") not in (None, "") else None
         channel_type = str(tool_input.get("channel_type", "")).strip().lower()
         external_user_key = str(tool_input.get("external_user_key", "")).strip()
         is_active = bool(tool_input.get("is_active", True))
@@ -505,7 +512,7 @@ class MCPGateway:
             raise ValueError("external_user_key obrigatorio")
         row = self.repository.upsert_channel_user_binding(
             context.client_id,
-            tenant_id=int(tool_input["tenant_id"]),
+            tenant_id=tenant_id,
             user_id=user_id,
             channel_type=channel_type,
             external_user_key=external_user_key,

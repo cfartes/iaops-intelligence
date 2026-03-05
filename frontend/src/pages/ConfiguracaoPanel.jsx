@@ -13,7 +13,13 @@ import {
   deleteChannelBinding,
   enableMfa,
   getAdminLlmConfig,
+  getAdminHubConfig,
+  getClientBillingInfo,
   getAdminSmtpConfig,
+  listAdminClients,
+  updateAdminClient,
+  deleteAdminClient,
+  listBillingPlans,
   getMfaStatus,
   getUserTenantPreference,
   getTenantLlmConfig,
@@ -28,12 +34,16 @@ import {
   updateUserTenantPreference,
   updateTenantLlmConfig,
   updateAdminLlmConfig,
+  updateAdminHubConfig,
+  testAdminHubIntake,
   updateAdminSmtpConfig,
+  listAdminHubBillingClients,
   sendAdminSmtpTestEmail,
   testAdminSmtpConfig,
 } from "../api/mcpApi";
 import AppLlmConfigModal from "../components/AppLlmConfigModal";
 import ConfirmActionModal from "../components/ConfirmActionModal";
+import ClientAdminModal from "../components/ClientAdminModal";
 import MfaCodeModal from "../components/MfaCodeModal";
 import SmtpConfigModal from "../components/SmtpConfigModal";
 import TenantLlmConfigModal from "../components/TenantLlmConfigModal";
@@ -47,6 +57,18 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   const [setupInfo, setSetupInfo] = useState(null);
   const [modalMode, setModalMode] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [clientBillingInfo, setClientBillingInfo] = useState(null);
+  const [hubConfig, setHubConfig] = useState(null);
+  const [hubApiKeyDraft, setHubApiKeyDraft] = useState("");
+  const [hubIntakeApiKeyDraft, setHubIntakeApiKeyDraft] = useState("");
+  const [hubIntakeEndpointDraft, setHubIntakeEndpointDraft] = useState("");
+  const [hubIntakeTestClientId, setHubIntakeTestClientId] = useState("");
+  const [hubBillingRows, setHubBillingRows] = useState([]);
+  const [adminClients, setAdminClients] = useState([]);
+  const [adminPlans, setAdminPlans] = useState([]);
+  const [clientModalOpen, setClientModalOpen] = useState(false);
+  const [clientDraft, setClientDraft] = useState(null);
+  const [pendingDeleteClient, setPendingDeleteClient] = useState(null);
   const [llmProviders, setLlmProviders] = useState([]);
   const [llmModelsByProvider, setLlmModelsByProvider] = useState({});
   const [llmConfig, setLlmConfig] = useState(null);
@@ -68,7 +90,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   const [channelType, setChannelType] = useState("telegram");
   const [externalUserKey, setExternalUserKey] = useState("");
   const [conversationKey, setConversationKey] = useState("");
-  const [messageText, setMessageText] = useState("tenant list");
+  const [messageText, setMessageText] = useState("ajuda");
   const [webhookResponse, setWebhookResponse] = useState(null);
   const [tenantOptions, setTenantOptions] = useState([]);
   const [selectedTenantId, setSelectedTenantId] = useState("");
@@ -80,8 +102,13 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   const [channelBindings, setChannelBindings] = useState([]);
   const [tenantItems, setTenantItems] = useState([]);
   const [channelUsers, setChannelUsers] = useState([]);
+  const [channelClientId, setChannelClientId] = useState("");
   const [isLoadingChannelBindings, setIsLoadingChannelBindings] = useState(false);
   const [selectedBindingId, setSelectedBindingId] = useState("");
+  const [bindingClientFilter, setBindingClientFilter] = useState("all");
+  const [bindingChannelFilter, setBindingChannelFilter] = useState("all");
+  const [bindingStatusFilter, setBindingStatusFilter] = useState("all");
+  const [bindingCoverageFilter, setBindingCoverageFilter] = useState("all");
   const [channelBindingDraft, setChannelBindingDraft] = useState({
     tenant_id: String(auth?.tenant_id || ""),
     user_id: "",
@@ -105,17 +132,249 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   useEffect(() => {
     loadStatus();
     loadLlmAdmin();
+    loadClientBillingInfo();
     if (isGlobalSuperadmin) {
       loadSmtpConfig();
+      loadHubConfig();
+      loadHubBillingRows();
+      loadAdminClients();
+      loadAdminPlans();
+      loadChannelTenantsCatalog();
+      loadChannelBindings();
+      setChannelUsers([]);
     } else {
       loadTenantLlmConfig();
       loadUserPreference();
       loadSessions();
-      loadChannelTenantsCatalog();
-      loadChannelBindings();
-      loadChannelUsers();
     }
   }, [isGlobalSuperadmin]);
+
+  const loadClientBillingInfo = async () => {
+    try {
+      const data = await getClientBillingInfo();
+      setClientBillingInfo(data?.billing_info || null);
+    } catch (_) {
+      setClientBillingInfo(null);
+    }
+  };
+
+  const loadHubConfig = async () => {
+    try {
+      const data = await getAdminHubConfig();
+      const cfg = data?.config || null;
+      setHubConfig(cfg);
+      setHubApiKeyDraft(cfg?.hub_api_key || "");
+      setHubIntakeApiKeyDraft(cfg?.intake_api_key || "");
+      setHubIntakeEndpointDraft(cfg?.intake_endpoint_url || "");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar configuracao HUB", error.message);
+    }
+  };
+
+  const loadHubBillingRows = async () => {
+    try {
+      const data = await listAdminHubBillingClients();
+      const rows = Array.isArray(data?.clients) ? data.clients : [];
+      setHubBillingRows(rows);
+      setHubIntakeTestClientId((prev) => {
+        if (prev && rows.some((item) => String(item.client_id) === String(prev))) return prev;
+        return rows[0] ? String(rows[0].client_id) : "";
+      });
+      setChannelClientId((prev) => {
+        if (prev && rows.some((item) => String(item.client_id) === String(prev))) return prev;
+        return rows[0] ? String(rows[0].client_id) : "";
+      });
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar clientes de faturamento", error.message);
+    }
+  };
+
+  const loadAdminClients = async () => {
+    try {
+      const data = await listAdminClients();
+      setAdminClients(Array.isArray(data?.clients) ? data.clients : []);
+    } catch (error) {
+      onSystemMessage("error", "Falha ao carregar clientes", error.message);
+    }
+  };
+
+  const loadAdminPlans = async () => {
+    try {
+      const data = await listBillingPlans();
+      setAdminPlans(Array.isArray(data?.plans) ? data.plans : []);
+    } catch (_) {
+      setAdminPlans([]);
+    }
+  };
+
+  const openEditClientModal = (item) => {
+    setClientDraft({
+      client_id: item?.client_id || "",
+      trade_name: item?.trade_name || "",
+      legal_name: item?.legal_name || "",
+      cnpj: item?.cnpj || "",
+      address_text: item?.address_text || "",
+      bairro: item?.bairro || "",
+      cidade: item?.cidade || "",
+      uf: item?.uf || "",
+      cep: item?.cep || "",
+      phone_contact: item?.phone_contact || "",
+      email_access: item?.email_access || "",
+      email_financial: item?.email_financial || "",
+      email_nf: item?.email_nf || "",
+      status: item?.status || "active",
+      plan_code: item?.plan_code || "",
+    });
+    setClientModalOpen(true);
+  };
+
+  const updateClientDraftField = (field, value) => {
+    setClientDraft((prev) => ({ ...(prev || {}), [field]: value }));
+  };
+
+  const saveAdminClient = async () => {
+    if (!clientDraft?.client_id) return;
+    setSubmitting(true);
+    try {
+      await updateAdminClient(clientDraft);
+      onSystemMessage("success", "Cliente atualizado", "Cadastro do cliente atualizado com sucesso.");
+      setClientModalOpen(false);
+      setClientDraft(null);
+      await loadAdminClients();
+      await loadHubBillingRows();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao atualizar cliente", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const confirmDeleteAdminClient = async () => {
+    if (!pendingDeleteClient?.client_id) return;
+    setSubmitting(true);
+    try {
+      await deleteAdminClient({ client_id: pendingDeleteClient.client_id });
+      onSystemMessage("success", "Cliente inativado", "Cliente inativado e fontes/tenants desativados.");
+      setPendingDeleteClient(null);
+      await loadAdminClients();
+      await loadHubBillingRows();
+    } catch (error) {
+      onSystemMessage("error", "Falha ao excluir cliente", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const formatDate = (value) => {
+    if (!value) return "-";
+    const parsed = new Date(`${value}T00:00:00`);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleDateString("pt-BR");
+  };
+
+  const formatCurrency = (cents) => {
+    const value = Number(cents || 0) / 100;
+    return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  };
+
+  const saveHubApiKey = async () => {
+    if (!hubApiKeyDraft.trim()) {
+      onSystemMessage("warning", "HUB API Key", "Informe uma chave antes de salvar.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const data = await updateAdminHubConfig({ hub_api_key: hubApiKeyDraft.trim() });
+      const cfg = data?.config || null;
+      setHubConfig(cfg);
+      setHubApiKeyDraft(cfg?.hub_api_key || "");
+      onSystemMessage("success", "HUB API Key atualizada", "Chave de integracao salva com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar HUB API Key", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const regenerateHubApiKey = async () => {
+    setSubmitting(true);
+    try {
+      const data = await updateAdminHubConfig({ regenerate: true });
+      const cfg = data?.config || null;
+      setHubConfig(cfg);
+      setHubApiKeyDraft(cfg?.hub_api_key || "");
+      onSystemMessage("success", "HUB API Key gerada", "Nova chave gerada e salva no banco.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao gerar HUB API Key", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const saveHubIntakeApiKey = async () => {
+    if (!hubIntakeApiKeyDraft.trim()) {
+      onSystemMessage("warning", "API KEY Intake", "Informe a chave Intake antes de salvar.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const data = await updateAdminHubConfig({ intake_api_key: hubIntakeApiKeyDraft.trim() });
+      const cfg = data?.config || null;
+      setHubConfig(cfg);
+      setHubIntakeApiKeyDraft(cfg?.intake_api_key || "");
+      onSystemMessage("success", "API KEY Intake atualizada", "Chave Intake salva com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar API KEY Intake", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const saveHubIntakeEndpoint = async () => {
+    if (!hubIntakeEndpointDraft.trim()) {
+      onSystemMessage("warning", "Endpoint Intake", "Informe o endpoint Intake antes de salvar.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const data = await updateAdminHubConfig({ intake_endpoint_url: hubIntakeEndpointDraft.trim() });
+      const cfg = data?.config || null;
+      setHubConfig(cfg);
+      setHubIntakeEndpointDraft(cfg?.intake_endpoint_url || "");
+      onSystemMessage("success", "Endpoint Intake atualizado", "Endpoint Intake salvo com sucesso.");
+    } catch (error) {
+      onSystemMessage("error", "Falha ao salvar Endpoint Intake", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const testHubIntakeSend = async () => {
+    setSubmitting(true);
+    try {
+      const payload = hubIntakeTestClientId ? { client_id: Number(hubIntakeTestClientId) } : {};
+      const data = await testAdminHubIntake(payload);
+      const result = data?.result || {};
+      const client = data?.client || {};
+      if (result?.sent) {
+        onSystemMessage(
+          "success",
+          "Teste Intake enviado",
+          `Cliente: ${client?.cliente || client?.fantasy_name || data?.client_id}. HTTP ${result?.status_code || 200}.`
+        );
+      } else {
+        onSystemMessage(
+          "warning",
+          "Teste Intake sem envio",
+          `Cliente: ${client?.cliente || client?.fantasy_name || data?.client_id}. Motivo: ${result?.reason || "nao informado"}.`
+        );
+      }
+    } catch (error) {
+      onSystemMessage("error", "Falha no teste Intake", error.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const loadLlmAdmin = async () => {
     try {
@@ -367,6 +626,11 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   };
 
   const loadChannelTenantsCatalog = async () => {
+    if (isGlobalSuperadmin) {
+      setTenantItems([]);
+      setChannelBindingDraft((prev) => ({ ...prev, tenant_id: "" }));
+      return;
+    }
     try {
       const data = await listClientTenants();
       const rows = data.tenants || [];
@@ -383,8 +647,22 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   const loadChannelBindings = async () => {
     setIsLoadingChannelBindings(true);
     try {
-      const data = await listChannelBindings();
-      const bindings = data.bindings || [];
+      let bindings = [];
+      if (isGlobalSuperadmin) {
+        const clientIds = (hubBillingRows || [])
+          .map((item) => Number(item.client_id))
+          .filter((value) => Number.isFinite(value) && value > 0);
+        if (clientIds.length > 0) {
+          const responses = await Promise.all(clientIds.map((clientId) => listChannelBindings(null, clientId)));
+          bindings = responses.flatMap((item) => item.bindings || []);
+        } else if (channelClientId) {
+          const data = await listChannelBindings(null, channelClientId);
+          bindings = data.bindings || [];
+        }
+      } else {
+        const data = await listChannelBindings(null, null);
+        bindings = data.bindings || [];
+      }
       setChannelBindings(bindings);
       const selected = selectedBindingId
         ? bindings.find((item) => String(item.id) === String(selectedBindingId))
@@ -410,8 +688,12 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     const userId = Number(channelBindingDraft.user_id || 0);
     const externalUserKey = String(channelBindingDraft.external_user_key || "").trim();
     const channelTypeDraft = String(channelBindingDraft.channel_type || "").trim().toLowerCase();
-    if (!Number.isFinite(tenantId) || tenantId <= 0) {
+    if (!isGlobalSuperadmin && (!Number.isFinite(tenantId) || tenantId <= 0)) {
       onSystemMessage("warning", "Campos obrigatorios", "Selecione o tenant.");
+      return;
+    }
+    if (isGlobalSuperadmin && (!channelClientId || Number(channelClientId) <= 0)) {
+      onSystemMessage("warning", "Campos obrigatorios", "Selecione o cliente.");
       return;
     }
     if (!externalUserKey) {
@@ -421,17 +703,24 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     setSubmitting(true);
     try {
       await upsertChannelBinding({
-        tenant_id: tenantId,
-        user_id: Number.isFinite(userId) && userId > 0 ? userId : null,
+        client_id: isGlobalSuperadmin ? Number(channelClientId) : undefined,
+        tenant_id: isGlobalSuperadmin ? null : tenantId,
+        user_id: isGlobalSuperadmin ? null : (Number.isFinite(userId) && userId > 0 ? userId : null),
         channel_type: channelTypeDraft,
         external_user_key: externalUserKey,
         is_active: Boolean(channelBindingDraft.is_active),
       });
-      onSystemMessage("success", "Vinculo salvo", "Identidade do canal vinculada ao tenant com sucesso.");
+      onSystemMessage(
+        "success",
+        "Vinculo salvo",
+        isGlobalSuperadmin
+          ? "Identidade do canal vinculada ao cliente em modo automatico de tenant."
+          : "Identidade do canal vinculada ao tenant com sucesso."
+      );
       setChannelBindingDraft((prev) => ({ ...prev, external_user_key: "" }));
       await loadChannelBindings();
       if (String(channelTypeDraft) === String(channelType)) {
-        const updated = await listChannelBindings();
+        const updated = await listChannelBindings(null, isGlobalSuperadmin ? channelClientId : null);
         const rows = updated.bindings || [];
         const matched = rows.find(
           (item) =>
@@ -448,11 +737,15 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     }
   };
 
-  const removeChannelBinding = async (bindingId) => {
+  const removeChannelBinding = async (bindingItem) => {
+    const bindingId = Number(bindingItem?.id || 0);
     if (!bindingId) return;
     setSubmitting(true);
     try {
-      await deleteChannelBinding({ binding_id: Number(bindingId) });
+      await deleteChannelBinding({
+        binding_id: bindingId,
+        client_id: isGlobalSuperadmin ? Number(bindingItem?.client_id || channelClientId || 0) : undefined,
+      });
       onSystemMessage("success", "Vinculo removido", "Vinculo de canal removido.");
       await loadChannelBindings();
     } catch (error) {
@@ -467,13 +760,15 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     setSubmitting(true);
     try {
       await upsertChannelBinding({
-        tenant_id: Number(item.tenant_id),
+        client_id: isGlobalSuperadmin ? Number(channelClientId || item.client_id || 0) : undefined,
+        tenant_id: item.tenant_id != null ? Number(item.tenant_id) : null,
         user_id: item.user_id != null ? Number(item.user_id) : null,
         channel_type: String(item.channel_type || "").toLowerCase(),
         external_user_key: String(item.external_user_key || ""),
         is_active: !Boolean(item.is_active),
       });
       onSystemMessage("success", "Vinculo atualizado", "Status do vinculo atualizado com sucesso.");
+      if (isGlobalSuperadmin && item?.client_id) setChannelClientId(String(item.client_id));
       await loadChannelBindings();
     } catch (error) {
       onSystemMessage("error", "Falha ao atualizar vinculo", error.message);
@@ -541,6 +836,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
   };
 
   const baseChannelPayload = () => ({
+    client_id: isGlobalSuperadmin ? Number(channelClientId || 0) : undefined,
     channel_type: channelType,
     external_user_key: externalUserKey.trim(),
     conversation_key: conversationKey.trim(),
@@ -680,6 +976,34 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     setWebhookResponse(null);
   }, [channelType, channelBindings, selectedBindingId]);
 
+  useEffect(() => {
+    if (!isGlobalSuperadmin) return;
+    loadChannelBindings();
+  }, [isGlobalSuperadmin, channelClientId, hubBillingRows.length]);
+
+  const activeClientIds = new Set(
+    (channelBindings || [])
+      .filter((item) => Boolean(item?.is_active))
+      .map((item) => Number(item?.client_id || 0))
+      .filter((value) => Number.isFinite(value) && value > 0)
+  );
+
+  const clientsWithoutActiveBinding = (hubBillingRows || []).filter(
+    (row) => !activeClientIds.has(Number(row?.client_id || 0))
+  );
+
+  const filteredChannelBindings = (channelBindings || []).filter((item) => {
+    const itemClientId = Number(item?.client_id || 0);
+    const isClientWithActive = activeClientIds.has(itemClientId);
+    if (bindingClientFilter !== "all" && String(itemClientId) !== String(bindingClientFilter)) return false;
+    if (bindingChannelFilter !== "all" && String(item?.channel_type || "").toLowerCase() !== String(bindingChannelFilter)) return false;
+    if (bindingStatusFilter === "active" && !Boolean(item?.is_active)) return false;
+    if (bindingStatusFilter === "inactive" && Boolean(item?.is_active)) return false;
+    if (bindingCoverageFilter === "with_active" && !isClientWithActive) return false;
+    if (bindingCoverageFilter === "without_active" && isClientWithActive) return false;
+    return true;
+  });
+
   return (
     <section className="page-panel">
       <header>
@@ -716,9 +1040,36 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
             <button type="button" className="btn btn-secondary" onClick={loadStatus}>
               {tUi("config.refresh.status", "Atualizar Status")}
             </button>
+            <button type="button" className="btn btn-secondary" onClick={loadClientBillingInfo}>
+              Atualizar Pagamento
+            </button>
           </div>
         </>
       )}
+
+      <section className="catalog-block">
+        <header>
+          <h3>Informacoes de Pagamento (somente leitura)</h3>
+        </header>
+        <div className="table-wrap">
+          <table className="data-table">
+            <tbody>
+              <tr>
+                <th>Data liberado</th>
+                <td>{formatDate(clientBillingInfo?.data_liberado)}</td>
+              </tr>
+              <tr>
+                <th>Data ultimo pagamento</th>
+                <td>{formatDate(clientBillingInfo?.data_ultimo_pagamento)}</td>
+              </tr>
+              <tr>
+                <th>Data proximo vencimento</th>
+                <td>{formatDate(clientBillingInfo?.data_proximo_vencimento)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       {!isGlobalSuperadmin && (
       <section className="catalog-block">
@@ -767,23 +1118,31 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {!isGlobalSuperadmin && (
+      {isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
-          <h3>Vinculo Canal x Tenant</h3>
+          <h3>Vinculo Canal x Cliente</h3>
         </header>
         <p className="muted">
-          Defina para qual tenant cada identidade de canal (Telegram/WhatsApp) deve apontar.
+          Vincule a identidade do canal ao cliente. O tenant pode ser automatico (todos ativos) ou definido manualmente.
         </p>
-        <p className="muted">Identificador do usuario no canal: Telegram (`from.id`/`chat_id`) ou WhatsApp (`from`). Usuario e opcional (auditoria).</p>
+        <p className="muted">Identificador no canal: Telegram (`from.id`/`chat_id`) ou WhatsApp (`from`).</p>
         <div className="inline-form">
+          <select value={channelClientId} onChange={(event) => setChannelClientId(event.target.value)}>
+            <option value="">Selecione um cliente</option>
+            {(hubBillingRows || []).map((item) => (
+              <option key={String(item.client_id)} value={String(item.client_id)}>
+                {`${item.cliente || item.client_name || `Cliente ${item.client_id}`} (#${item.client_id})`}
+              </option>
+            ))}
+          </select>
           <select
             value={channelBindingDraft.tenant_id}
             onChange={(event) =>
               setChannelBindingDraft((prev) => ({ ...prev, tenant_id: event.target.value }))
             }
           >
-            <option value="">Selecione um tenant</option>
+            <option value="">Tenant automatico (todos ativos do cliente)</option>
             {tenantItems.map((item) => (
               <option key={item.id} value={String(item.id)}>
                 {`${item.name} (#${item.id})`}
@@ -799,25 +1158,12 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
             <option value="telegram">Telegram</option>
             <option value="whatsapp">WhatsApp</option>
           </select>
-          <select
-            value={channelBindingDraft.user_id}
-            onChange={(event) =>
-              setChannelBindingDraft((prev) => ({ ...prev, user_id: event.target.value }))
-            }
-          >
-            <option value="">Usuario (opcional)</option>
-            {channelUsers.map((item) => (
-              <option key={item.user_id} value={String(item.user_id)}>
-                {`${item.full_name || item.email} (#${item.user_id})`}
-              </option>
-            ))}
-          </select>
           <input
             value={channelBindingDraft.external_user_key}
             onChange={(event) =>
               setChannelBindingDraft((prev) => ({ ...prev, external_user_key: event.target.value }))
             }
-            placeholder="Identificador do usuario no canal"
+            placeholder="Identificador no canal (WhatsApp: from | Telegram: from.id/chat_id)"
           />
           <label className="checkbox-inline">
             <input
@@ -835,7 +1181,64 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
           <button type="button" className="btn btn-secondary" onClick={loadChannelBindings} disabled={isLoadingChannelBindings}>
             {isLoadingChannelBindings ? "Atualizando..." : "Atualizar lista"}
           </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => {
+              setBindingCoverageFilter("without_active");
+              setBindingStatusFilter("all");
+              setBindingChannelFilter("all");
+            }}
+          >
+            Mostrar somente pendentes
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => {
+              setBindingClientFilter("all");
+              setBindingChannelFilter("all");
+              setBindingStatusFilter("all");
+              setBindingCoverageFilter("all");
+            }}
+          >
+            Limpar filtros
+          </button>
         </div>
+        <div className="inline-form">
+          <select value={bindingClientFilter} onChange={(event) => setBindingClientFilter(event.target.value)}>
+            <option value="all">Todos os clientes</option>
+            {(hubBillingRows || []).map((item) => (
+              <option key={`flt-${item.client_id}`} value={String(item.client_id)}>
+                {`${item.cliente || item.client_name || `Cliente ${item.client_id}`} (#${item.client_id})`}
+              </option>
+            ))}
+          </select>
+          <select value={bindingChannelFilter} onChange={(event) => setBindingChannelFilter(event.target.value)}>
+            <option value="all">Todos os canais</option>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="telegram">Telegram</option>
+          </select>
+          <select value={bindingStatusFilter} onChange={(event) => setBindingStatusFilter(event.target.value)}>
+            <option value="all">Ativo e inativo</option>
+            <option value="active">Somente ativos</option>
+            <option value="inactive">Somente inativos</option>
+          </select>
+          <select value={bindingCoverageFilter} onChange={(event) => setBindingCoverageFilter(event.target.value)}>
+            <option value="all">Todos os clientes</option>
+            <option value="with_active">Clientes com vínculo ativo</option>
+            <option value="without_active">Clientes sem vínculo ativo</option>
+          </select>
+        </div>
+        <p className="muted" style={{ marginTop: "0.35rem" }}>
+          Clientes sem vínculo ativo: {clientsWithoutActiveBinding.length}
+          {clientsWithoutActiveBinding.length > 0
+            ? ` (${clientsWithoutActiveBinding
+                .slice(0, 6)
+                .map((item) => item.cliente || item.client_name || `#${item.client_id}`)
+                .join(", ")}${clientsWithoutActiveBinding.length > 6 ? ", ..." : ""})`
+            : ""}
+        </p>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -843,6 +1246,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
                 <th>ID</th>
                 <th>Canal</th>
                 <th>Identificador no canal</th>
+                <th>Cliente</th>
                 <th>Tenant</th>
                 <th>Usuario (opcional)</th>
                 <th>Status</th>
@@ -850,16 +1254,25 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
               </tr>
             </thead>
             <tbody>
-              {channelBindings.length === 0 ? (
+              {filteredChannelBindings.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="empty-state">Nenhum vinculo cadastrado.</td>
+                  <td colSpan={8} className="empty-state">Nenhum vinculo encontrado com os filtros atuais.</td>
                 </tr>
               ) : (
-                channelBindings.map((item) => (
+                filteredChannelBindings.map((item) => (
                   <tr key={item.id}>
                     <td>{item.id}</td>
                     <td>{item.channel_type}</td>
                     <td>{item.external_user_key}</td>
+                    <td>
+                      {(() => {
+                        const client = (hubBillingRows || []).find(
+                          (entry) => String(entry.client_id) === String(item.client_id)
+                        );
+                        const name = client?.cliente || client?.client_name || null;
+                        return name ? `${name} (#${item.client_id})` : (item.client_id || "-");
+                      })()}
+                    </td>
                     <td>{item.tenant_name || (item.tenant_id ? `#${item.tenant_id}` : "-")}</td>
                     <td>{item.user_full_name || item.user_email || (item.user_id ? `#${item.user_id}` : "-")}</td>
                     <td>{item.is_active ? "Ativo" : "Inativo"}</td>
@@ -876,7 +1289,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
                         <button
                           type="button"
                           className="btn btn-small btn-secondary"
-                          onClick={() => removeChannelBinding(item.id)}
+                          onClick={() => removeChannelBinding(item)}
                           disabled={submitting}
                         >
                           Remover
@@ -892,15 +1305,15 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {!isGlobalSuperadmin && (
+      {isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
-          <h3>Canais do Tenant (Telegram/WhatsApp)</h3>
+          <h3>Canais do Cliente (Telegram/WhatsApp)</h3>
         </header>
         <p className="muted">
-          Configure aqui o contexto do canal para este tenant e valide o fluxo de mensagens.
+          Configure o contexto por cliente e valide o fluxo de mensagens.
         </p>
-        <p className="muted">Dica: selecione uma identidade de canal ja vinculada ao tenant.</p>
+        <p className="muted">Dica: selecione uma identidade de canal vinculada ao cliente.</p>
         <div className="inline-form">
           <select value={channelType} onChange={(event) => setChannelType(event.target.value)}>
             <option value="telegram">Telegram</option>
@@ -915,6 +1328,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
               if (!selected) return;
               const selectedChannel = String(selected.channel_type || "telegram");
               const key = String(selected.external_user_key || "");
+              if (selected.client_id != null) setChannelClientId(String(selected.client_id));
               setChannelType(selectedChannel);
               setExternalUserKey(key);
               setConversationKey((prev) => (prev.trim() ? prev : key));
@@ -925,7 +1339,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
               .filter((item) => Boolean(item.is_active))
               .map((item) => (
                 <option key={`${item.id}-${item.external_user_key}`} value={String(item.id)}>
-                  {`${item.channel_type} | ${item.external_user_key} -> ${item.tenant_name || `#${item.tenant_id}`}`}
+                  {`${item.channel_type} | ${item.external_user_key} -> cliente #${item.client_id}`}
                 </option>
               ))}
           </select>
@@ -948,7 +1362,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
             {isLoadingChannelActiveTenant ? tUi("op.tenant.loading", "Carregando...") : tUi("op.tenant.active.get", "Ver Tenant Ativo")}
           </button>
           <select value={selectedTenantId} onChange={(event) => setSelectedTenantId(event.target.value)}>
-            <option value="">{tUi("op.tenant.select.placeholder", "Selecione um tenant")}</option>
+            <option value="">Selecionar tenant ativo (opcional)</option>
             {tenantOptions.map((item) => (
               <option key={item.tenant_id} value={String(item.tenant_id)}>
                 {`${item.tenant_id} - ${item.name} (${item.status}, ${item.role})`}
@@ -1148,6 +1562,166 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       {isGlobalSuperadmin && (
       <section className="catalog-block">
         <header>
+          <h3>Integracao HUB de Faturamento (Superadmin)</h3>
+        </header>
+        <div className="table-wrap">
+          <table className="data-table">
+            <tbody>
+              <tr>
+                <th>App</th>
+                <td>{hubConfig?.app_name || "IAOps Governance"}</td>
+              </tr>
+              <tr>
+                <th>Origem da chave</th>
+                <td>{hubConfig?.source || "-"}</td>
+              </tr>
+              <tr>
+                <th>Chave configurada</th>
+                <td>{hubConfig?.has_hub_api_key ? "Sim" : "Nao"}</td>
+              </tr>
+              <tr>
+                <th>Chave (mascarada)</th>
+                <td>{hubConfig?.hub_api_key_masked || "-"}</td>
+              </tr>
+              <tr>
+                <th>API KEY Intake configurada</th>
+                <td>{hubConfig?.has_intake_api_key ? "Sim" : "Nao"}</td>
+              </tr>
+              <tr>
+                <th>API KEY Intake (mascarada)</th>
+                <td>{hubConfig?.intake_api_key_masked || "-"}</td>
+              </tr>
+              <tr>
+                <th>Endpoint Intake</th>
+                <td>{hubConfig?.intake_endpoint_url || "-"}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div className="inline-form">
+          <input
+            type="text"
+            value={hubApiKeyDraft}
+            onChange={(event) => setHubApiKeyDraft(event.target.value)}
+            placeholder="Cole a HUB API Key ou gere automaticamente"
+          />
+          <button type="button" className="btn btn-primary" onClick={saveHubApiKey} disabled={submitting}>
+            Salvar HUB API Key
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={regenerateHubApiKey} disabled={submitting}>
+            Gerar nova chave
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadHubConfig} disabled={submitting}>
+            Atualizar chave
+          </button>
+        </div>
+        <div className="inline-form">
+          <input
+            type="text"
+            value={hubIntakeApiKeyDraft}
+            onChange={(event) => setHubIntakeApiKeyDraft(event.target.value)}
+            placeholder="Cole a API KEY Intake do HUB"
+          />
+          <button type="button" className="btn btn-primary" onClick={saveHubIntakeApiKey} disabled={submitting}>
+            Salvar API KEY Intake
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadHubConfig} disabled={submitting}>
+            Atualizar Intake
+          </button>
+        </div>
+        <div className="inline-form">
+          <input
+            type="text"
+            value={hubIntakeEndpointDraft}
+            onChange={(event) => setHubIntakeEndpointDraft(event.target.value)}
+            placeholder="https://hub.exemplo.com/api/hub/intake/client-upsert"
+          />
+          <button type="button" className="btn btn-primary" onClick={saveHubIntakeEndpoint} disabled={submitting}>
+            Salvar Endpoint Intake
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={loadHubConfig} disabled={submitting}>
+            Atualizar Endpoint
+          </button>
+        </div>
+        <div className="inline-form">
+          <select value={hubIntakeTestClientId} onChange={(event) => setHubIntakeTestClientId(event.target.value)}>
+            <option value="">Cliente automatico (primeiro ativo)</option>
+            {(hubBillingRows || []).map((row) => (
+              <option key={String(row.client_id)} value={String(row.client_id)}>
+                {row.cliente || row.client_name || `Cliente ${row.client_id}`} (#{row.client_id})
+              </option>
+            ))}
+          </select>
+          <button type="button" className="btn btn-primary" onClick={testHubIntakeSend} disabled={submitting}>
+            Testar envio Intake
+          </button>
+        </div>
+      </section>
+      )}
+
+      {isGlobalSuperadmin && (
+      <section className="catalog-block">
+        <header>
+          <h3>Clientes Cadastrados (Superadmin)</h3>
+        </header>
+        <div className="page-actions">
+          <button type="button" className="btn btn-secondary" onClick={loadAdminClients} disabled={submitting}>
+            Atualizar lista
+          </button>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Cliente</th>
+                <th>CNPJ</th>
+                <th>E-mail login</th>
+                <th>Plano</th>
+                <th>Valor (R$)</th>
+                <th>Ultimo pagamento</th>
+                <th>Proximo pagamento</th>
+                <th>Status</th>
+                <th>Acoes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(adminClients || []).length === 0 ? (
+                <tr>
+                  <td colSpan={9}>Nenhum cliente encontrado.</td>
+                </tr>
+              ) : (
+                (adminClients || []).map((row) => (
+                  <tr key={String(row.client_id)}>
+                    <td>{row.trade_name || "-"}</td>
+                    <td>{row.cnpj || "-"}</td>
+                    <td>{row.email_access || "-"}</td>
+                    <td>{row.plan_name || row.plan_code || "-"}</td>
+                    <td>{formatCurrency(row.monthly_price_cents)}</td>
+                    <td>{formatDate(row.data_ultimo_pagamento)}</td>
+                    <td>{formatDate(row.data_proximo_vencimento)}</td>
+                    <td>{row.status || "-"}</td>
+                    <td>
+                      <div className="table-actions">
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => openEditClientModal(row)} disabled={submitting}>
+                          Editar
+                        </button>
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => setPendingDeleteClient(row)} disabled={submitting}>
+                          Excluir
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      )}
+
+      {isGlobalSuperadmin && (
+      <section className="catalog-block">
+        <header>
           <h3>{tUi("config.appLlm.title", "LLM Padrao do App (Superadmin)")}</h3>
         </header>
         {llmDenied ? (
@@ -1188,6 +1762,33 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
         )}
       </section>
       )}
+
+      <ClientAdminModal
+        open={clientModalOpen}
+        loading={submitting}
+        draft={clientDraft || {}}
+        plans={adminPlans}
+        onChange={updateClientDraftField}
+        onClose={() => {
+          if (!submitting) {
+            setClientModalOpen(false);
+            setClientDraft(null);
+          }
+        }}
+        onSave={saveAdminClient}
+      />
+
+      <ConfirmActionModal
+        open={Boolean(pendingDeleteClient)}
+        title="Excluir cliente"
+        message={`Deseja inativar o cliente ${pendingDeleteClient?.trade_name || pendingDeleteClient?.client_id}?`}
+        confirmLabel="Excluir"
+        onConfirm={confirmDeleteAdminClient}
+        onClose={() => {
+          if (!submitting) setPendingDeleteClient(null);
+        }}
+        loading={submitting}
+      />
 
       <MfaCodeModal
         open={modalMode === "enable"}

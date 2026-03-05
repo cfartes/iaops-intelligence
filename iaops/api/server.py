@@ -78,12 +78,23 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     lgpd_schema_ready = False
     billing_plan_limits_ready = False
     smtp_table_ready = False
+    hub_config_table_ready = False
+    client_release_date_ready = False
 
     @staticmethod
     def _build_signup_confirm_link(confirm_token: str) -> str:
         base = (os.getenv("IAOPS_SIGNUP_CONFIRM_URL_BASE") or "http://127.0.0.1:8000/api/auth/confirm-link").strip()
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}confirm_token={quote_plus(str(confirm_token or '').strip())}"
+
+    @staticmethod
+    def _build_default_hub_intake_url() -> str:
+        base = str(os.getenv("IAOPS_HUB_BASE_URL") or "").strip().rstrip("/")
+        if not base:
+            return ""
+        if base.endswith("/api"):
+            return f"{base}/hub/intake/client-upsert"
+        return f"{base}/api/hub/intake/client-upsert"
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json(HTTPStatus.NO_CONTENT, {})
@@ -153,6 +164,15 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/admin/smtp/config":
             self._handle_admin_smtp_config_get()
             return
+        if parsed.path == "/api/admin/hub/config":
+            self._handle_admin_hub_config_get()
+            return
+        if parsed.path == "/api/admin/hub/billing/clients":
+            self._handle_admin_hub_billing_clients()
+            return
+        if parsed.path == "/api/admin/clients":
+            self._handle_admin_clients_list()
+            return
         if parsed.path == "/api/tenant-llm/providers":
             self._handle_tenant_llm_providers_list()
             return
@@ -164,6 +184,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/preferences/user-tenant":
             self._handle_user_tenant_preference_get()
+            return
+        if parsed.path == "/api/client/billing-info":
+            self._handle_client_billing_info_get()
             return
         if parsed.path == "/api/setup/progress":
             self._handle_setup_progress_get()
@@ -209,6 +232,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channel/bindings":
             self._handle_channel_bindings_list(parsed.query)
+            return
+        if parsed.path == "/api/hub/billing/clients":
+            self._handle_hub_billing_clients()
             return
         if parsed.path == "/webhooks/meta/whatsapp":
             self._handle_meta_whatsapp_verify(parsed.query)
@@ -331,6 +357,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/admin/smtp/config":
             self._handle_admin_smtp_config_update()
             return
+        if parsed.path == "/api/admin/hub/config":
+            self._handle_admin_hub_config_update()
+            return
+        if parsed.path == "/api/admin/clients/update":
+            self._handle_admin_client_update()
+            return
+        if parsed.path == "/api/admin/clients/delete":
+            self._handle_admin_client_delete()
+            return
+        if parsed.path == "/api/admin/hub/intake/test":
+            self._handle_admin_hub_intake_test()
+            return
         if parsed.path == "/api/admin/smtp/test":
             self._handle_admin_smtp_test()
             return
@@ -369,6 +407,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channel/bindings/delete":
             self._handle_channel_binding_delete()
+            return
+        if parsed.path == "/api/hub/billing/release-date":
+            self._handle_hub_billing_release_date_update()
             return
         if parsed.path == "/api/lgpd/policy":
             self._handle_lgpd_policy_upsert()
@@ -1313,6 +1354,440 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
 
+    def _handle_admin_hub_config_get(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.get_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.get_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "success",
+                "tool": "admin.hub.get_config",
+                "correlation_id": str(uuid.uuid4()),
+                "data": {"config": self._db_get_hub_integration_config()},
+                "error": None,
+            },
+        )
+
+    def _handle_admin_hub_config_update(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        regenerate = bool((body or {}).get("regenerate"))
+        key_input = (body or {}).get("hub_api_key")
+        intake_key_input = (body or {}).get("intake_api_key")
+        intake_url_input = (body or {}).get("intake_endpoint_url")
+        key_value = str(key_input or "").strip() if key_input is not None else None
+        intake_key_value = str(intake_key_input or "").strip() if intake_key_input is not None else None
+        intake_url_value = str(intake_url_input or "").strip() if intake_url_input is not None else None
+        if regenerate:
+            key_value = token_hex(24)
+        if key_value is None and intake_key_value is None and intake_url_value is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "Informe hub_api_key, intake_api_key, intake_endpoint_url ou use regenerate=true."},
+                },
+            )
+            return
+        try:
+            self._db_save_hub_integration_config(
+                hub_api_key=key_value,
+                intake_api_key=intake_key_value,
+                intake_endpoint_url=intake_url_value,
+            )
+            cfg = self._db_get_hub_integration_config()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.hub.update_config",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"config": cfg},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.update_config",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_hub_billing_clients(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.billing_clients",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.billing_clients",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        try:
+            app_name = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+            rows = self._db_list_hub_billing_clients()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.hub.billing_clients",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"app_name": app_name, "clients": rows},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.billing_clients",
+                    "data": {},
+                    "error": {"code": "hub_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_clients_list(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.list",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.list",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        try:
+            rows = self._db_list_admin_clients()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.clients.list",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"clients": rows},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.list",
+                    "data": {},
+                    "error": {"code": "admin_clients_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_client_update(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.update",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.update",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            row = self._db_update_admin_client(
+                client_id=body.get("client_id"),
+                trade_name=body.get("trade_name"),
+                legal_name=body.get("legal_name"),
+                cnpj=body.get("cnpj"),
+                address_text=body.get("address_text"),
+                bairro=body.get("bairro"),
+                cidade=body.get("cidade"),
+                uf=body.get("uf"),
+                cep=body.get("cep"),
+                phone_contact=body.get("phone_contact"),
+                email_access=body.get("email_access"),
+                email_financial=body.get("email_financial"),
+                email_nf=body.get("email_nf"),
+                status=body.get("status"),
+                plan_code=body.get("plan_code"),
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.clients.update",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"client": row},
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.update",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.update",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "admin_clients_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_client_delete(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.delete",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.delete",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        try:
+            data = self._db_delete_admin_client(client_id=body.get("client_id"))
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.clients.delete",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": data,
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.delete",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.clients.delete",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "admin_clients_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_admin_hub_intake_test(self) -> None:
+        context = self._request_context()
+        if context.get("invalid_session"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.intake_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        if not self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.intake_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                },
+            )
+            return
+        body = self._read_json_body()
+        client_id_input = (body or {}).get("client_id")
+        try:
+            client_id = int(client_id_input) if str(client_id_input or "").strip() else 0
+        except Exception:
+            client_id = 0
+        try:
+            rows = self._db_list_hub_billing_clients()
+            if client_id <= 0:
+                if not rows:
+                    raise ValueError("Nenhum cliente ativo encontrado para teste de intake.")
+                client_id = int(rows[0].get("client_id") or 0)
+            if client_id <= 0:
+                raise ValueError("client_id invalido para teste de intake.")
+            selected = next((item for item in rows if int(item.get("client_id") or 0) == client_id), None)
+            send_result = self._send_client_to_hub_intake(client_id=client_id)
+            payload_preview = self._db_build_hub_intake_client_payload(client_id=client_id)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "admin.hub.intake_test",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {
+                        "client_id": client_id,
+                        "client": selected,
+                        "payload_preview": payload_preview,
+                        "result": send_result,
+                    },
+                    "error": None,
+                },
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.intake_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": str(exc)},
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "admin.hub.intake_test",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "hub_error", "message": str(exc)},
+                },
+            )
+
     def _handle_data_source_discover_tables(self) -> None:
         body = self._read_json_body()
         source_type = str(body.get("source_type") or "").strip().lower()
@@ -1603,6 +2078,44 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         }
         self._dispatch_mcp(payload)
 
+    def _handle_client_billing_info_get(self) -> None:
+        context = self._request_context()
+        if bool(context.get("invalid_session")):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "status": "denied",
+                    "tool": "client.get_billing_info",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "invalid_session", "message": "Sessao invalida ou expirada. Faca login novamente."},
+                },
+            )
+            return
+        try:
+            data = self._db_get_client_billing_info(client_id=int(context.get("client_id") or 0))
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "client.get_billing_info",
+                    "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+                    "data": {"billing_info": data},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "client.get_billing_info",
+                    "correlation_id": None,
+                    "data": {},
+                    "error": {"code": "billing_info_error", "message": str(exc)},
+                },
+            )
+
     def _handle_user_tenant_preference_update(self) -> None:
         body = self._read_json_body()
         payload = {
@@ -1642,10 +2155,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "legal_name",
             "cnpj",
             "address_text",
+            "bairro",
+            "cidade",
+            "uf",
+            "cep",
             "phone_contact",
-            "email_contact",
             "email_access",
-            "email_notification",
+            "email_financial",
+            "email_nf",
             "password",
             "plan_code",
             "language_code",
@@ -1690,10 +2207,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             "legal_name": str(body.get("legal_name") or "").strip(),
             "cnpj": str(body.get("cnpj") or "").strip(),
             "address_text": str(body.get("address_text") or "").strip(),
+            "bairro": str(body.get("bairro") or "").strip(),
+            "cidade": str(body.get("cidade") or "").strip(),
+            "uf": str(body.get("uf") or "").strip(),
+            "cep": str(body.get("cep") or "").strip(),
             "phone_contact": str(body.get("phone_contact") or "").strip(),
-            "email_contact": str(body.get("email_contact") or "").strip(),
             "email_access": email_access,
-            "email_notification": str(body.get("email_notification") or "").strip(),
+            "email_financial": str(body.get("email_financial") or "").strip(),
+            "email_nf": str(body.get("email_nf") or "").strip(),
             "password_hash": encoded_password,
             "plan_code": str(body.get("plan_code") or "").strip(),
             "language_code": str(body.get("language_code") or "pt-BR").strip(),
@@ -2225,13 +2746,21 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        hub_intake = None
+        if isinstance(confirm_result, dict):
+            client_id = int(confirm_result.get("client_id") or 0)
+            if client_id > 0:
+                hub_intake = self._send_client_to_hub_intake(client_id=client_id)
+        response_data = dict(confirm_result) if isinstance(confirm_result, dict) else confirm_result
+        if isinstance(response_data, dict):
+            response_data["hub_intake"] = hub_intake or {"sent": False, "reason": "not_applicable"}
         self._send_json(
             HTTPStatus.OK,
             {
                 "status": "success",
                 "tool": "auth.confirm",
                 "correlation_id": str(uuid.uuid4()),
-                "data": confirm_result,
+                "data": response_data,
                 "error": None,
             },
         )
@@ -2303,6 +2832,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         result = self._confirm_pending_signup_db(confirm_token=confirm_token)
         if isinstance(result, dict):
+            try:
+                client_id = int(result.get("client_id") or 0)
+            except Exception:
+                client_id = 0
+            if client_id > 0:
+                self._send_client_to_hub_intake(client_id=client_id)
             self._send_html(
                 HTTPStatus.OK,
                 "<h2>Cadastro confirmado</h2><p>Seu acesso foi ativado com sucesso. Volte ao app e faca login.</p>",
@@ -2426,10 +2961,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         legal_name,
                         cnpj,
                         address_text,
+                        bairro,
+                        cidade,
+                        uf,
+                        cep,
                         phone_contact,
                         email_contact,
                         email_access,
                         email_notification,
+                        email_financial,
+                        email_nf,
                         password_hash,
                         plan_code,
                         language_code,
@@ -2442,10 +2983,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         %(legal_name)s,
                         %(cnpj)s,
                         %(address_text)s,
+                        %(bairro)s,
+                        %(cidade)s,
+                        %(uf)s,
+                        %(cep)s,
                         %(phone_contact)s,
                         %(email_contact)s,
                         %(email_access)s,
                         %(email_notification)s,
+                        %(email_financial)s,
+                        %(email_nf)s,
                         %(password_hash)s,
                         %(plan_code)s,
                         %(language_code)s,
@@ -2459,10 +3006,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "legal_name": signup_data["legal_name"],
                         "cnpj": signup_data["cnpj"],
                         "address_text": signup_data["address_text"],
+                        "bairro": signup_data["bairro"],
+                        "cidade": signup_data["cidade"],
+                        "uf": signup_data["uf"],
+                        "cep": signup_data["cep"],
                         "phone_contact": signup_data["phone_contact"],
-                        "email_contact": signup_data["email_contact"],
+                        "email_contact": signup_data["email_financial"],
                         "email_access": signup_data["email_access"],
-                        "email_notification": signup_data["email_notification"],
+                        "email_notification": signup_data["email_nf"],
+                        "email_financial": signup_data["email_financial"],
+                        "email_nf": signup_data["email_nf"],
                         "password_hash": signup_data["password_hash"],
                         "plan_code": signup_data["plan_code"],
                         "language_code": signup_data["language_code"],
@@ -2503,10 +3056,14 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         legal_name,
                         cnpj,
                         address_text,
+                        bairro,
+                        cidade,
+                        uf,
+                        cep,
                         phone_contact,
-                        email_contact,
                         email_access,
-                        email_notification,
+                        email_financial,
+                        email_nf,
                         password_hash,
                         plan_code,
                         language_code,
@@ -2521,9 +3078,9 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 pending = cur.fetchone()
                 if not pending:
                     return None
-                if pending[13] != "pending":
+                if pending[17] != "pending":
                     return "invalid_token"
-                if pending[12] is None or pending[12].timestamp() < time():
+                if pending[16] is None or pending[16].timestamp() < time():
                     cur.execute(
                         f"""
                         UPDATE {schema}.client_signup_pending
@@ -2536,7 +3093,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     return "expired_token"
 
                 cnpj = str(pending[3]).strip()
-                email_access = str(pending[7]).strip().lower()
+                email_access = str(pending[10]).strip().lower()
                 cur.execute(
                     f"""
                     SELECT 1
@@ -2550,6 +3107,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                 if cur.fetchone():
                     return "already_exists"
 
+                plan_code = str(pending[14] or "").strip().lower()
+                cur.execute(
+                    f"""
+                    SELECT id
+                    FROM {schema}.billing_plan
+                    WHERE code = %(plan_code)s
+                    LIMIT 1
+                    """,
+                    {"plan_code": plan_code},
+                )
+                billing_plan_row = cur.fetchone()
+                legacy_plan_row = None
                 cur.execute(
                     f"""
                     SELECT id
@@ -2557,12 +3126,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     WHERE code = %(plan_code)s
                     LIMIT 1
                     """,
-                    {"plan_code": pending[10]},
+                    {"plan_code": plan_code},
                 )
-                plan_row = cur.fetchone()
-                if not plan_row:
+                legacy_plan_row = cur.fetchone()
+                if not billing_plan_row and not legacy_plan_row:
                     return "plan_not_found"
-                plan_id = int(plan_row[0])
+                billing_plan_id = int(billing_plan_row[0]) if billing_plan_row else None
+                legacy_plan_id = int(legacy_plan_row[0]) if legacy_plan_row else None
 
                 cur.execute(
                     f"""
@@ -2571,12 +3141,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         legal_name,
                         cnpj,
                         address_text,
+                        bairro,
+                        cidade,
+                        uf,
+                        cep,
                         contact_phone,
                         contact_email,
                         access_email,
                         notification_email,
+                        financial_email,
+                        nf_email,
                         password_hash,
                         email_confirmed_at,
+                        data_liberado,
                         status
                     )
                     VALUES (
@@ -2584,12 +3161,19 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         %(legal_name)s,
                         %(cnpj)s,
                         %(address_text)s,
+                        %(bairro)s,
+                        %(cidade)s,
+                        %(uf)s,
+                        %(cep)s,
                         %(contact_phone)s,
                         %(contact_email)s,
                         %(access_email)s,
                         %(notification_email)s,
+                        %(financial_email)s,
+                        %(nf_email)s,
                         %(password_hash)s,
                         NOW(),
+                        CURRENT_DATE + INTERVAL '30 days',
                         'active'
                     )
                     RETURNING id
@@ -2599,37 +3183,65 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "legal_name": pending[2],
                         "cnpj": cnpj,
                         "address_text": pending[4],
-                        "contact_phone": pending[5],
-                        "contact_email": pending[6],
+                        "bairro": pending[5],
+                        "cidade": pending[6],
+                        "uf": pending[7],
+                        "cep": pending[8],
+                        "contact_phone": pending[9],
+                        "contact_email": pending[11],
                         "access_email": email_access,
-                        "notification_email": pending[8],
-                        "password_hash": pending[9],
+                        "notification_email": pending[12],
+                        "financial_email": pending[11],
+                        "nf_email": pending[12],
+                        "password_hash": pending[13],
                     },
                 )
                 client_id = int(cur.fetchone()[0])
 
-                cur.execute(
-                    f"""
-                    INSERT INTO {schema}.subscription (
-                        client_id,
-                        plan_id,
-                        starts_at,
-                        ends_at,
-                        status
-                    )
-                    VALUES (
-                        %(client_id)s,
-                        %(plan_id)s,
-                        NOW(),
-                        NULL,
-                        'active'
-                    )
-                    """,
-                    {
-                        "client_id": client_id,
-                        "plan_id": plan_id,
-                    },
-                )
+                if billing_plan_id is not None:
+                    cur.execute("SELECT to_regclass(%(table_name)s)", {"table_name": f"{schema}.billing_subscription"})
+                    billing_table_row = cur.fetchone()
+                    if billing_table_row and billing_table_row[0]:
+                        cur.execute(
+                            f"""
+                            INSERT INTO {schema}.billing_subscription (
+                                client_id, plan_id, status, starts_at, ends_at, tolerance_days, updated_at
+                            )
+                            VALUES (
+                                %(client_id)s, %(plan_id)s, 'active', NOW(), NULL, 5, NOW()
+                            )
+                            """,
+                            {
+                                "client_id": client_id,
+                                "plan_id": billing_plan_id,
+                            },
+                        )
+                if legacy_plan_id is not None:
+                    cur.execute("SELECT to_regclass(%(table_name)s)", {"table_name": f"{schema}.subscription"})
+                    legacy_table_row = cur.fetchone()
+                    if legacy_table_row and legacy_table_row[0]:
+                        cur.execute(
+                            f"""
+                            INSERT INTO {schema}.subscription (
+                                client_id,
+                                plan_id,
+                                starts_at,
+                                ends_at,
+                                status
+                            )
+                            VALUES (
+                                %(client_id)s,
+                                %(plan_id)s,
+                                NOW(),
+                                NULL,
+                                'active'
+                            )
+                            """,
+                            {
+                                "client_id": client_id,
+                                "plan_id": legacy_plan_id,
+                            },
+                        )
 
                 tenant_name = str(pending[1]).strip() or "Tenant Principal"
                 tenant_slug = self._build_unique_tenant_slug(
@@ -2684,7 +3296,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "client_id": client_id,
                         "email": email_access,
                         "full_name": str(pending[1]).strip() or str(pending[2]).strip(),
-                        "password_hash": pending[9],
+                        "password_hash": pending[13],
                     },
                 )
                 owner_user_id = int(cur.fetchone()[0])
@@ -2726,7 +3338,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     {
                         "tenant_id": tenant_id,
                         "user_id": owner_user_id,
-                        "language_code": str(pending[11] or "pt-BR"),
+                        "language_code": str(pending[15] or "pt-BR"),
                     },
                 )
 
@@ -3894,8 +4506,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_channel_list_tenants(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client > 0:
+                context = {
+                    "client_id": override_client,
+                    "tenant_id": 0,
+                    "user_id": int(context.get("user_id") or 0),
+                    "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+                }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.list_user_tenants",
             "input": {
                 "channel_type": body.get("channel_type"),
@@ -3920,8 +4542,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_channel_bindings_list(self, query: str) -> None:
         qs = parse_qs(query)
         channel_type = qs.get("channel_type", [None])[0]
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(qs.get("client_id", ["0"])[0] or 0)
+            if override_client > 0:
+                context = {
+                    "client_id": override_client,
+                    "tenant_id": 0,
+                    "user_id": int(context.get("user_id") or 0),
+                    "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+                }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.binding.list",
             "input": {
                 "channel_type": channel_type,
@@ -3931,8 +4563,28 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_channel_binding_upsert(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client <= 0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "channel.binding.upsert",
+                        "data": {},
+                        "error": {"code": "invalid_input", "message": "client_id obrigatorio para superadmin"},
+                    },
+                )
+                return
+            context = {
+                "client_id": override_client,
+                "tenant_id": 0,
+                "user_id": int(context.get("user_id") or 0),
+                "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+            }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.binding.upsert",
             "input": {
                 "tenant_id": body.get("tenant_id"),
@@ -3946,8 +4598,28 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_channel_binding_delete(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client <= 0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "status": "denied",
+                        "tool": "channel.binding.delete",
+                        "data": {},
+                        "error": {"code": "invalid_input", "message": "client_id obrigatorio para superadmin"},
+                    },
+                )
+                return
+            context = {
+                "client_id": override_client,
+                "tenant_id": 0,
+                "user_id": int(context.get("user_id") or 0),
+                "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+            }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.binding.delete",
             "input": {
                 "binding_id": body.get("binding_id"),
@@ -3957,8 +4629,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_channel_select_tenant(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client > 0:
+                context = {
+                    "client_id": override_client,
+                    "tenant_id": 0,
+                    "user_id": int(context.get("user_id") or 0),
+                    "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+                }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.set_active_tenant",
             "input": {
                 "channel_type": body.get("channel_type"),
@@ -3971,8 +4653,18 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_channel_get_active_tenant(self) -> None:
         body = self._read_json_body()
+        context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client > 0:
+                context = {
+                    "client_id": override_client,
+                    "tenant_id": 0,
+                    "user_id": int(context.get("user_id") or 0),
+                    "correlation_id": str(context.get("correlation_id") or str(uuid.uuid4())),
+                }
         payload = {
-            "context": self._request_context(),
+            "context": context,
             "tool": "channel.get_active_tenant",
             "input": {
                 "channel_type": body.get("channel_type"),
@@ -4011,6 +4703,23 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
 
         context = self._request_context()
+        if self._is_global_superadmin_context(context):
+            override_client = int(body.get("client_id") or 0)
+            if override_client > 0:
+                context = {
+                    "client_id": override_client,
+                    "tenant_id": 0,
+                    "user_id": int(context.get("user_id") or 100),
+                    "correlation_id": str(uuid.uuid4()),
+                }
+        resolved = self._resolve_channel_client_context(channel_type=channel_type, external_user_key=external_user_key)
+        if resolved.get("client_id"):
+            context = {
+                "client_id": int(resolved.get("client_id") or 0),
+                "tenant_id": int(resolved.get("tenant_id") or 0),
+                "user_id": int(resolved.get("user_id") or 100),
+                "correlation_id": str(uuid.uuid4()),
+            }
         command = self._parse_channel_command(message_text)
         response_data = self._execute_channel_command(
             context=context,
@@ -4072,10 +4781,11 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     if not message_text:
                         continue
                     conversation_key = external_user_key
+                    resolved = self._resolve_channel_client_context(channel_type="whatsapp", external_user_key=external_user_key)
                     context = {
-                        "client_id": default_client_id,
-                        "tenant_id": default_tenant_id,
-                        "user_id": default_user_id,
+                        "client_id": int(resolved.get("client_id") or default_client_id),
+                        "tenant_id": int(resolved.get("tenant_id") or default_tenant_id),
+                        "user_id": int(resolved.get("user_id") or default_user_id),
                         "correlation_id": str(uuid.uuid4()),
                     }
                     command = self._parse_channel_command(message_text)
@@ -4198,6 +4908,46 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
         return {"ok": True}
+
+    @classmethod
+    def _resolve_channel_client_context(cls, *, channel_type: str, external_user_key: str) -> dict[str, int]:
+        if not cls._is_db_enabled():
+            return {}
+        key = str(external_user_key or "").strip()
+        ctype = str(channel_type or "").strip().lower()
+        if not key or ctype not in {"telegram", "whatsapp"}:
+            return {}
+        schema = cls.signup_schema
+        try:
+            with connect(cls._get_db_dsn(), row_factory=dict_row) as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        b.client_id,
+                        COALESCE(b.tenant_id, 0) AS tenant_id,
+                        COALESCE(b.user_id, 100) AS user_id
+                    FROM {schema}.channel_user_binding b
+                    WHERE b.channel_type = %(channel_type)s
+                      AND b.external_user_key = %(external_user_key)s
+                      AND b.is_active = TRUE
+                    ORDER BY b.updated_at DESC, b.id DESC
+                    LIMIT 1
+                    """,
+                    {
+                        "channel_type": ctype,
+                        "external_user_key": key,
+                    },
+                )
+                row = cur.fetchone()
+            if not row:
+                return {}
+            return {
+                "client_id": int(row.get("client_id") or 0),
+                "tenant_id": int(row.get("tenant_id") or 0),
+                "user_id": int(row.get("user_id") or 100),
+            }
+        except Exception:
+            return {}
 
     def _execute_channel_command(
         self,
@@ -4558,13 +5308,53 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         normalized = " ".join(raw.lower().split())
         if not normalized:
             return {"kind": "help"}
-        if normalized in {"help", "ajuda", "/help"}:
+        if normalized in {"help", "ajuda", "/help", "/ajuda"}:
             return {"kind": "help"}
-        if normalized in {"tenant", "/tenant", "tenant list", "/tenant list", "tenants"}:
+        if normalized in {
+            "tenant",
+            "/tenant",
+            "tenant list",
+            "/tenant list",
+            "tenants",
+            "list tenants",
+            "/list tenants",
+            "list tenant",
+            "/list tenant",
+            "listar inquilinos",
+            "/listar inquilinos",
+            "listar tenants",
+            "/listar tenants",
+            "listar tenant",
+            "/listar tenant",
+            "lista tenants",
+            "/lista tenants",
+            "lista tenant",
+            "/lista tenant",
+        }:
             return {"kind": "tenant_list"}
-        if normalized in {"tenant active", "/tenant active"}:
+        if normalized in {
+            "tenant active",
+            "/tenant active",
+            "active tenant",
+            "/active tenant",
+            "show active tenant",
+            "/show active tenant",
+            "ver tenant activo",
+            "/ver tenant activo",
+            "mostrar tenant activo",
+            "/mostrar tenant activo",
+            "tenant ativo",
+            "/tenant ativo",
+            "ver tenant ativo",
+            "/ver tenant ativo",
+            "mostrar tenant ativo",
+            "/mostrar tenant ativo",
+        }:
             return {"kind": "tenant_active"}
-        selected = re.match(r"^/?tenant\s+select\s+(\d+)$", normalized)
+        selected = re.match(
+            r"^/?(?:tenant\s+select|select\s+tenant|selecionar\s+tenant|tenant\s+selecionar|seleccionar\s+tenant|tenant\s+seleccionar)\s+(\d+)$",
+            normalized,
+        )
         if selected:
             return {"kind": "tenant_select", "tenant_id": int(selected.group(1))}
         if re.match(r"^/?(?:select|selecionar|seleccione|escolher|choose|usar|use|trocar|cambiar)\s+", normalized):
@@ -4629,9 +5419,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         prefix = self._t(language_code, "unknown_command", value=message_text) if message_text else ""
         return (
             f"{prefix}{self._t(language_code, 'available_commands')}\n"
-            "tenant list\n"
-            "tenant select <id>\n"
-            "tenant active\n"
+            "- tenant list\n"
+            "- tenant select <id>\n"
+            "- tenant active\n"
+            "- (pt-BR) listar tenants | selecionar tenant <id> | tenant ativo\n"
             f"{self._t(language_code, 'help_keyword')}\n"
             f"{self._t(language_code, 'ask_natural_language')}"
         )
@@ -6439,20 +7230,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         texts = {
             "pt": {
                 "sql_not_allowed": "Comando SQL nao e aceito. Envie a pergunta em linguagem natural.",
-                "no_active_tenant_conversation": "Nenhum tenant ativo na conversa. Use: tenant list e tenant select <id>.",
+                "no_active_tenant_conversation": "Nenhum tenant ativo na conversa. Liste os tenants do cliente e selecione um tenant para esta conversa.",
                 "channel_user_not_identified": "Usuario do canal nao identificado.",
                 "channel_command_failed": "Nao foi possivel processar o comando no canal.",
                 "error_prefix": "Erro: {message}",
                 "user_label": "Usuario: {value}",
-                "available_tenants": "Tenants disponiveis:",
-                "available_commands": "Comandos disponiveis:",
+                "available_tenants": "Tenants disponiveis para este cliente:",
+                "available_commands": "Comandos de conversa:",
                 "tenant_selection_not_understood": "Nao consegui identificar o tenant. Escolha pelo numero ou nome.",
                 "tenant_status_label": "status={value}",
                 "tenant_role_label": "perfil={value}",
                 "hint_tenant_pick_natural": "Dica: responda com o numero do tenant ou com o nome (ex.: Comercial).",
-                "hint_tenant_select": "Use: tenant select <id>",
-                "hint_tenant_active": "Use: tenant active",
-                "no_active_tenant": "Nenhum tenant ativo para esta conversa. Use: tenant list",
+                "hint_tenant_select": "Comando: tenant select <id>",
+                "hint_tenant_active": "Comando: tenant active",
+                "no_active_tenant": "Nenhum tenant ativo para esta conversa. Use o comando: tenant list",
                 "active_tenant_id_only": "Tenant ativo: {tenant_id}",
                 "active_tenant_full": "Tenant ativo: {tenant_id} - {tenant_name} ({tenant_status})",
                 "unknown_command": "Comando nao reconhecido: '{value}'.\n",
@@ -6470,20 +7261,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
             "en": {
                 "sql_not_allowed": "SQL command is not accepted. Send your question in natural language.",
-                "no_active_tenant_conversation": "No active tenant in this conversation. Use: tenant list and tenant select <id>.",
+                "no_active_tenant_conversation": "No active tenant in this conversation. List client tenants and select one for this conversation.",
                 "channel_user_not_identified": "Channel user not identified.",
                 "channel_command_failed": "Could not process channel command.",
                 "error_prefix": "Error: {message}",
                 "user_label": "User: {value}",
-                "available_tenants": "Available tenants:",
-                "available_commands": "Available commands:",
+                "available_tenants": "Available tenants for this client:",
+                "available_commands": "Conversation commands:",
                 "tenant_selection_not_understood": "I could not identify the tenant. Choose by number or name.",
                 "tenant_status_label": "status={value}",
                 "tenant_role_label": "role={value}",
                 "hint_tenant_pick_natural": "Tip: reply with tenant number or name (e.g., Sales).",
-                "hint_tenant_select": "Use: tenant select <id>",
-                "hint_tenant_active": "Use: tenant active",
-                "no_active_tenant": "No active tenant for this conversation. Use: tenant list",
+                "hint_tenant_select": "Command: tenant select <id>",
+                "hint_tenant_active": "Command: tenant active",
+                "no_active_tenant": "No active tenant for this conversation. Use command: tenant list",
                 "active_tenant_id_only": "Active tenant: {tenant_id}",
                 "active_tenant_full": "Active tenant: {tenant_id} - {tenant_name} ({tenant_status})",
                 "unknown_command": "Unknown command: '{value}'.\n",
@@ -6501,20 +7292,20 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             },
             "es": {
                 "sql_not_allowed": "No se acepta comando SQL. Envie su pregunta en lenguaje natural.",
-                "no_active_tenant_conversation": "No hay tenant activo en esta conversacion. Use: tenant list y tenant select <id>.",
+                "no_active_tenant_conversation": "No hay tenant activo en esta conversacion. Liste los tenants del cliente y seleccione uno para esta conversacion.",
                 "channel_user_not_identified": "Usuario del canal no identificado.",
                 "channel_command_failed": "No fue posible procesar el comando del canal.",
                 "error_prefix": "Error: {message}",
                 "user_label": "Usuario: {value}",
-                "available_tenants": "Tenants disponibles:",
-                "available_commands": "Comandos disponibles:",
+                "available_tenants": "Tenants disponibles para este cliente:",
+                "available_commands": "Comandos de conversacion:",
                 "tenant_selection_not_understood": "No pude identificar el tenant. Elija por numero o nombre.",
                 "tenant_status_label": "estado={value}",
                 "tenant_role_label": "rol={value}",
                 "hint_tenant_pick_natural": "Sugerencia: responda con numero o nombre del tenant (ej.: Comercial).",
-                "hint_tenant_select": "Use: tenant select <id>",
-                "hint_tenant_active": "Use: tenant active",
-                "no_active_tenant": "No hay tenant activo para esta conversacion. Use: tenant list",
+                "hint_tenant_select": "Comando: tenant select <id>",
+                "hint_tenant_active": "Comando: tenant active",
+                "no_active_tenant": "No hay tenant activo para esta conversacion. Use el comando: tenant list",
                 "active_tenant_id_only": "Tenant activo: {tenant_id}",
                 "active_tenant_full": "Tenant activo: {tenant_id} - {tenant_name} ({tenant_status})",
                 "unknown_command": "Comando no reconocido: '{value}'.\n",
@@ -6639,7 +7430,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "data": {},
                         "error": {
                             "code": "tenant_blocked",
-                            "message": "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para continuar.",
+                            "message": "Tenant bloqueado. Verifique status do tenant e DataLiberado do cliente.",
                         },
                     },
                 )
@@ -7113,6 +7904,134 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"status": "denied", "tool": "billing.installments.pay", "data": {}, "error": {"code": "billing_error", "message": str(exc)}})
 
+    def _authorize_hub_request(self) -> tuple[bool, str]:
+        cfg = self._db_get_hub_integration_config()
+        configured_key = str((cfg or {}).get("hub_api_key") or "").strip()
+        provided_key = str(self.headers.get("X-IAOPS-HUB-KEY", "") or "").strip()
+        if configured_key and provided_key and provided_key == configured_key:
+            return True, "ok"
+        context = self._request_context()
+        if bool(context.get("invalid_session")):
+            return False, "Sessao invalida ou expirada."
+        if self._is_superadmin_user(user_id=int(context.get("user_id") or 0)):
+            return True, "ok"
+        if configured_key:
+            return False, "Chave de integracao do HUB invalida."
+        return False, "Acesso restrito a superadmin ou chave de integracao."
+
+    def _handle_hub_billing_clients(self) -> None:
+        ok, message = self._authorize_hub_request()
+        if not ok:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.list_clients",
+                    "data": {},
+                    "error": {"code": "hub_auth_failed", "message": message},
+                },
+            )
+            return
+        try:
+            rows = self._db_list_hub_billing_clients()
+            app_name = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing_hub.list_clients",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"app_name": app_name, "clients": rows},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.list_clients",
+                    "data": {},
+                    "error": {"code": "hub_error", "message": str(exc)},
+                },
+            )
+
+    def _handle_hub_billing_release_date_update(self) -> None:
+        ok, message = self._authorize_hub_request()
+        if not ok:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.update_release_date",
+                    "data": {},
+                    "error": {"code": "hub_auth_failed", "message": message},
+                },
+            )
+            return
+        body = self._read_json_body()
+        client_ref = (
+            body.get("client_id")
+            or body.get("cliente")
+            or body.get("client")
+            or body.get("email_owner")
+            or body.get("owner_email")
+            or body.get("cnpj")
+            or body.get("access_email")
+        )
+        release_date = body.get("data_liberado") or body.get("release_date")
+        last_payment = body.get("data_pagamento") or body.get("data_ultimo_pagamento") or body.get("last_payment_date")
+        next_due = body.get("data_prox_vencimento") or body.get("data_proximo_vencimento") or body.get("next_due_date")
+        if not client_ref:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.update_release_date",
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "cliente (ou email_owner/client_id/cnpj/access_email) obrigatorio"},
+                },
+            )
+            return
+        if not release_date:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.update_release_date",
+                    "data": {},
+                    "error": {"code": "invalid_input", "message": "data_liberado obrigatorio (YYYY-MM-DD)"},
+                },
+            )
+            return
+        try:
+            row = self._db_update_client_release_date(
+                client_ref=client_ref,
+                data_liberado=str(release_date),
+                data_ultimo_pagamento=last_payment,
+                data_proximo_vencimento=next_due,
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "tool": "billing_hub.update_release_date",
+                    "correlation_id": str(uuid.uuid4()),
+                    "data": {"app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"), "client": row},
+                    "error": None,
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "denied",
+                    "tool": "billing_hub.update_release_date",
+                    "data": {},
+                    "error": {"code": "hub_error", "message": str(exc)},
+                },
+            )
+
     def _handle_jobs_enqueue(self, job_kind: str) -> None:
         body = self._read_json_body()
         context = self._request_context()
@@ -7151,7 +8070,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         "data": {},
                         "error": {
                             "code": "tenant_blocked",
-                            "message": "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para enfileirar jobs.",
+                            "message": "Tenant bloqueado. Verifique status do tenant e DataLiberado do cliente.",
                         },
                     },
                 )
@@ -7225,12 +8144,282 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     def _handle_generic_call(self) -> None:
         body = self._read_json_body()
         context = body.get("context") or self._request_context()
+        tool_name = str(body.get("tool") or "").strip()
+        if tool_name.startswith("billing_hub."):
+            result = self._handle_mcp_billing_hub_call(
+                context=context,
+                tool_name=tool_name,
+                tool_input=body.get("input", {}),
+            )
+            if result["status"] == "success":
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if result["status"] == "denied":
+                code = str((result.get("error") or {}).get("code") or "")
+                if code in {"superadmin_required", "insufficient_role", "hub_auth_failed"}:
+                    self._send_json(HTTPStatus.FORBIDDEN, result)
+                else:
+                    self._send_json(HTTPStatus.BAD_REQUEST, result)
+                return
+            self._send_json(HTTPStatus.BAD_REQUEST, result)
+            return
+        if tool_name.startswith("billing."):
+            result = self._handle_mcp_billing_call(context=context, tool_name=tool_name, tool_input=body.get("input", {}))
+            if result["status"] == "success":
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if result["status"] == "denied":
+                code = str((result.get("error") or {}).get("code") or "")
+                if code in {"superadmin_required", "insufficient_role"}:
+                    self._send_json(HTTPStatus.FORBIDDEN, result)
+                else:
+                    self._send_json(HTTPStatus.BAD_REQUEST, result)
+                return
+            self._send_json(HTTPStatus.BAD_REQUEST, result)
+            return
         payload = {
             "context": context,
-            "tool": body.get("tool"),
+            "tool": tool_name,
             "input": body.get("input", {}),
         }
         self._dispatch_mcp(payload)
+
+    def _handle_mcp_billing_call(self, *, context: dict, tool_name: str, tool_input: dict) -> dict:
+        correlation_id = str(context.get("correlation_id") or str(uuid.uuid4()))
+        try:
+            client_id = int(context.get("client_id") or 0)
+            tenant_id = int(context.get("tenant_id") or 0)
+            user_id = int(context.get("user_id") or 0)
+        except Exception:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "invalid_context", "message": "Contexto MCP invalido."},
+            }
+        if client_id <= 0 or user_id <= 0:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "invalid_context", "message": "client_id e user_id sao obrigatorios no contexto MCP."},
+            }
+        input_data = tool_input if isinstance(tool_input, dict) else {}
+        try:
+            if tool_name == "billing.plans.list":
+                data = {"plans": self._db_list_billing_plans()}
+            elif tool_name == "billing.subscription.get":
+                data = {"subscription": self._db_get_billing_subscription(client_id=client_id)}
+            elif tool_name == "billing.subscription.upsert":
+                data = {
+                    "subscription": self._db_upsert_billing_subscription(
+                        client_id=client_id,
+                        plan_code=input_data.get("plan_code"),
+                        tolerance_days=input_data.get("tolerance_days"),
+                    )
+                }
+            elif tool_name == "billing.plan.upsert":
+                if not self._is_superadmin_user(user_id=user_id):
+                    return {
+                        "status": "denied",
+                        "tool": tool_name,
+                        "correlation_id": correlation_id,
+                        "data": {},
+                        "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                    }
+                data = {
+                    "plan": self._db_upsert_billing_plan(
+                        plan_id=input_data.get("id"),
+                        code=input_data.get("code"),
+                        name=input_data.get("name"),
+                        max_tenants=input_data.get("max_tenants"),
+                        max_users=input_data.get("max_users"),
+                        max_data_sources_per_client=input_data.get("max_data_sources_per_client"),
+                        max_data_sources_per_tenant=input_data.get("max_data_sources_per_tenant"),
+                        monthly_price_cents=input_data.get("monthly_price_cents"),
+                        is_active=input_data.get("is_active"),
+                    )
+                }
+            elif tool_name == "billing.plan.delete":
+                if not self._is_superadmin_user(user_id=user_id):
+                    return {
+                        "status": "denied",
+                        "tool": tool_name,
+                        "correlation_id": correlation_id,
+                        "data": {},
+                        "error": {"code": "superadmin_required", "message": "Acesso restrito a superadmin."},
+                    }
+                data = self._db_delete_billing_plan(plan_id=input_data.get("id"))
+            elif tool_name == "billing.installments.list":
+                status = input_data.get("status")
+                status_v = str(status).strip() if status not in (None, "") else None
+                data = {"installments": self._db_list_billing_installments(client_id=client_id, status=status_v)}
+            elif tool_name == "billing.installments.generate":
+                due_date = input_data.get("due_date")
+                if not due_date:
+                    return {
+                        "status": "denied",
+                        "tool": tool_name,
+                        "correlation_id": correlation_id,
+                        "data": {},
+                        "error": {"code": "invalid_input", "message": "due_date obrigatorio"},
+                    }
+                data = self._db_generate_billing_installment(client_id=client_id, due_date=str(due_date))
+            elif tool_name == "billing.installments.pay":
+                installment_id = input_data.get("installment_id")
+                if installment_id is None:
+                    return {
+                        "status": "denied",
+                        "tool": tool_name,
+                        "correlation_id": correlation_id,
+                        "data": {},
+                        "error": {"code": "invalid_input", "message": "installment_id obrigatorio"},
+                    }
+                data = {"installment": self._db_pay_billing_installment(installment_id=int(installment_id))}
+            elif tool_name == "billing.llm_usage":
+                days = int(input_data.get("days") or 30)
+                requested_tenant_id = input_data.get("tenant_id")
+                target_tenant_id = int(requested_tenant_id) if requested_tenant_id not in (None, "") else tenant_id
+                bounded_days = max(1, min(days, 365))
+                if target_tenant_id <= 0:
+                    data = {
+                        "summary": {
+                            "days": bounded_days,
+                            "calls": 0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "amount_cents": 0,
+                        },
+                        "by_feature": [],
+                        "recent": [],
+                    }
+                else:
+                    if not self._can_access_tenant_billing_usage(
+                        user_id=user_id,
+                        client_id=client_id,
+                        tenant_id=target_tenant_id,
+                    ):
+                        return {
+                            "status": "denied",
+                            "tool": tool_name,
+                            "correlation_id": correlation_id,
+                            "data": {},
+                            "error": {
+                                "code": "insufficient_role",
+                                "message": "Sem permissao para consultar consumo deste tenant.",
+                            },
+                        }
+                    data = self._db_get_llm_usage_report(tenant_id=target_tenant_id, days=bounded_days)
+            else:
+                return {
+                    "status": "denied",
+                    "tool": tool_name,
+                    "correlation_id": correlation_id,
+                    "data": {},
+                    "error": {"code": "tool_not_found", "message": "Tool nao registrada"},
+                }
+            return {
+                "status": "success",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": data,
+                "error": None,
+            }
+        except ValueError as exc:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "invalid_input", "message": str(exc)},
+            }
+        except Exception as exc:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "billing_error", "message": str(exc)},
+            }
+
+    def _handle_mcp_billing_hub_call(self, *, context: dict, tool_name: str, tool_input: dict) -> dict:
+        correlation_id = str(context.get("correlation_id") or str(uuid.uuid4()))
+        ok, message = self._authorize_hub_request()
+        if not ok:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "hub_auth_failed", "message": message},
+            }
+        input_data = tool_input if isinstance(tool_input, dict) else {}
+        try:
+            if tool_name == "billing_hub.list_clients":
+                data = {
+                    "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+                    "clients": self._db_list_hub_billing_clients(),
+                }
+            elif tool_name == "billing_hub.update_release_date":
+                client_ref = (
+                    input_data.get("client_id")
+                    or input_data.get("cliente")
+                    or input_data.get("client")
+                    or input_data.get("email_owner")
+                    or input_data.get("owner_email")
+                    or input_data.get("cnpj")
+                    or input_data.get("access_email")
+                )
+                release_date = input_data.get("data_liberado") or input_data.get("release_date")
+                last_payment = input_data.get("data_pagamento") or input_data.get("data_ultimo_pagamento") or input_data.get("last_payment_date")
+                next_due = input_data.get("data_prox_vencimento") or input_data.get("data_proximo_vencimento") or input_data.get("next_due_date")
+                if not client_ref:
+                    raise ValueError("cliente (ou email_owner/client_id/cnpj/access_email) obrigatorio")
+                if not release_date:
+                    raise ValueError("data_liberado obrigatorio (YYYY-MM-DD)")
+                data = {
+                    "client": self._db_update_client_release_date(
+                        client_ref=client_ref,
+                        data_liberado=str(release_date),
+                        data_ultimo_pagamento=last_payment,
+                        data_proximo_vencimento=next_due,
+                    )
+                }
+                data["app_name"] = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+            else:
+                return {
+                    "status": "denied",
+                    "tool": tool_name,
+                    "correlation_id": correlation_id,
+                    "data": {},
+                    "error": {"code": "tool_not_found", "message": "Tool nao registrada"},
+                }
+            return {
+                "status": "success",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": data,
+                "error": None,
+            }
+        except ValueError as exc:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "invalid_input", "message": str(exc)},
+            }
+        except Exception as exc:
+            return {
+                "status": "denied",
+                "tool": tool_name,
+                "correlation_id": correlation_id,
+                "data": {},
+                "error": {"code": "hub_error", "message": str(exc)},
+            }
 
     def _dispatch_mcp(self, payload: dict) -> None:
         context = payload.get("context") if isinstance(payload, dict) else None
@@ -7346,10 +8535,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     legal_name TEXT NOT NULL,
                     cnpj TEXT NOT NULL,
                     address_text TEXT NOT NULL,
+                    bairro TEXT,
+                    cidade TEXT,
+                    uf TEXT,
+                    cep TEXT,
                     phone_contact TEXT NOT NULL,
                     email_contact TEXT NOT NULL,
                     email_access TEXT NOT NULL,
                     email_notification TEXT NOT NULL,
+                    email_financial TEXT,
+                    email_nf TEXT,
                     password_hash TEXT NOT NULL,
                     plan_code TEXT NOT NULL,
                     language_code TEXT NOT NULL DEFAULT 'pt-BR',
@@ -7372,6 +8567,12 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     ON {schema}.client_signup_pending (cnpj)
                 """
             )
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS bairro TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS cidade TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS uf TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS cep TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS email_financial TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client_signup_pending ADD COLUMN IF NOT EXISTS email_nf TEXT")
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {schema}.user_password_reset (
@@ -7394,6 +8595,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             conn.commit()
         cls.signup_tables_ready = True
+        cls._ensure_client_release_date_column()
 
     @classmethod
     def _ensure_billing_plan_limits_columns(cls) -> None:
@@ -7444,6 +8646,219 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             conn.commit()
         cls.smtp_table_ready = True
+
+    @classmethod
+    def _ensure_hub_config_table(cls) -> None:
+        if cls.hub_config_table_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {schema}.app_hub_integration_config (
+                    id SMALLINT PRIMARY KEY DEFAULT 1,
+                    hub_api_key_enc TEXT,
+                    intake_api_key_enc TEXT,
+                    intake_endpoint_url TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.app_hub_integration_config
+                ADD COLUMN IF NOT EXISTS intake_api_key_enc TEXT
+                """
+            )
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.app_hub_integration_config
+                ADD COLUMN IF NOT EXISTS intake_endpoint_url TEXT
+                """
+            )
+            conn.commit()
+        cls.hub_config_table_ready = True
+
+    @classmethod
+    def _db_get_hub_integration_config(cls) -> dict[str, object]:
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            env_intake_key = str(
+                os.getenv("IAOPS_HUB_INTAKE_API_KEY")
+                or os.getenv("HUB_APP_KEY")
+                or ""
+            ).strip()
+            intake_masked = "-"
+            if env_intake_key:
+                intake_masked = f"{env_intake_key[:4]}...{env_intake_key[-4:]}" if len(env_intake_key) > 8 else ("*" * len(env_intake_key))
+            return {
+                "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+                "has_hub_api_key": False,
+                "hub_api_key": None,
+                "hub_api_key_masked": "-",
+                "has_intake_api_key": bool(env_intake_key),
+                "intake_api_key": env_intake_key or None,
+                "intake_api_key_masked": intake_masked,
+                "intake_endpoint_url": str(os.getenv("IAOPS_HUB_INTAKE_URL") or "").strip() or None,
+                "updated_at": None,
+                "source": "none",
+                "intake_source": "env" if env_intake_key else "none",
+            }
+        cls._ensure_hub_config_table()
+        schema = cls.signup_schema
+        env_key = str(os.getenv("IAOPS_HUB_API_KEY") or "").strip()
+        env_intake_key = str(
+            os.getenv("IAOPS_HUB_INTAKE_API_KEY")
+            or os.getenv("HUB_APP_KEY")
+            or ""
+        ).strip()
+        env_intake_url = str(
+            os.getenv("IAOPS_HUB_INTAKE_URL")
+            or cls._build_default_hub_intake_url()
+            or ""
+        ).strip()
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT hub_api_key_enc, intake_api_key_enc, intake_endpoint_url, updated_at
+                FROM {schema}.app_hub_integration_config
+                WHERE id = 1
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+        db_key = ""
+        db_intake_key = ""
+        db_intake_url = ""
+        updated_at = None
+        if row:
+            updated_at = row[3]
+            enc = str(row[0] or "").strip()
+            if enc:
+                try:
+                    db_key = decrypt_text(enc)
+                except Exception:
+                    db_key = ""
+            enc_intake = str(row[1] or "").strip()
+            if enc_intake:
+                try:
+                    db_intake_key = decrypt_text(enc_intake)
+                except Exception:
+                    db_intake_key = ""
+            db_intake_url = str(row[2] or "").strip()
+        key = env_key or db_key
+        intake_key = env_intake_key or db_intake_key
+        intake_url = env_intake_url or db_intake_url or None
+        source = "env" if env_key else ("db" if db_key else "none")
+        intake_source = "env" if env_intake_key else ("db" if db_intake_key else "none")
+        masked = "-"
+        if key:
+            if len(key) <= 8:
+                masked = "*" * len(key)
+            else:
+                masked = f"{key[:4]}...{key[-4:]}"
+        intake_masked = "-"
+        if intake_key:
+            if len(intake_key) <= 8:
+                intake_masked = "*" * len(intake_key)
+            else:
+                intake_masked = f"{intake_key[:4]}...{intake_key[-4:]}"
+        return {
+            "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+            "has_hub_api_key": bool(key),
+            "hub_api_key": key or None,
+            "hub_api_key_masked": masked,
+            "has_intake_api_key": bool(intake_key),
+            "intake_api_key": intake_key or None,
+            "intake_api_key_masked": intake_masked,
+            "intake_endpoint_url": intake_url,
+            "updated_at": updated_at.isoformat() if updated_at else None,
+            "source": source,
+            "intake_source": intake_source,
+        }
+
+    @classmethod
+    def _db_save_hub_integration_config(
+        cls,
+        *,
+        hub_api_key: str | None = None,
+        intake_api_key: str | None = None,
+        intake_endpoint_url: str | None = None,
+    ) -> None:
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        cls._ensure_hub_config_table()
+        schema = cls.signup_schema
+        hub_value = str(hub_api_key or "").strip() if hub_api_key is not None else None
+        intake_value = str(intake_api_key or "").strip() if intake_api_key is not None else None
+        intake_url_value = str(intake_endpoint_url or "").strip() if intake_endpoint_url is not None else None
+        if hub_value is None and intake_value is None and intake_url_value is None:
+            raise ValueError("Informe ao menos um campo para atualizar.")
+        hub_enc = encrypt_text(hub_value) if hub_value else None
+        intake_enc = encrypt_text(intake_value) if intake_value else None
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.app_hub_integration_config (
+                    id, hub_api_key_enc, intake_api_key_enc, intake_endpoint_url, updated_at
+                )
+                VALUES (1, %(hub_enc)s, %(intake_enc)s, %(intake_url)s, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    hub_api_key_enc = COALESCE(EXCLUDED.hub_api_key_enc, {schema}.app_hub_integration_config.hub_api_key_enc),
+                    intake_api_key_enc = COALESCE(EXCLUDED.intake_api_key_enc, {schema}.app_hub_integration_config.intake_api_key_enc),
+                    intake_endpoint_url = COALESCE(EXCLUDED.intake_endpoint_url, {schema}.app_hub_integration_config.intake_endpoint_url),
+                    updated_at = NOW()
+                """,
+                {"hub_enc": hub_enc, "intake_enc": intake_enc, "intake_url": intake_url_value},
+            )
+            conn.commit()
+
+    @classmethod
+    def _ensure_client_release_date_column(cls) -> None:
+        if cls.client_release_date_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.client
+                ADD COLUMN IF NOT EXISTS data_liberado DATE
+                """
+            )
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS bairro TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS cidade TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS uf TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS cep TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS financial_email TEXT")
+            cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS nf_email TEXT")
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.client
+                ADD COLUMN IF NOT EXISTS data_ultimo_pagamento DATE
+                """
+            )
+            cur.execute(
+                f"""
+                ALTER TABLE {schema}.client
+                ADD COLUMN IF NOT EXISTS data_proximo_vencimento DATE
+                """
+            )
+            cur.execute(
+                f"""
+                UPDATE {schema}.client
+                   SET data_liberado = CURRENT_DATE + INTERVAL '30 days'
+                 WHERE data_liberado IS NULL
+                """
+            )
+            conn.commit()
+        cls.client_release_date_ready = True
 
     @classmethod
     def _db_load_smtp_config(cls) -> dict[str, object]:
@@ -10056,6 +11471,625 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             for row in rows
         ]
 
+    def _db_get_client_billing_info(self, *, client_id: int) -> dict:
+        if not self._is_db_enabled():
+            return {}
+        if int(client_id or 0) <= 0:
+            return {}
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    c.id,
+                    c.fantasy_name,
+                    c.legal_name,
+                    c.cnpj,
+                    c.data_liberado,
+                    c.data_ultimo_pagamento,
+                    c.data_proximo_vencimento
+                FROM {schema}.client c
+                WHERE c.id = %(client_id)s::bigint
+                LIMIT 1
+                """,
+                {"client_id": int(client_id)},
+            )
+            row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "client_id": int(row[0]),
+            "client_name": row[1] or row[2] or f"Cliente {row[0]}",
+            "cnpj": row[3],
+            "data_liberado": row[4].isoformat() if row[4] else None,
+            "data_ultimo_pagamento": row[5].isoformat() if row[5] else None,
+            "data_proximo_vencimento": row[6].isoformat() if row[6] else None,
+        }
+
+    def _db_list_hub_billing_clients(self) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        sql = f"""
+            SELECT
+                c.id,
+                c.fantasy_name,
+                c.legal_name,
+                c.cnpj,
+                c.access_email,
+                c.notification_email,
+                c.status,
+                c.data_liberado,
+                c.data_ultimo_pagamento,
+                c.data_proximo_vencimento,
+                COALESCE(bp.code, p.code, '-') AS plan_code,
+                COALESCE(bp.name, p.name, '-') AS plan_name,
+                COALESCE(bp.monthly_price_cents, p.monthly_price_cents, 0) AS monthly_price_cents,
+                COALESCE(EXTRACT(DAY FROM bs.starts_at), EXTRACT(DAY FROM s.starts_at))::int AS due_base_day
+            FROM {schema}.client c
+            LEFT JOIN LATERAL (
+                SELECT bs.plan_id, bs.starts_at
+                FROM {schema}.billing_subscription bs
+                WHERE bs.client_id = c.id
+                  AND bs.status = 'active'
+                ORDER BY bs.id DESC
+                LIMIT 1
+            ) bs ON TRUE
+            LEFT JOIN {schema}.billing_plan bp ON bp.id = bs.plan_id
+            LEFT JOIN LATERAL (
+                SELECT s.plan_id, s.starts_at
+                FROM {schema}.subscription s
+                WHERE s.client_id = c.id
+                  AND s.status = 'active'
+                ORDER BY s.id DESC
+                LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN {schema}.plan p ON p.id = s.plan_id
+            WHERE c.status = 'active'
+            ORDER BY c.id
+        """
+        fallback_sql = f"""
+            SELECT
+                c.id,
+                c.fantasy_name,
+                c.legal_name,
+                c.cnpj,
+                c.access_email,
+                c.notification_email,
+                c.status,
+                c.data_liberado,
+                c.data_ultimo_pagamento,
+                c.data_proximo_vencimento,
+                COALESCE(bp.code, p.code, '-') AS plan_code,
+                COALESCE(bp.name, p.name, '-') AS plan_name,
+                COALESCE(bp.monthly_price_cents, 0) AS monthly_price_cents,
+                COALESCE(EXTRACT(DAY FROM bs.starts_at), EXTRACT(DAY FROM s.starts_at))::int AS due_base_day
+            FROM {schema}.client c
+            LEFT JOIN LATERAL (
+                SELECT bs.plan_id, bs.starts_at
+                FROM {schema}.billing_subscription bs
+                WHERE bs.client_id = c.id
+                  AND bs.status = 'active'
+                ORDER BY bs.id DESC
+                LIMIT 1
+            ) bs ON TRUE
+            LEFT JOIN {schema}.billing_plan bp ON bp.id = bs.plan_id
+            LEFT JOIN LATERAL (
+                SELECT s.plan_id, s.starts_at
+                FROM {schema}.subscription s
+                WHERE s.client_id = c.id
+                  AND s.status = 'active'
+                ORDER BY s.id DESC
+                LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN {schema}.plan p ON p.id = s.plan_id
+            WHERE c.status = 'active'
+            ORDER BY c.id
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            try:
+                cur.execute(sql)
+            except Exception:
+                conn.rollback()
+                cur.execute(fallback_sql)
+            rows = cur.fetchall()
+        return [
+            {
+                "client_id": int(row[0]),
+                "cliente": row[1] or row[2] or f"Cliente {row[0]}",
+                "fantasy_name": row[1],
+                "legal_name": row[2],
+                "cnpj": row[3],
+                "access_email": row[4],
+                "email_owner": row[4],
+                "notification_email": row[5],
+                "client_status": row[6],
+                "status": row[6],
+                "data_liberado": row[7].isoformat() if row[7] else None,
+                "data_ultimo_pagamento": row[8].isoformat() if row[8] else None,
+                "data_proximo_vencimento": row[9].isoformat() if row[9] else None,
+                "data_pagamento": row[8].isoformat() if row[8] else None,
+                "data_prox_vencimento": row[9].isoformat() if row[9] else None,
+                "plano": row[11],
+                "plan_code": row[10],
+                "valor_cents": int(row[12] or 0),
+                "valor": int(row[12] or 0),
+                "due_base_day": int(row[13]) if row[13] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def _db_list_admin_clients(self) -> list[dict]:
+        if not self._is_db_enabled():
+            return []
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        sql = f"""
+            SELECT
+                c.id,
+                c.fantasy_name,
+                c.legal_name,
+                c.cnpj,
+                c.address_text,
+                COALESCE(c.bairro, ''),
+                COALESCE(c.cidade, ''),
+                COALESCE(c.uf, ''),
+                COALESCE(c.cep, ''),
+                c.contact_phone,
+                c.access_email,
+                COALESCE(c.financial_email, c.contact_email, c.access_email),
+                COALESCE(c.nf_email, c.notification_email, c.financial_email, c.contact_email, c.access_email),
+                c.status,
+                c.data_liberado,
+                c.data_ultimo_pagamento,
+                c.data_proximo_vencimento,
+                COALESCE(bp.code, p.code, '-') AS plan_code,
+                COALESCE(bp.name, p.name, '-') AS plan_name,
+                COALESCE(bp.monthly_price_cents, p.monthly_price_cents, 0) AS monthly_price_cents,
+                c.created_at
+            FROM {schema}.client c
+            LEFT JOIN LATERAL (
+                SELECT bs.plan_id
+                FROM {schema}.billing_subscription bs
+                WHERE bs.client_id = c.id
+                ORDER BY bs.id DESC
+                LIMIT 1
+            ) bs ON TRUE
+            LEFT JOIN {schema}.billing_plan bp ON bp.id = bs.plan_id
+            LEFT JOIN LATERAL (
+                SELECT s.plan_id
+                FROM {schema}.subscription s
+                WHERE s.client_id = c.id
+                ORDER BY s.id DESC
+                LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN {schema}.plan p ON p.id = s.plan_id
+            ORDER BY c.id DESC
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        return [
+            {
+                "client_id": int(row[0]),
+                "trade_name": row[1] or "",
+                "legal_name": row[2] or "",
+                "cnpj": row[3] or "",
+                "address_text": row[4] or "",
+                "bairro": row[5] or "",
+                "cidade": row[6] or "",
+                "uf": row[7] or "",
+                "cep": row[8] or "",
+                "phone_contact": row[9] or "",
+                "email_access": row[10] or "",
+                "email_financial": row[11] or "",
+                "email_nf": row[12] or "",
+                "status": row[13] or "",
+                "data_liberado": row[14].isoformat() if row[14] else None,
+                "data_ultimo_pagamento": row[15].isoformat() if row[15] else None,
+                "data_proximo_vencimento": row[16].isoformat() if row[16] else None,
+                "plan_code": row[17] or "-",
+                "plan_name": row[18] or "-",
+                "monthly_price_cents": int(row[19] or 0),
+                "created_at": row[20].isoformat() if row[20] else None,
+            }
+            for row in rows
+        ]
+
+    def _db_update_admin_client(
+        self,
+        *,
+        client_id: object,
+        trade_name: object,
+        legal_name: object,
+        cnpj: object,
+        address_text: object,
+        bairro: object,
+        cidade: object,
+        uf: object,
+        cep: object,
+        phone_contact: object,
+        email_access: object,
+        email_financial: object,
+        email_nf: object,
+        status: object,
+        plan_code: object,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        cid = int(client_id or 0)
+        if cid <= 0:
+            raise ValueError("client_id obrigatorio")
+        trade_name_v = str(trade_name or "").strip()
+        legal_name_v = str(legal_name or "").strip()
+        cnpj_v = str(cnpj or "").strip()
+        address_v = str(address_text or "").strip()
+        bairro_v = str(bairro or "").strip()
+        cidade_v = str(cidade or "").strip()
+        uf_v = str(uf or "").strip().upper()[:2]
+        cep_v = str(cep or "").strip()
+        phone_v = str(phone_contact or "").strip()
+        email_access_v = str(email_access or "").strip().lower()
+        email_financial_v = str(email_financial or "").strip().lower()
+        email_nf_v = str(email_nf or "").strip().lower()
+        status_v = str(status or "active").strip().lower()
+        plan_code_v = str(plan_code or "").strip().lower()
+        if not trade_name_v:
+            raise ValueError("Nome fantasia obrigatorio")
+        if not legal_name_v:
+            raise ValueError("Razao social obrigatoria")
+        if not cnpj_v:
+            raise ValueError("CNPJ obrigatorio")
+        if not address_v:
+            raise ValueError("Endereco obrigatorio")
+        if not bairro_v or not cidade_v or not uf_v or not cep_v:
+            raise ValueError("Bairro, cidade, UF e CEP sao obrigatorios")
+        if not phone_v:
+            raise ValueError("Telefone obrigatorio")
+        if not email_access_v or "@" not in email_access_v:
+            raise ValueError("E-mail de login invalido")
+        if not email_financial_v or "@" not in email_financial_v:
+            raise ValueError("E-mail financeiro invalido")
+        if not email_nf_v or "@" not in email_nf_v:
+            raise ValueError("E-mail NFs invalido")
+        if status_v not in {"active", "inactive", "blocked"}:
+            raise ValueError("status invalido. Use active, inactive ou blocked.")
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {schema}.client
+                   SET fantasy_name = %(trade_name)s,
+                       legal_name = %(legal_name)s,
+                       cnpj = %(cnpj)s,
+                       address_text = %(address_text)s,
+                       bairro = %(bairro)s,
+                       cidade = %(cidade)s,
+                       uf = %(uf)s,
+                       cep = %(cep)s,
+                       contact_phone = %(phone_contact)s,
+                       access_email = %(email_access)s,
+                       contact_email = %(email_financial)s,
+                       notification_email = %(email_nf)s,
+                       financial_email = %(email_financial)s,
+                       nf_email = %(email_nf)s,
+                       status = %(status)s
+                 WHERE id = %(client_id)s
+                """,
+                {
+                    "client_id": cid,
+                    "trade_name": trade_name_v,
+                    "legal_name": legal_name_v,
+                    "cnpj": cnpj_v,
+                    "address_text": address_v,
+                    "bairro": bairro_v,
+                    "cidade": cidade_v,
+                    "uf": uf_v,
+                    "cep": cep_v,
+                    "phone_contact": phone_v,
+                    "email_access": email_access_v,
+                    "email_financial": email_financial_v,
+                    "email_nf": email_nf_v,
+                    "status": status_v,
+                },
+            )
+            if cur.rowcount <= 0:
+                raise ValueError("cliente nao encontrado")
+            if plan_code_v:
+                cur.execute(f"SELECT COALESCE(MAX(tolerance_days), 5) FROM {schema}.billing_subscription WHERE client_id = %(client_id)s", {"client_id": cid})
+                row = cur.fetchone()
+                tolerance_days = int((row[0] if row else 5) or 5)
+                conn.commit()
+                self._db_upsert_billing_subscription(client_id=cid, plan_code=plan_code_v, tolerance_days=tolerance_days)
+            else:
+                conn.commit()
+        rows = self._db_list_admin_clients()
+        for item in rows:
+            if int(item.get("client_id") or 0) == cid:
+                return item
+        raise ValueError("cliente nao encontrado")
+
+    def _db_delete_admin_client(self, *, client_id: object) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        self._ensure_signup_tables()
+        schema = self.signup_schema
+        cid = int(client_id or 0)
+        if cid <= 0:
+            raise ValueError("client_id obrigatorio")
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {schema}.client
+                   SET status = 'inactive'
+                 WHERE id = %(client_id)s
+                """,
+                {"client_id": cid},
+            )
+            if cur.rowcount <= 0:
+                raise ValueError("cliente nao encontrado")
+            cur.execute(
+                f"""
+                UPDATE {schema}.tenant
+                   SET status = 'inactive'
+                 WHERE client_id = %(client_id)s
+                """,
+                {"client_id": cid},
+            )
+            cur.execute("SELECT to_regclass(%(table_name)s)", {"table_name": f"{schema}.tenant_data_source"})
+            tenant_data_source_exists = bool((cur.fetchone() or [None])[0])
+            cur.execute("SELECT to_regclass(%(table_name)s)", {"table_name": f"{schema}.data_source"})
+            data_source_exists = bool((cur.fetchone() or [None])[0])
+            if tenant_data_source_exists:
+                cur.execute(
+                    f"""
+                    UPDATE {schema}.tenant_data_source
+                       SET is_active = FALSE
+                     WHERE tenant_id IN (
+                        SELECT id FROM {schema}.tenant WHERE client_id = %(client_id)s
+                     )
+                    """,
+                    {"client_id": cid},
+                )
+            elif data_source_exists:
+                cur.execute(
+                    """
+                    SELECT LOWER(column_name)
+                    FROM information_schema.columns
+                    WHERE table_schema = %(schema)s
+                      AND table_name = 'data_source'
+                    """,
+                    {"schema": schema},
+                )
+                ds_columns = {str(row[0] or "").strip().lower() for row in (cur.fetchall() or [])}
+                if "is_active" in ds_columns and "tenant_id" in ds_columns:
+                    cur.execute(
+                        f"""
+                        UPDATE {schema}.data_source
+                           SET is_active = FALSE
+                         WHERE tenant_id IN (
+                            SELECT id FROM {schema}.tenant WHERE client_id = %(client_id)s
+                         )
+                        """,
+                        {"client_id": cid},
+                    )
+                elif "is_active" in ds_columns and "client_id" in ds_columns:
+                    cur.execute(
+                        f"""
+                        UPDATE {schema}.data_source
+                           SET is_active = FALSE
+                         WHERE client_id = %(client_id)s
+                        """,
+                        {"client_id": cid},
+                    )
+            conn.commit()
+        return {"client_id": cid, "deleted_logically": True}
+
+    def _db_build_hub_intake_client_payload(self, *, client_id: int) -> dict[str, object] | None:
+        if not self._is_db_enabled():
+            return None
+        if int(client_id or 0) <= 0:
+            return None
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    c.id,
+                    c.fantasy_name,
+                    c.legal_name,
+                    c.cnpj,
+                    COALESCE(c.contact_email, c.access_email),
+                    COALESCE(c.financial_email, c.contact_email, c.access_email),
+                    COALESCE(c.nf_email, c.notification_email, c.financial_email, c.contact_email, c.access_email),
+                    c.contact_phone,
+                    c.address_text,
+                    c.bairro,
+                    c.cidade,
+                    c.uf,
+                    c.cep,
+                    c.created_at::date AS created_date,
+                    c.status,
+                    c.data_liberado,
+                    COALESCE(bp.code, p.code, '-') AS plan_code,
+                    COALESCE(bp.monthly_price_cents, p.monthly_price_cents, 0) AS monthly_price_cents
+                FROM {schema}.client c
+                LEFT JOIN LATERAL (
+                    SELECT bs.plan_id
+                    FROM {schema}.billing_subscription bs
+                    WHERE bs.client_id = c.id
+                      AND bs.status = 'active'
+                    ORDER BY bs.id DESC
+                    LIMIT 1
+                ) bs ON TRUE
+                LEFT JOIN {schema}.billing_plan bp ON bp.id = bs.plan_id
+                LEFT JOIN LATERAL (
+                    SELECT s.plan_id
+                    FROM {schema}.subscription s
+                    WHERE s.client_id = c.id
+                      AND s.status = 'active'
+                    ORDER BY s.id DESC
+                    LIMIT 1
+                ) s ON TRUE
+                LEFT JOIN {schema}.plan p ON p.id = s.plan_id
+                WHERE c.id = %(client_id)s::bigint
+                LIMIT 1
+                """,
+                {"client_id": int(client_id)},
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        status_raw = str(row[14] or "").strip().lower()
+        status_access = "active" if status_raw in {"active", "ativo"} else ("blocked" if status_raw in {"blocked", "bloqueado"} else "inactive")
+        address_parts = [str(row[8] or "").strip(), str(row[9] or "").strip(), str(row[10] or "").strip(), str(row[11] or "").strip(), str(row[12] or "").strip()]
+        full_address = ", ".join([part for part in address_parts if part])
+        return {
+            "external_client_id": str(row[0]),
+            "nome": row[1] or row[2] or f"Cliente {row[0]}",
+            "cpf_cnpj": row[3],
+            "email_contato": row[4],
+            "email_financeiro": row[5] or row[4],
+            "email_nf": row[6] or row[5] or row[4],
+            "documento": row[3],
+            "telefone": row[7],
+            "endereco": full_address or row[8],
+            "plano": row[16],
+            "valor_cents": int(row[17] or 0),
+            "data_cadastro": row[13].isoformat() if row[13] else dt.date.today().isoformat(),
+            "status_acesso": status_access,
+            "data_liberado": row[15].isoformat() if row[15] else None,
+        }
+
+    def _send_client_to_hub_intake(self, *, client_id: int) -> dict[str, object]:
+        cfg = self._db_get_hub_integration_config()
+        intake_key = str((cfg or {}).get("intake_api_key") or "").strip()
+        intake_url = str((cfg or {}).get("intake_endpoint_url") or "").strip()
+        if not intake_key:
+            return {"sent": False, "reason": "intake_api_key_not_configured"}
+        if not intake_url:
+            return {"sent": False, "reason": "intake_endpoint_not_configured"}
+        payload = self._db_build_hub_intake_client_payload(client_id=int(client_id))
+        if not payload:
+            return {"sent": False, "reason": "client_payload_not_found"}
+        request = urllib.request.Request(
+            url=intake_url,
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-HUB-APP-KEY": intake_key,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+                data = {}
+                if raw:
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        data = {"raw": raw[:500]}
+                return {"sent": True, "status_code": int(getattr(response, "status", 200) or 200), "response": data}
+        except urllib.error.HTTPError as exc:
+            details = ""
+            try:
+                details = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                details = ""
+            return {"sent": False, "status_code": int(exc.code), "reason": details or str(exc.reason)}
+        except Exception as exc:
+            return {"sent": False, "reason": str(exc)}
+
+    def _db_update_client_release_date(
+        self,
+        *,
+        client_ref: object,
+        data_liberado: str,
+        data_ultimo_pagamento: str | None = None,
+        data_proximo_vencimento: str | None = None,
+    ) -> dict:
+        if not self._is_db_enabled():
+            raise ValueError("Banco nao configurado")
+        self._ensure_signup_tables()
+        self._ensure_client_release_date_column()
+        schema = self.signup_schema
+        data_liberado_v = str(data_liberado or "").strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", data_liberado_v):
+            raise ValueError("data_liberado invalido. Use o formato YYYY-MM-DD.")
+        data_ultimo_pagamento_v = str(data_ultimo_pagamento or "").strip() or None
+        data_proximo_vencimento_v = str(data_proximo_vencimento or "").strip() or None
+        if data_ultimo_pagamento_v and not re.match(r"^\d{4}-\d{2}-\d{2}$", data_ultimo_pagamento_v):
+            raise ValueError("data_ultimo_pagamento invalida. Use o formato YYYY-MM-DD.")
+        if data_proximo_vencimento_v and not re.match(r"^\d{4}-\d{2}-\d{2}$", data_proximo_vencimento_v):
+            raise ValueError("data_proximo_vencimento invalida. Use o formato YYYY-MM-DD.")
+        client_id: int | None = None
+        cnpj = None
+        access_email = None
+        client_name = None
+        if isinstance(client_ref, (int, float)) or str(client_ref).strip().isdigit():
+            client_id = int(client_ref)
+        else:
+            ref_text = str(client_ref or "").strip()
+            if "@" in ref_text:
+                access_email = ref_text.lower()
+            elif re.match(r"^\d{11,20}$", re.sub(r"\D+", "", ref_text)):
+                cnpj = ref_text
+            else:
+                client_name = ref_text
+        sql = f"""
+            UPDATE {schema}.client
+               SET data_liberado = %(data_liberado)s::date,
+                   data_ultimo_pagamento = COALESCE(%(data_ultimo_pagamento)s::date, data_ultimo_pagamento),
+                   data_proximo_vencimento = COALESCE(%(data_proximo_vencimento)s::date, data_proximo_vencimento)
+             WHERE (
+                (%(client_id)s::bigint IS NOT NULL AND id = %(client_id)s::bigint)
+                OR (%(cnpj)s::text IS NOT NULL AND cnpj = %(cnpj)s::text)
+                OR (%(access_email)s::text IS NOT NULL AND LOWER(access_email) = %(access_email)s::text)
+                OR (%(client_name)s::text IS NOT NULL AND (LOWER(fantasy_name) = LOWER(%(client_name)s::text) OR LOWER(legal_name) = LOWER(%(client_name)s::text)))
+             )
+            RETURNING id, fantasy_name, legal_name, cnpj, access_email, data_liberado, data_ultimo_pagamento, data_proximo_vencimento, status
+        """
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "client_id": client_id,
+                    "cnpj": cnpj,
+                    "access_email": access_email,
+                    "client_name": client_name,
+                    "data_liberado": data_liberado_v,
+                    "data_ultimo_pagamento": data_ultimo_pagamento_v,
+                    "data_proximo_vencimento": data_proximo_vencimento_v,
+                },
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("cliente nao encontrado")
+            conn.commit()
+        return {
+            "client_id": int(row[0]),
+            "cliente": row[1] or row[2] or f"Cliente {row[0]}",
+            "cnpj": row[3],
+            "access_email": row[4],
+            "email_owner": row[4],
+            "data_liberado": row[5].isoformat() if row[5] else None,
+            "data_ultimo_pagamento": row[6].isoformat() if row[6] else None,
+            "data_proximo_vencimento": row[7].isoformat() if row[7] else None,
+            "data_pagamento": row[6].isoformat() if row[6] else None,
+            "data_prox_vencimento": row[7].isoformat() if row[7] else None,
+            "status": row[8],
+        }
+
     def _db_get_billing_subscription(self, *, client_id: int) -> dict:
         if not self._is_db_enabled():
             return {}
@@ -10702,48 +12736,21 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if not self._is_db_enabled():
             return True
         schema = self.signup_schema
+        self._ensure_client_release_date_column()
         sql = f"""
             SELECT EXISTS (
                 SELECT 1
                 FROM {schema}.tenant t
                 JOIN {schema}.client c ON c.id = t.client_id
-                LEFT JOIN {schema}.v_client_billing_delinquency d ON d.client_id = t.client_id
                 WHERE t.id = %(tenant_id)s
                   AND t.client_id = %(client_id)s
                   AND t.status = 'active'
                   AND c.status = 'active'
-                  AND d.client_id IS NULL
-            ) AS ok
-        """
-        fallback_sql = f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {schema}.tenant t
-                JOIN {schema}.client c ON c.id = t.client_id
-                WHERE t.id = %(tenant_id)s
-                  AND t.client_id = %(client_id)s
-                  AND t.status = 'active'
-                  AND c.status = 'active'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.installment inst
-                      JOIN {schema}.invoice inv ON inv.id = inst.invoice_id
-                      LEFT JOIN {schema}.subscription sub
-                        ON sub.client_id = t.client_id
-                       AND sub.status = 'active'
-                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
-                      LEFT JOIN {schema}.plan p ON p.id = sub.plan_id
-                      WHERE inv.client_id = t.client_id
-                        AND inst.status IN ('open', 'overdue')
-                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
-                  )
+                  AND COALESCE(c.data_liberado, CURRENT_DATE) >= CURRENT_DATE
             ) AS ok
         """
         with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
-            try:
-                cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
-            except Exception:
-                cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
+            cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
             row = cur.fetchone()
         return bool(row and row[0])
 

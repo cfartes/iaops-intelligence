@@ -202,7 +202,7 @@ class MCPRepository(ABC):
         self,
         client_id: int,
         *,
-        tenant_id: int,
+        tenant_id: int | None,
         user_id: int | None = None,
         channel_type: str,
         external_user_key: str,
@@ -1128,7 +1128,7 @@ class InMemoryMCPRepository(MCPRepository):
             None,
         )
         if not binding or int(binding.get("client_id", 0)) != int(client_id):
-            raise ValueError("identidade do canal nao vinculada a tenant")
+            raise ValueError("identidade do canal nao vinculada a cliente")
         tenant_id = int(binding.get("tenant_id") or 0)
         user = self._users.get(int(binding.get("user_id") or 0)) if binding.get("user_id") else None
         tenants = []
@@ -1160,8 +1160,21 @@ class InMemoryMCPRepository(MCPRepository):
                             "role": role,
                         }
                     )
+        else:
+            for item in all_tenants:
+                if str(item.get("status", "")).lower() != "active":
+                    continue
+                tenants.append(
+                    {
+                        "tenant_id": item["id"],
+                        "name": item["name"],
+                        "slug": item["slug"],
+                        "status": item["status"],
+                        "role": "owner",
+                    }
+                )
         if not tenants:
-            raise ValueError("canal sem tenant vinculado")
+            raise ValueError("canal sem tenant vinculado ao cliente")
         return {
             "user": {"user_id": user["id"], "email": user["email"], "full_name": user["full_name"]} if user else {},
             "tenants": tenants,
@@ -1196,7 +1209,7 @@ class InMemoryMCPRepository(MCPRepository):
         self,
         client_id: int,
         *,
-        tenant_id: int,
+        tenant_id: int | None,
         user_id: int | None = None,
         channel_type: str,
         external_user_key: str,
@@ -1208,16 +1221,18 @@ class InMemoryMCPRepository(MCPRepository):
             raise ValueError("channel_type invalido")
         if not normalized_external:
             raise ValueError("external_user_key obrigatorio")
-        selected_tenant = next(
-            (
-                item
-                for item in self._client_tenants.get(client_id, [])
-                if int(item["id"]) == int(tenant_id)
-            ),
-            None,
-        )
-        if not selected_tenant:
-            raise ValueError("tenant_id invalido")
+        selected_tenant = None
+        if tenant_id is not None:
+            selected_tenant = next(
+                (
+                    item
+                    for item in self._client_tenants.get(client_id, [])
+                    if int(item["id"]) == int(tenant_id)
+                ),
+                None,
+            )
+            if not selected_tenant:
+                raise ValueError("tenant_id invalido")
         user = None
         if user_id is not None:
             user = self._users.get(int(user_id))
@@ -1237,7 +1252,7 @@ class InMemoryMCPRepository(MCPRepository):
         )
         if existing:
             existing["client_id"] = int(client_id)
-            existing["tenant_id"] = int(tenant_id)
+            existing["tenant_id"] = int(tenant_id) if tenant_id is not None else None
             existing["user_id"] = int(user_id) if user_id is not None else None
             existing["is_active"] = bool(is_active)
             existing["updated_at"] = now_iso
@@ -1246,7 +1261,7 @@ class InMemoryMCPRepository(MCPRepository):
             row = {
                 "id": int(self._channel_binding_seq),
                 "client_id": int(client_id),
-                "tenant_id": int(tenant_id),
+                "tenant_id": int(tenant_id) if tenant_id is not None else None,
                 "user_id": int(user_id) if user_id is not None else None,
                 "channel_type": normalized_channel,
                 "external_user_key": normalized_external,
@@ -1258,7 +1273,7 @@ class InMemoryMCPRepository(MCPRepository):
             self._channel_bindings.append(row)
         return {
             **row,
-            "tenant_name": selected_tenant.get("name"),
+            "tenant_name": selected_tenant.get("name") if selected_tenant else None,
             "user_email": user.get("email") if user else None,
             "user_full_name": user.get("full_name") if user else None,
         }
@@ -1292,7 +1307,7 @@ class InMemoryMCPRepository(MCPRepository):
             raise ValueError("tenant nao permitido para este usuario/canal")
         self._channel_context[(channel_type, conversation_key)] = {
             "client_id": client_id,
-            "user_id": resolved["user"]["user_id"],
+            "user_id": (resolved.get("user") or {}).get("user_id"),
             "active_tenant_id": int(tenant_id),
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }

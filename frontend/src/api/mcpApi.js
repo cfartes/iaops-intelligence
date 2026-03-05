@@ -464,6 +464,14 @@ export async function getTenantLimits() {
   return parseResponse(response);
 }
 
+export async function getClientBillingInfo() {
+  const response = await fetch("/api/client/billing-info", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
 export async function createTenant(payload) {
   const response = await fetch("/api/tenants", {
     method: "POST",
@@ -556,6 +564,66 @@ export async function sendAdminSmtpTestEmail(payload) {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function getAdminHubConfig() {
+  const response = await fetch("/api/admin/hub/config", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function updateAdminHubConfig(payload) {
+  const response = await fetch("/api/admin/hub/config", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse(response);
+}
+
+export async function listAdminHubBillingClients() {
+  const response = await fetch("/api/admin/hub/billing/clients", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function testAdminHubIntake(payload) {
+  const response = await fetch("/api/admin/hub/intake/test", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload || {}),
+  });
+  return parseResponse(response);
+}
+
+export async function listAdminClients() {
+  const response = await fetch("/api/admin/clients", {
+    method: "GET",
+    headers: buildHeaders(),
+  });
+  return parseResponse(response);
+}
+
+export async function updateAdminClient(payload) {
+  const response = await fetch("/api/admin/clients/update", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload || {}),
+  });
+  return parseResponse(response);
+}
+
+export async function deleteAdminClient(payload) {
+  const response = await fetch("/api/admin/clients/delete", {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(payload || {}),
   });
   return parseResponse(response);
 }
@@ -764,8 +832,11 @@ export async function channelWebhookWhatsapp(payload) {
   return parseWebhookResponse(response);
 }
 
-export async function listChannelBindings(channelType) {
-  const query = channelType ? `?channel_type=${encodeURIComponent(channelType)}` : "";
+export async function listChannelBindings(channelType, clientId = null) {
+  const params = new URLSearchParams();
+  if (channelType) params.set("channel_type", String(channelType));
+  if (clientId != null && String(clientId).trim() !== "") params.set("client_id", String(clientId));
+  const query = params.toString() ? `?${params.toString()}` : "";
   const response = await fetch(`/api/channel/bindings${query}`, {
     method: "GET",
     headers: buildHeaders(),

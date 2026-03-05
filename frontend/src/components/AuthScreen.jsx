@@ -1,14 +1,43 @@
 import { useMemo, useState } from "react";
 
+const digitsOnly = (value) => String(value || "").replace(/\D+/g, "");
+
+const maskCpfCnpj = (value) => {
+  const v = digitsOnly(value).slice(0, 14);
+  if (v.length <= 11) {
+    return v
+      .replace(/^(\d{3})(\d)/, "$1.$2")
+      .replace(/^(\d{3})\.(\d{3})(\d)/, "$1.$2.$3")
+      .replace(/\.(\d{3})(\d)/, ".$1-$2");
+  }
+  return v
+    .replace(/^(\d{2})(\d)/, "$1.$2")
+    .replace(/^(\d{2})\.(\d{3})(\d)/, "$1.$2.$3")
+    .replace(/\.(\d{3})(\d)/, ".$1/$2")
+    .replace(/(\d{4})(\d)/, "$1-$2");
+};
+
+const maskPhone = (value) => {
+  const v = digitsOnly(value).slice(0, 11);
+  if (v.length <= 10) return v.replace(/^(\d{2})(\d)/, "($1) $2").replace(/(\d{4})(\d)/, "$1-$2");
+  return v.replace(/^(\d{2})(\d)/, "($1) $2").replace(/(\d{5})(\d)/, "$1-$2");
+};
+
+const maskCep = (value) => digitsOnly(value).slice(0, 8).replace(/^(\d{5})(\d)/, "$1-$2");
+
 const SIGNUP_TEMPLATE = {
   trade_name: "",
   legal_name: "",
   cnpj: "",
   address_text: "",
+  bairro: "",
+  cidade: "",
+  uf: "",
+  cep: "",
   phone_contact: "",
-  email_contact: "",
   email_access: "",
-  email_notification: "",
+  email_financial: "",
+  email_nf: "",
   password: "",
   plan_code: "starter",
   language_code: "pt-BR",
@@ -55,10 +84,14 @@ export default function AuthScreen({
       signupForm.legal_name &&
       signupForm.cnpj &&
       signupForm.address_text &&
+      signupForm.bairro &&
+      signupForm.cidade &&
+      signupForm.uf &&
+      signupForm.cep &&
       signupForm.phone_contact &&
-      signupForm.email_contact &&
       signupForm.email_access &&
-      signupForm.email_notification &&
+      signupForm.email_financial &&
+      signupForm.email_nf &&
       signupForm.password &&
       signupForm.plan_code &&
       signupForm.language_code,
@@ -317,27 +350,43 @@ export default function AuthScreen({
                   </label>
                   <label>
                     {labels.signup.cnpj}
-                    <input value={signupForm.cnpj} onChange={(e) => setSignupForm((prev) => ({ ...prev, cnpj: e.target.value }))} />
+                    <input value={signupForm.cnpj} onChange={(e) => setSignupForm((prev) => ({ ...prev, cnpj: maskCpfCnpj(e.target.value) }))} />
                   </label>
                   <label>
                     {labels.signup.address_text}
                     <input value={signupForm.address_text} onChange={(e) => setSignupForm((prev) => ({ ...prev, address_text: e.target.value }))} />
                   </label>
                   <label>
-                    {labels.signup.phone_contact}
-                    <input value={signupForm.phone_contact} onChange={(e) => setSignupForm((prev) => ({ ...prev, phone_contact: e.target.value }))} />
+                    {labels.signup.bairro}
+                    <input value={signupForm.bairro} onChange={(e) => setSignupForm((prev) => ({ ...prev, bairro: e.target.value }))} />
                   </label>
                   <label>
-                    {labels.signup.email_contact}
-                    <input type="email" value={signupForm.email_contact} onChange={(e) => setSignupForm((prev) => ({ ...prev, email_contact: e.target.value }))} />
+                    {labels.signup.cidade}
+                    <input value={signupForm.cidade} onChange={(e) => setSignupForm((prev) => ({ ...prev, cidade: e.target.value }))} />
+                  </label>
+                  <label>
+                    {labels.signup.uf}
+                    <input value={signupForm.uf} onChange={(e) => setSignupForm((prev) => ({ ...prev, uf: String(e.target.value || "").toUpperCase().slice(0, 2) }))} />
+                  </label>
+                  <label>
+                    {labels.signup.cep}
+                    <input value={signupForm.cep} onChange={(e) => setSignupForm((prev) => ({ ...prev, cep: maskCep(e.target.value) }))} />
+                  </label>
+                  <label>
+                    {labels.signup.phone_contact}
+                    <input value={signupForm.phone_contact} onChange={(e) => setSignupForm((prev) => ({ ...prev, phone_contact: maskPhone(e.target.value) }))} />
+                  </label>
+                  <label>
+                    {labels.signup.email_financial}
+                    <input type="email" value={signupForm.email_financial} onChange={(e) => setSignupForm((prev) => ({ ...prev, email_financial: e.target.value }))} />
                   </label>
                   <label>
                     {labels.signup.email_access}
                     <input type="email" value={signupForm.email_access} onChange={(e) => setSignupForm((prev) => ({ ...prev, email_access: e.target.value }))} />
                   </label>
                   <label>
-                    {labels.signup.email_notification}
-                    <input type="email" value={signupForm.email_notification} onChange={(e) => setSignupForm((prev) => ({ ...prev, email_notification: e.target.value }))} />
+                    {labels.signup.email_nf}
+                    <input type="email" value={signupForm.email_nf} onChange={(e) => setSignupForm((prev) => ({ ...prev, email_nf: e.target.value }))} />
                   </label>
                   <label>
                     {labels.signup.password}

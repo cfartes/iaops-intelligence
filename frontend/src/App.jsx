@@ -21,7 +21,6 @@ import AccessPanel from "./pages/AccessPanel";
 import ConfiguracaoPanel from "./pages/ConfiguracaoPanel";
 import LgpdPanel from "./pages/LgpdPanel";
 import BillingPanel from "./pages/BillingPanel";
-import InstallmentsPanel from "./pages/InstallmentsPanel";
 import { NAV_ITEMS } from "./state/nav";
 import {
   createIncident,
@@ -99,7 +98,7 @@ export default function App() {
       NAV_ITEMS.filter((item) => {
         if (item.key === "seguranca-sql" && !isSuperadmin) return false;
         if (!isGlobalSuperadmin) return true;
-        return ["configuracao", "faturamento", "parcelas", "seguranca-sql"].includes(item.key);
+        return ["configuracao", "seguranca-sql", "faturamento"].includes(item.key);
       }).map((item) => ({
         ...item,
         label: uiText.nav[item.key] || item.label,
@@ -615,6 +614,7 @@ export default function App() {
       "chat-bi": <ChatBiPanel onSystemMessage={openSystemMessage} />,
       eventos: <EventsPanel onSystemMessage={openSystemMessage} />,
       operacao: <OperationPanel onSystemMessage={openSystemMessage} />,
+      faturamento: <BillingPanel onSystemMessage={openSystemMessage} />,
       auditoria: <AuditPanel onSystemMessage={openSystemMessage} />,
       "seguranca-sql": <SqlSecurityPanel onSystemMessage={openSystemMessage} />,
       acesso: <AccessPanel onSystemMessage={openSystemMessage} />,
@@ -630,8 +630,6 @@ export default function App() {
         />
       ),
       lgpd: <LgpdPanel onSystemMessage={openSystemMessage} />,
-      faturamento: <BillingPanel onSystemMessage={openSystemMessage} />,
-      parcelas: <InstallmentsPanel onSystemMessage={openSystemMessage} />,
       incidentes: (
         <IncidentPanel
           onOpenCreate={() => setIsIncidentModalOpen(true)}

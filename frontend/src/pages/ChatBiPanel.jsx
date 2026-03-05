@@ -102,7 +102,7 @@ export default function ChatBiPanel({ onSystemMessage }) {
         onSystemMessage(
           "warning",
           "Tenant bloqueado",
-          "Tenant bloqueado por inadimplencia ou inatividade. Regularize o faturamento para continuar usando o Chat BI.",
+          "Tenant bloqueado. Verifique status do tenant e DataLiberado do cliente para continuar usando o Chat BI.",
         );
       } else {
         onSystemMessage("error", tUi("chat.fail.title", "Falha no Chat BI"), error.message);

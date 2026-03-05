@@ -11,6 +11,5 @@ export const NAV_ITEMS = [
   { key: "lgpd", label: "LGPD" },
   { key: "operacao", label: "Operacao" },
   { key: "faturamento", label: "Faturamento (Owner)" },
-  { key: "parcelas", label: "Parcelas (Owner)" },
   { key: "configuracao", label: "Configuracao" },
 ];

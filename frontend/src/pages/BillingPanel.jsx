@@ -15,6 +15,20 @@ import {
   upsertBillingSubscription,
 } from "../api/mcpApi";
 
+const formatCentsToBrl = (cents) => {
+  const value = Number(cents || 0) / 100;
+  return value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+
+const parseBrlToCents = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const normalized = raw.replace(/\./g, "").replace(",", ".");
+  const num = Number(normalized);
+  if (!Number.isFinite(num) || num < 0) return 0;
+  return Math.round(num * 100);
+};
+
 export default function BillingPanel({ onSystemMessage }) {
   const auth = getAuthContext();
   const authRole = String(auth?.role || "").toLowerCase();
@@ -43,7 +57,7 @@ export default function BillingPanel({ onSystemMessage }) {
     max_users: 1,
     max_data_sources_per_client: 10,
     max_data_sources_per_tenant: 5,
-    monthly_price_cents: 0,
+    monthly_price_brl: "0,00",
     is_active: true,
   });
 
@@ -103,7 +117,7 @@ export default function BillingPanel({ onSystemMessage }) {
       max_users: 1,
       max_data_sources_per_client: 10,
       max_data_sources_per_tenant: 5,
-      monthly_price_cents: 0,
+      monthly_price_brl: "0,00",
       is_active: true,
     });
     setPlanModalOpen(true);
@@ -118,7 +132,7 @@ export default function BillingPanel({ onSystemMessage }) {
       max_users: Number(item?.max_users || 1),
       max_data_sources_per_client: Number(item?.max_data_sources_per_client || 10),
       max_data_sources_per_tenant: Number(item?.max_data_sources_per_tenant || 5),
-      monthly_price_cents: Number(item?.monthly_price_cents || 0),
+      monthly_price_brl: formatCentsToBrl(item?.monthly_price_cents || 0),
       is_active: Boolean(item?.is_active),
     });
     setPlanModalOpen(true);
@@ -134,7 +148,7 @@ export default function BillingPanel({ onSystemMessage }) {
         max_users: Number(planDraft.max_users || 1),
         max_data_sources_per_client: Number(planDraft.max_data_sources_per_client || 10),
         max_data_sources_per_tenant: Number(planDraft.max_data_sources_per_tenant || 5),
-        monthly_price_cents: Number(planDraft.monthly_price_cents || 0),
+        monthly_price_cents: parseBrlToCents(planDraft.monthly_price_brl),
         is_active: Boolean(planDraft.is_active),
       });
       setPlanModalOpen(false);
@@ -308,7 +322,7 @@ export default function BillingPanel({ onSystemMessage }) {
         </div>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>Codigo</th><th>Nome</th><th>Tenants</th><th>Usuarios</th><th>Fontes/cliente</th><th>Fontes/tenant</th><th>Preco (cent)</th><th>Status</th>{isGlobalSuperadmin ? <th>Acoes</th> : null}</tr></thead>
+            <thead><tr><th>Codigo</th><th>Nome</th><th>Tenants</th><th>Usuarios</th><th>Fontes/cliente</th><th>Fontes/tenant</th><th>Preco mensal</th><th>Status</th>{isGlobalSuperadmin ? <th>Acoes</th> : null}</tr></thead>
             <tbody>
               {displayedPlans.map((item) => (
                 <tr key={item.id}>
@@ -318,7 +332,7 @@ export default function BillingPanel({ onSystemMessage }) {
                   <td>{item.max_users}</td>
                   <td>{item.max_data_sources_per_client ?? "-"}</td>
                   <td>{item.max_data_sources_per_tenant ?? "-"}</td>
-                  <td>{item.monthly_price_cents}</td>
+                  <td>R$ {formatCentsToBrl(item.monthly_price_cents)}</td>
                   <td>{item.is_active ? "Ativo" : "Inativo"}</td>
                   {isGlobalSuperadmin ? (
                     <td>
@@ -464,8 +478,15 @@ export default function BillingPanel({ onSystemMessage }) {
               <label>Max fontes/tenant
                 <input type="number" min={1} value={planDraft.max_data_sources_per_tenant} onChange={(e) => setPlanDraft((prev) => ({ ...prev, max_data_sources_per_tenant: e.target.value }))} />
               </label>
-              <label>Preco mensal (cent)
-                <input type="number" min={0} value={planDraft.monthly_price_cents} onChange={(e) => setPlanDraft((prev) => ({ ...prev, monthly_price_cents: e.target.value }))} />
+              <label>Preco mensal (R$)
+                <input
+                  value={planDraft.monthly_price_brl}
+                  onChange={(e) => {
+                    const cleaned = String(e.target.value || "").replace(/[^\d.,]/g, "");
+                    setPlanDraft((prev) => ({ ...prev, monthly_price_brl: cleaned }));
+                  }}
+                  placeholder="999,00"
+                />
               </label>
               <label className="checkbox-inline">
                 <input type="checkbox" checked={Boolean(planDraft.is_active)} onChange={(e) => setPlanDraft((prev) => ({ ...prev, is_active: e.target.checked }))} />

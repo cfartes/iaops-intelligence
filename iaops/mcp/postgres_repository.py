@@ -202,73 +202,32 @@ class PostgresMCPRepository(MCPRepository):
     def is_tenant_operational(self, client_id: int, tenant_id: int) -> bool:
         if int(tenant_id) <= 0:
             return True
+        with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"ALTER TABLE {self.schema}.client ADD COLUMN IF NOT EXISTS data_liberado DATE"
+            )
+            cur.execute(
+                f"""
+                UPDATE {self.schema}.client
+                   SET data_liberado = CURRENT_DATE + INTERVAL '30 days'
+                 WHERE data_liberado IS NULL
+                """
+            )
+            conn.commit()
         sql = f"""
             SELECT EXISTS (
                 SELECT 1
                 FROM {self.schema}.tenant t
                 JOIN {self.schema}.client c ON c.id = t.client_id
-                LEFT JOIN {self.schema}.v_client_billing_delinquency d ON d.client_id = t.client_id
                 WHERE t.id = %(tenant_id)s
                   AND t.client_id = %(client_id)s
                   AND t.status = 'active'
                   AND c.status = 'active'
-                  AND d.client_id IS NULL
-            ) AS ok
-        """
-        fallback_sql = f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {self.schema}.tenant t
-                JOIN {self.schema}.client c ON c.id = t.client_id
-                WHERE t.id = %(tenant_id)s
-                  AND t.client_id = %(client_id)s
-                  AND t.status = 'active'
-                  AND c.status = 'active'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {self.schema}.installment inst
-                      JOIN {self.schema}.invoice inv ON inv.id = inst.invoice_id
-                      LEFT JOIN {self.schema}.subscription sub
-                        ON sub.client_id = t.client_id
-                       AND sub.status = 'active'
-                       AND (sub.ends_at IS NULL OR sub.ends_at >= NOW())
-                      LEFT JOIN {self.schema}.plan p ON p.id = sub.plan_id
-                      WHERE inv.client_id = t.client_id
-                        AND inst.status IN ('open', 'overdue')
-                        AND inst.due_date < CURRENT_DATE - COALESCE(p.late_tolerance_days, 0)
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {self.schema}.billing_installment bi
-                      JOIN {self.schema}.billing_subscription bs ON bs.id = bi.subscription_id
-                      WHERE bs.client_id = t.client_id
-                        AND bs.status = 'active'
-                        AND bi.status IN ('open', 'overdue')
-                        AND bi.due_date < CURRENT_DATE - COALESCE(bs.tolerance_days, 5)
-                  )
-            ) AS ok
-        """
-        basic_sql = f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {self.schema}.tenant t
-                JOIN {self.schema}.client c ON c.id = t.client_id
-                WHERE t.id = %(tenant_id)s
-                  AND t.client_id = %(client_id)s
-                  AND t.status = 'active'
-                  AND c.status = 'active'
+                  AND COALESCE(c.data_liberado, CURRENT_DATE) >= CURRENT_DATE
             ) AS ok
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            try:
-                cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
-            except Exception:
-                conn.rollback()
-                try:
-                    cur.execute(fallback_sql, {"client_id": client_id, "tenant_id": tenant_id})
-                except Exception:
-                    conn.rollback()
-                    cur.execute(basic_sql, {"client_id": client_id, "tenant_id": tenant_id})
+            cur.execute(sql, {"client_id": client_id, "tenant_id": tenant_id})
             row = cur.fetchone()
         return bool(row and row["ok"])
 
@@ -1215,6 +1174,23 @@ class PostgresMCPRepository(MCPRepository):
                     },
                 )
                 tenants = cur.fetchall()
+            else:
+                cur.execute(
+                    f"""
+                    SELECT
+                        t.id AS tenant_id,
+                        t.name,
+                        t.slug,
+                        t.status,
+                        'owner'::text AS role
+                    FROM {self.schema}.tenant t
+                    WHERE t.client_id = %(client_id)s
+                      AND t.status = 'active'
+                    ORDER BY t.id
+                    """,
+                    {"client_id": int(client_id)},
+                )
+                tenants = cur.fetchall()
         if not tenants:
             raise ValueError("canal sem tenant vinculado")
         return {
@@ -1263,7 +1239,7 @@ class PostgresMCPRepository(MCPRepository):
         self,
         client_id: int,
         *,
-        tenant_id: int,
+        tenant_id: int | None = None,
         user_id: int | None = None,
         channel_type: str,
         external_user_key: str,
@@ -1319,10 +1295,11 @@ class PostgresMCPRepository(MCPRepository):
             RETURNING id
         """
         with connect(self.dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(tenant_sql, {"tenant_id": int(tenant_id), "client_id": int(client_id)})
-            tenant_row = cur.fetchone()
-            if not tenant_row:
-                raise ValueError("tenant_id invalido")
+            if tenant_id is not None:
+                cur.execute(tenant_sql, {"tenant_id": int(tenant_id), "client_id": int(client_id)})
+                tenant_row = cur.fetchone()
+                if not tenant_row:
+                    raise ValueError("tenant_id invalido")
             user_row = None
             if user_id is not None:
                 cur.execute(user_sql, {"user_id": int(user_id)})
@@ -1335,7 +1312,7 @@ class PostgresMCPRepository(MCPRepository):
                 upsert_sql,
                 {
                     "client_id": int(client_id),
-                    "tenant_id": int(tenant_id),
+                    "tenant_id": int(tenant_id) if tenant_id is not None else None,
                     "user_id": int(user_id) if user_id is not None else None,
                     "channel_type": normalized_channel,
                     "external_user_key": normalized_external,
@@ -1420,7 +1397,7 @@ class PostgresMCPRepository(MCPRepository):
                 upsert_sql,
                 {
                     "client_id": client_id,
-                    "user_id": resolved["user"]["user_id"],
+                    "user_id": (resolved.get("user") or {}).get("user_id"),
                     "channel_type": channel_type,
                     "conversation_key": conversation_key,
                     "active_tenant_id": tenant_id,
