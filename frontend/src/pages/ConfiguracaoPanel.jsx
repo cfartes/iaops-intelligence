@@ -116,6 +116,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     external_user_key: "",
     is_active: true,
   });
+  const [configTab, setConfigTab] = useState("security");
 
   const loadStatus = async () => {
     setLoading(true);
@@ -147,6 +148,10 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       loadUserPreference();
       loadSessions();
     }
+  }, [isGlobalSuperadmin]);
+
+  useEffect(() => {
+    setConfigTab("security");
   }, [isGlobalSuperadmin]);
 
   const loadClientBillingInfo = async () => {
@@ -1004,53 +1009,90 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
     return true;
   });
 
+  const configTabs = isGlobalSuperadmin
+    ? [
+        { id: "security", label: "Seguranca" },
+        { id: "billing", label: "Pagamento" },
+        { id: "channels", label: "Canais" },
+        { id: "smtp", label: "SMTP" },
+        { id: "hub", label: "HUB Faturamento" },
+        { id: "clients", label: "Clientes" },
+        { id: "appLlm", label: "LLM App" },
+      ]
+    : [
+        { id: "security", label: "Seguranca" },
+        { id: "billing", label: "Pagamento" },
+        { id: "preferences", label: "Preferencias" },
+        { id: "sessions", label: "Sessoes" },
+        { id: "tenantLlm", label: "LLM Tenant" },
+      ];
+
   return (
     <section className="page-panel">
       <header>
         <h2>{tUi("config.header.title", "Configuracao")}</h2>
         <p>{tUi("config.header.subtitle", "MFA por usuario com TOTP (ativacao voluntaria).")}</p>
       </header>
-      {loading ? (
-        <p className="empty-state">{tUi("config.loading.mfa", "Carregando configuracao MFA...")}</p>
-      ) : (
-        <>
-          <div className="metric-grid">
-            <article className="metric-card">
-              <h4>{tUi("config.mfa.status", "Status MFA")}</h4>
-              <p>{mfa?.enabled ? tUi("access.mfa.enabled", "Habilitado") : tUi("access.mfa.disabled", "Desabilitado")}</p>
-            </article>
-            <article className="metric-card">
-              <h4>{tUi("config.mfa.pending", "Setup pendente")}</h4>
-              <p>{mfa?.has_pending_setup ? tUi("common.yes", "Sim") : tUi("common.no", "Nao")}</p>
-            </article>
-          </div>
+      <div className="config-tabs" role="tablist" aria-label="Abas de configuracao">
+        {configTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={configTab === tab.id}
+            className={`config-tab ${configTab === tab.id ? "active" : ""}`}
+            onClick={() => setConfigTab(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-          <div className="page-actions">
-            <button type="button" className="btn btn-primary" onClick={startSetup} disabled={submitting}>
-              {tUi("config.mfa.enable", "Ativar MFA")}
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setModalMode("disable")}
-              disabled={submitting || !mfa?.enabled}
-            >
-              {tUi("config.mfa.disable", "Desativar MFA")}
-            </button>
-            <button type="button" className="btn btn-secondary" onClick={loadStatus}>
-              {tUi("config.refresh.status", "Atualizar Status")}
-            </button>
-            <button type="button" className="btn btn-secondary" onClick={loadClientBillingInfo}>
-              Atualizar Pagamento
-            </button>
-          </div>
-        </>
-      )}
+      {configTab === "security" &&
+        (loading ? (
+          <p className="empty-state">{tUi("config.loading.mfa", "Carregando configuracao MFA...")}</p>
+        ) : (
+          <>
+            <div className="metric-grid">
+              <article className="metric-card">
+                <h4>{tUi("config.mfa.status", "Status MFA")}</h4>
+                <p>{mfa?.enabled ? tUi("access.mfa.enabled", "Habilitado") : tUi("access.mfa.disabled", "Desabilitado")}</p>
+              </article>
+              <article className="metric-card">
+                <h4>{tUi("config.mfa.pending", "Setup pendente")}</h4>
+                <p>{mfa?.has_pending_setup ? tUi("common.yes", "Sim") : tUi("common.no", "Nao")}</p>
+              </article>
+            </div>
 
+            <div className="page-actions">
+              <button type="button" className="btn btn-primary" onClick={startSetup} disabled={submitting}>
+                {tUi("config.mfa.enable", "Ativar MFA")}
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setModalMode("disable")}
+                disabled={submitting || !mfa?.enabled}
+              >
+                {tUi("config.mfa.disable", "Desativar MFA")}
+              </button>
+              <button type="button" className="btn btn-secondary" onClick={loadStatus}>
+                {tUi("config.refresh.status", "Atualizar Status")}
+              </button>
+            </div>
+          </>
+        ))}
+
+      {configTab === "billing" && (
       <section className="catalog-block">
         <header>
           <h3>Informacoes de Pagamento (somente leitura)</h3>
         </header>
+        <div className="page-actions">
+          <button type="button" className="btn btn-secondary" onClick={loadClientBillingInfo}>
+            Atualizar Pagamento
+          </button>
+        </div>
         <div className="table-wrap">
           <table className="data-table">
             <tbody>
@@ -1070,8 +1112,9 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
           </table>
         </div>
       </section>
+      )}
 
-      {!isGlobalSuperadmin && (
+      {!isGlobalSuperadmin && configTab === "preferences" && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.pref.title", "Preferencias Usuario + Tenant")}</h3>
@@ -1118,7 +1161,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "channels" && (
       <section className="catalog-block">
         <header>
           <h3>Vinculo Canal x Cliente</h3>
@@ -1305,7 +1348,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "channels" && (
       <section className="catalog-block">
         <header>
           <h3>Canais do Cliente (Telegram/WhatsApp)</h3>
@@ -1410,7 +1453,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {!isGlobalSuperadmin && (
+      {!isGlobalSuperadmin && configTab === "sessions" && (
       <section className="catalog-block">
         <div className="section-header">
           <h3>{tUi("config.sessions.title", "Sessoes do usuario")}</h3>
@@ -1470,7 +1513,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {!isGlobalSuperadmin && (
+      {!isGlobalSuperadmin && configTab === "tenantLlm" && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.tenantLlm.title", "LLM do Tenant")}</h3>
@@ -1513,7 +1556,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "smtp" && (
       <section className="catalog-block">
         <header>
           <h3>SMTP do App (Superadmin)</h3>
@@ -1559,7 +1602,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "hub" && (
       <section className="catalog-block">
         <header>
           <h3>Integracao HUB de Faturamento (Superadmin)</h3>
@@ -1659,7 +1702,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "clients" && (
       <section className="catalog-block">
         <header>
           <h3>Clientes Cadastrados (Superadmin)</h3>
@@ -1719,7 +1762,7 @@ export default function ConfiguracaoPanel({ onSystemMessage, onNavigate, onPrefe
       </section>
       )}
 
-      {isGlobalSuperadmin && (
+      {isGlobalSuperadmin && configTab === "appLlm" && (
       <section className="catalog-block">
         <header>
           <h3>{tUi("config.appLlm.title", "LLM Padrao do App (Superadmin)")}</h3>

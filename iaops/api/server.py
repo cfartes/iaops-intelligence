@@ -1495,7 +1495,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            app_name = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+            app_name = "IAOps Governance"
             rows = self._db_list_hub_billing_clients()
             self._send_json(
                 HTTPStatus.OK,
@@ -7934,7 +7934,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return
         try:
             rows = self._db_list_hub_billing_clients()
-            app_name = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+            app_name = "IAOps Governance"
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -8017,7 +8017,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                     "status": "success",
                     "tool": "billing_hub.update_release_date",
                     "correlation_id": str(uuid.uuid4()),
-                    "data": {"app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"), "client": row},
+                    "data": {"app_name": "IAOps Governance", "client": row},
                     "error": None,
                 },
             )
@@ -8360,7 +8360,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         try:
             if tool_name == "billing_hub.list_clients":
                 data = {
-                    "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+                    "app_name": "IAOps Governance",
                     "clients": self._db_list_hub_billing_clients(),
                 }
             elif tool_name == "billing_hub.update_release_date":
@@ -8388,7 +8388,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
                         data_proximo_vencimento=next_due,
                     )
                 }
-                data["app_name"] = str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance")
+                data["app_name"] = "IAOps Governance"
             else:
                 return {
                     "status": "denied",
@@ -8695,7 +8695,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             if env_intake_key:
                 intake_masked = f"{env_intake_key[:4]}...{env_intake_key[-4:]}" if len(env_intake_key) > 8 else ("*" * len(env_intake_key))
             return {
-                "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+                "app_name": "IAOps Governance",
                 "has_hub_api_key": False,
                 "hub_api_key": None,
                 "hub_api_key_masked": "-",
@@ -8767,7 +8767,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             else:
                 intake_masked = f"{intake_key[:4]}...{intake_key[-4:]}"
         return {
-            "app_name": str(os.getenv("IAOPS_APP_NAME") or "IAOps Governance"),
+            "app_name": "IAOps Governance",
             "has_hub_api_key": bool(key),
             "hub_api_key": key or None,
             "hub_api_key_masked": masked,
