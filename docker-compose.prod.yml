@@ -1,0 +1,38 @@
+services:
+  db:
+    ports: []
+
+  redis:
+    ports: []
+
+  api:
+    ports: []
+    environment:
+      IAOPS_SIGNUP_CONFIRM_URL_BASE: ${IAOPS_SIGNUP_CONFIRM_URL_BASE:-https://${IAOPS_DOMAIN}/api/auth/confirm-link}
+      IAOPS_HUB_BASE_URL: ${IAOPS_HUB_BASE_URL:-}
+      IAOPS_HUB_INTAKE_URL: ${IAOPS_HUB_INTAKE_URL:-}
+      IAOPS_HUB_INTAKE_API_KEY: ${IAOPS_HUB_INTAKE_API_KEY:-}
+
+  frontend:
+    ports: []
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: iaops-caddy
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    environment:
+      IAOPS_DOMAIN: ${IAOPS_DOMAIN}
+      IAOPS_TLS_EMAIL: ${IAOPS_TLS_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

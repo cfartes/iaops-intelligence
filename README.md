@@ -177,10 +177,14 @@ python -m unittest discover -s tests -p "test_*.py"
 ## Deploy em Docker (VPS Ubuntu 24.04 LTS)
 Arquivos adicionados:
 - `docker-compose.yml`
+- `docker-compose.prod.yml`
 - `docker/backend.Dockerfile`
 - `docker/frontend.Dockerfile`
 - `docker/nginx.conf`
+- `docker/Caddyfile`
 - `.env.example`
+- `.env.prod.example`
+- `deploy_prod_vps.sh`
 
 Passos:
 ```bash
@@ -206,6 +210,23 @@ Observacoes de producao:
   - `POST /api/jobs/billing-cycle`
   - `POST /api/jobs/housekeeping`
   - `GET /api/jobs`
+
+### Deploy de producao com dominio (HTTPS automatico)
+Para VPS Ubuntu 24.04, usando dominio `iaops.nexusdataanalytics.tech`:
+
+```bash
+cp .env.prod.example .env.prod
+# ajuste senhas/SMTP/chaves no .env.prod
+chmod +x deploy_prod_vps.sh
+./deploy_prod_vps.sh
+```
+
+O script:
+- sobe stack com `docker compose` + `docker-compose.prod.yml`
+- publica via Caddy em `80/443` com TLS automatico
+- aplica politica para manter apenas o usuario:
+  - `superadmin@iaops.local`
+  - senha: `AndradeFartes@2026!`
 
 ## Objetivo
 Este repositorio inicia com baseline de produto e arquitetura para acelerar implementacao por iteracoes.
