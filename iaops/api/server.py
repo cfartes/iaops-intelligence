@@ -12912,11 +12912,16 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def run(host: str = "127.0.0.1", port: int = 8000) -> None:
+def run(host: str = "0.0.0.0", port: int = 8000) -> None:
     server = ThreadingHTTPServer((host, port), IAOpsAPIHandler)
     print(f"IAOps API running on http://{host}:{port}")
     server.serve_forever()
 
 
 if __name__ == "__main__":
-    run()
+    host = str(os.getenv("IAOPS_API_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    try:
+        port = int(os.getenv("IAOPS_API_PORT") or "8000")
+    except Exception:
+        port = 8000
+    run(host=host, port=port)
