@@ -1,12 +1,12 @@
 services:
   db:
-    ports: []
+    ports: !reset []
 
   redis:
-    ports: []
+    ports: !reset []
 
   api:
-    ports: []
+    ports: !reset []
     environment:
       IAOPS_SIGNUP_CONFIRM_URL_BASE: ${IAOPS_SIGNUP_CONFIRM_URL_BASE:-https://${IAOPS_DOMAIN}/api/auth/confirm-link}
       IAOPS_HUB_BASE_URL: ${IAOPS_HUB_BASE_URL:-}
@@ -14,7 +14,7 @@ services:
       IAOPS_HUB_INTAKE_API_KEY: ${IAOPS_HUB_INTAKE_API_KEY:-}
 
   frontend:
-    ports: []
+    ports: !reset []
 
   caddy:
     image: caddy:2.8-alpine
