@@ -34,16 +34,34 @@ DOMAIN_EFFECTIVE="$(grep -E '^IAOPS_DOMAIN=' .env.prod | tail -n1 | cut -d'=' -f
 if [ -z "${DOMAIN_EFFECTIVE}" ]; then
   DOMAIN_EFFECTIVE="${DOMAIN_DEFAULT}"
 fi
+FRONTEND_BIND_PORT="$(grep -E '^IAOPS_FRONTEND_BIND_PORT=' .env.prod | tail -n1 | cut -d'=' -f2- | tr -d '\r' || true)"
+if [ -z "${FRONTEND_BIND_PORT}" ]; then
+  FRONTEND_BIND_PORT="18080"
+fi
+USE_EMBEDDED_EDGE="$(grep -E '^IAOPS_USE_EMBEDDED_EDGE=' .env.prod | tail -n1 | cut -d'=' -f2- | tr -d '\r' || true)"
+if [ -z "${USE_EMBEDDED_EDGE}" ]; then
+  USE_EMBEDDED_EDGE="0"
+fi
 
 COMPOSE_CMD=(docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml)
+if [ "${USE_EMBEDDED_EDGE}" = "1" ]; then
+  COMPOSE_CMD+=(--profile edge)
+fi
 
 echo "[prod] Subindo servicos..."
 "${COMPOSE_CMD[@]}" up -d --build
 
-echo "[prod] Aguardando health via Caddy..."
+if [ "${USE_EMBEDDED_EDGE}" = "1" ]; then
+  HEALTH_URL="http://127.0.0.1/health"
+  echo "[prod] Modo edge embutido (Caddy). Health: ${HEALTH_URL}"
+else
+  HEALTH_URL="http://127.0.0.1:${FRONTEND_BIND_PORT}/health"
+  echo "[prod] Modo proxy externo. Health: ${HEALTH_URL}"
+fi
+echo "[prod] Aguardando health..."
 TRIES=40
 for ((i=1; i<=TRIES; i++)); do
-  if curl -fsS "http://127.0.0.1/health" >/dev/null 2>&1; then
+  if curl -fsS "${HEALTH_URL}" >/dev/null 2>&1; then
     echo "[prod] Health OK."
     break
   fi
@@ -148,3 +166,6 @@ echo "[prod] Estado dos servicos:"
 echo "[prod] Deploy concluido."
 echo "[prod] URL: https://${DOMAIN_EFFECTIVE}"
 echo "[prod] Usuario superadmin: ${SUPERADMIN_EMAIL}"
+if [ "${USE_EMBEDDED_EDGE}" != "1" ]; then
+  echo "[prod] Configure seu proxy central para encaminhar ${DOMAIN_EFFECTIVE} -> http://127.0.0.1:${FRONTEND_BIND_PORT}"
+fi

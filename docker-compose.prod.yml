@@ -14,12 +14,14 @@ services:
       IAOPS_HUB_INTAKE_API_KEY: ${IAOPS_HUB_INTAKE_API_KEY:-}
 
   frontend:
-    ports: !reset []
+    ports: !reset
+      - "127.0.0.1:${IAOPS_FRONTEND_BIND_PORT:-18080}:80"
 
   caddy:
     image: caddy:2.8-alpine
     container_name: iaops-caddy
     restart: unless-stopped
+    profiles: ["edge"]
     depends_on:
       - frontend
     environment:

@@ -223,10 +223,16 @@ chmod +x deploy_prod_vps.sh
 
 O script:
 - sobe stack com `docker compose` + `docker-compose.prod.yml`
-- publica via Caddy em `80/443` com TLS automatico
+- por padrao usa **proxy externo** (multi-app), publicando somente `127.0.0.1:${IAOPS_FRONTEND_BIND_PORT:-18080}`
+- opcionalmente publica via Caddy em `80/443` com TLS automatico se `IAOPS_USE_EMBEDDED_EDGE=1`
 - aplica politica para manter apenas o usuario:
   - `superadmin@iaops.local`
   - senha: `AndradeFartes@2026!`
+
+Modo recomendado para VPS com varios apps:
+- manter `IAOPS_USE_EMBEDDED_EDGE=0`
+- no proxy central (nginx/traefik/caddy do host), rotear:
+  - `iaops.nexusdataanalytics.tech` -> `http://127.0.0.1:18080`
 
 ## Objetivo
 Este repositorio inicia com baseline de produto e arquitetura para acelerar implementacao por iteracoes.
