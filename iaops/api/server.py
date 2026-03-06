@@ -79,6 +79,7 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
     billing_plan_limits_ready = False
     smtp_table_ready = False
     hub_config_table_ready = False
+    hub_intake_pending_ready = False
     client_release_date_ready = False
 
     @staticmethod
@@ -2750,10 +2751,13 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         if isinstance(confirm_result, dict):
             client_id = int(confirm_result.get("client_id") or 0)
             if client_id > 0:
-                hub_intake = self._send_client_to_hub_intake(client_id=client_id)
+                try:
+                    hub_intake = self._send_or_queue_client_hub_intake(client_id=client_id, retry_delay_sec=1800)
+                except Exception:
+                    hub_intake = {"sent": False, "queued_retry": False}
         response_data = dict(confirm_result) if isinstance(confirm_result, dict) else confirm_result
         if isinstance(response_data, dict):
-            response_data["hub_intake"] = hub_intake or {"sent": False, "reason": "not_applicable"}
+            response_data["hub_intake"] = hub_intake or {"sent": False, "queued_retry": False}
         self._send_json(
             HTTPStatus.OK,
             {
@@ -2837,7 +2841,10 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             except Exception:
                 client_id = 0
             if client_id > 0:
-                self._send_client_to_hub_intake(client_id=client_id)
+                try:
+                    self._send_or_queue_client_hub_intake(client_id=client_id, retry_delay_sec=1800)
+                except Exception:
+                    pass
             self._send_html(
                 HTTPStatus.OK,
                 "<h2>Cadastro confirmado</h2><p>Seu acesso foi ativado com sucesso. Volte ao app e faca login.</p>",
@@ -8683,6 +8690,42 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
         cls.hub_config_table_ready = True
 
     @classmethod
+    def _ensure_hub_intake_pending_table(cls) -> None:
+        if cls.hub_intake_pending_ready:
+            return
+        dsn = cls._get_db_dsn()
+        if not dsn or connect is None:
+            return
+        schema = cls.signup_schema
+        with connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {schema}.hub_intake_pending (
+                    id BIGSERIAL PRIMARY KEY,
+                    client_id BIGINT NOT NULL UNIQUE REFERENCES {schema}.client(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    last_status_code INTEGER,
+                    payload_json JSONB,
+                    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    sent_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_hub_intake_pending_status_next_retry
+                    ON {schema}.hub_intake_pending (status, next_retry_at)
+                """
+            )
+            conn.commit()
+        cls.hub_intake_pending_ready = True
+
+    @classmethod
     def _db_get_hub_integration_config(cls) -> dict[str, object]:
         dsn = cls._get_db_dsn()
         if not dsn or connect is None:
@@ -12009,6 +12052,145 @@ class IAOpsAPIHandler(BaseHTTPRequestHandler):
             return {"sent": False, "status_code": int(exc.code), "reason": details or str(exc.reason)}
         except Exception as exc:
             return {"sent": False, "reason": str(exc)}
+
+    def _db_upsert_hub_intake_pending(
+        self,
+        *,
+        client_id: int,
+        reason: str,
+        status_code: object = None,
+        payload_obj: dict[str, object] | None = None,
+        retry_delay_sec: int = 1800,
+    ) -> None:
+        if not self._is_db_enabled():
+            return
+        cid = int(client_id or 0)
+        if cid <= 0:
+            return
+        self._ensure_signup_tables()
+        self._ensure_hub_intake_pending_table()
+        schema = self.signup_schema
+        delay = max(60, int(retry_delay_sec or 1800))
+        payload_json = json.dumps(payload_obj or {}, ensure_ascii=True)
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.hub_intake_pending (
+                    client_id, status, attempts, last_error, last_status_code, payload_json, next_retry_at, updated_at
+                )
+                VALUES (
+                    %(client_id)s::bigint, 'pending', 1, %(last_error)s, %(last_status_code)s, %(payload_json)s::jsonb,
+                    NOW() + (%(retry_delay_sec)s::text || ' seconds')::interval, NOW()
+                )
+                ON CONFLICT (client_id)
+                DO UPDATE SET
+                    status = 'pending',
+                    attempts = GREATEST(1, {schema}.hub_intake_pending.attempts + 1),
+                    last_error = EXCLUDED.last_error,
+                    last_status_code = EXCLUDED.last_status_code,
+                    payload_json = COALESCE(EXCLUDED.payload_json, {schema}.hub_intake_pending.payload_json),
+                    next_retry_at = NOW() + (%(retry_delay_sec)s::text || ' seconds')::interval,
+                    updated_at = NOW()
+                """,
+                {
+                    "client_id": cid,
+                    "last_error": str(reason or "send_failed")[:2000],
+                    "last_status_code": int(status_code) if status_code not in (None, "") else None,
+                    "payload_json": payload_json,
+                    "retry_delay_sec": delay,
+                },
+            )
+            conn.commit()
+
+    def _db_mark_hub_intake_sent(
+        self,
+        *,
+        client_id: int,
+        status_code: object = None,
+        payload_obj: dict[str, object] | None = None,
+    ) -> None:
+        if not self._is_db_enabled():
+            return
+        cid = int(client_id or 0)
+        if cid <= 0:
+            return
+        self._ensure_signup_tables()
+        self._ensure_hub_intake_pending_table()
+        schema = self.signup_schema
+        payload_json = json.dumps(payload_obj or {}, ensure_ascii=True)
+        with connect(self._get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.hub_intake_pending (
+                    client_id, status, attempts, last_status_code, payload_json, sent_at, next_retry_at, updated_at
+                )
+                VALUES (
+                    %(client_id)s::bigint, 'sent', 1, %(last_status_code)s, %(payload_json)s::jsonb, NOW(), NOW(), NOW()
+                )
+                ON CONFLICT (client_id)
+                DO UPDATE SET
+                    status = 'sent',
+                    sent_at = NOW(),
+                    next_retry_at = NOW(),
+                    last_error = NULL,
+                    last_status_code = COALESCE(EXCLUDED.last_status_code, {schema}.hub_intake_pending.last_status_code),
+                    payload_json = COALESCE(EXCLUDED.payload_json, {schema}.hub_intake_pending.payload_json),
+                    updated_at = NOW()
+                """,
+                {
+                    "client_id": cid,
+                    "last_status_code": int(status_code) if status_code not in (None, "") else None,
+                    "payload_json": payload_json,
+                },
+            )
+            conn.commit()
+
+    def _enqueue_hub_intake_retry(self, *, client_id: int, retry_delay_sec: int = 1800) -> None:
+        if not self._is_db_enabled():
+            return
+        cid = int(client_id or 0)
+        if cid <= 0:
+            return
+        try:
+            queue = get_job_queue(self._get_db_dsn(), self.signup_schema)
+            queue.enqueue(
+                tenant_id=None,
+                job_kind="hub_intake_retry",
+                payload={"client_id": cid, "retry_delay_sec": int(max(60, retry_delay_sec))},
+                delay_seconds=int(max(60, retry_delay_sec)),
+            )
+        except Exception:
+            return
+
+    def _send_or_queue_client_hub_intake(self, *, client_id: int, retry_delay_sec: int = 1800) -> dict[str, object]:
+        cid = int(client_id or 0)
+        if cid <= 0:
+            return {"sent": False, "queued_retry": False}
+        payload_obj = self._db_build_hub_intake_client_payload(client_id=cid)
+        send_result = self._send_client_to_hub_intake(client_id=cid)
+        sent = bool(send_result.get("sent"))
+        if sent:
+            try:
+                self._db_mark_hub_intake_sent(
+                    client_id=cid,
+                    status_code=send_result.get("status_code"),
+                    payload_obj=payload_obj,
+                )
+            except Exception:
+                pass
+            return {"sent": True, "queued_retry": False}
+        try:
+            self._db_upsert_hub_intake_pending(
+                client_id=cid,
+                reason=str(send_result.get("reason") or "send_failed"),
+                status_code=send_result.get("status_code"),
+                payload_obj=payload_obj,
+                retry_delay_sec=retry_delay_sec,
+            )
+            self._enqueue_hub_intake_retry(client_id=cid, retry_delay_sec=retry_delay_sec)
+            return {"sent": False, "queued_retry": True}
+        except Exception:
+            return {"sent": False, "queued_retry": False}
 
     def _db_update_client_release_date(
         self,

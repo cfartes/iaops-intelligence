@@ -22,16 +22,37 @@ class JobQueue:
     schema: str = "iaops_gov"
     use_celery: bool = False
 
-    def enqueue(self, *, tenant_id: int | None, job_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def enqueue(
+        self,
+        *,
+        tenant_id: int | None,
+        job_kind: str,
+        payload: dict[str, Any],
+        delay_seconds: int = 0,
+    ) -> dict[str, Any]:
         job_id = self._insert_job_run(tenant_id=tenant_id, job_kind=job_kind, payload=payload)
+        normalized_delay = max(0, int(delay_seconds or 0))
         if self.use_celery and celery_app is not None:
-            task = execute_job.delay(job_id, job_kind, payload)  # type: ignore[attr-defined]
-            self._attach_dispatch_metadata(job_id=job_id, payload={"task_id": str(task.id), "runner": "celery"})
-            return {"job_id": job_id, "status": "queued", "runner": "celery", "task_id": str(task.id)}
+            task = execute_job.apply_async(args=[job_id, job_kind, payload], countdown=normalized_delay)  # type: ignore[attr-defined]
+            self._attach_dispatch_metadata(
+                job_id=job_id,
+                payload={"task_id": str(task.id), "runner": "celery", "dispatch_delay_sec": normalized_delay},
+            )
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "runner": "celery",
+                "task_id": str(task.id),
+                "dispatch_delay_sec": normalized_delay,
+            }
 
-        thread = threading.Thread(target=self._run_sync_job, args=(job_id, job_kind, payload), daemon=True)
+        thread = threading.Thread(
+            target=self._run_sync_job,
+            args=(job_id, job_kind, payload, normalized_delay),
+            daemon=True,
+        )
         thread.start()
-        return {"job_id": job_id, "status": "queued", "runner": "thread"}
+        return {"job_id": job_id, "status": "queued", "runner": "thread", "dispatch_delay_sec": normalized_delay}
 
     def list_jobs(self, *, tenant_id: int | None, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         if not self._db_enabled():
@@ -102,7 +123,9 @@ class JobQueue:
         replay["retried_from_job_id"] = int(job_id)
         return replay
 
-    def _run_sync_job(self, job_id: int, job_kind: str, payload: dict[str, Any]) -> None:
+    def _run_sync_job(self, job_id: int, job_kind: str, payload: dict[str, Any], delay_seconds: int = 0) -> None:
+        if int(delay_seconds or 0) > 0:
+            time.sleep(int(delay_seconds))
         max_retries = int(os.getenv("IAOPS_SYNC_JOB_MAX_RETRIES") or 3)
         attempt = 0
         while True:

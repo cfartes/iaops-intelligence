@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from typing import Any
@@ -196,6 +197,148 @@ def run_housekeeping(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "retention_days": retention_days, "deleted_calls": deleted_calls, "deleted_jobs": deleted_jobs}
 
 
+def run_hub_intake_retry(payload: dict[str, Any]) -> dict[str, Any]:
+    if connect is None:
+        return {"status": "error", "message": "psycopg indisponivel"}
+    dsn = os.getenv("IAOPS_DB_DSN")
+    schema = os.getenv("IAOPS_DB_SCHEMA") or "iaops_gov"
+    if not dsn:
+        return {"status": "error", "message": "IAOPS_DB_DSN nao configurado"}
+
+    client_id = int(payload.get("client_id") or 0)
+    limit = max(1, min(int(payload.get("limit") or 20), 100))
+    retry_delay_sec = max(60, int(payload.get("retry_delay_sec") or 1800))
+    _ensure_hub_intake_pending_table(dsn=dsn, schema=schema)
+
+    with connect(dsn) as conn, conn.cursor() as cur:
+        if client_id > 0:
+            cur.execute(
+                f"""
+                SELECT id, client_id, attempts
+                FROM {schema}.hub_intake_pending
+                WHERE client_id = %(client_id)s::bigint
+                  AND status = 'pending'
+                LIMIT 1
+                """,
+                {"client_id": client_id},
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT id, client_id, attempts
+                FROM {schema}.hub_intake_pending
+                WHERE status = 'pending'
+                  AND next_retry_at <= NOW()
+                ORDER BY next_retry_at ASC, id ASC
+                LIMIT %(limit)s
+                """,
+                {"limit": limit},
+            )
+        rows = cur.fetchall()
+
+    if not rows:
+        return {"status": "ok", "processed": 0, "sent": 0, "failed": 0}
+
+    cfg = _load_hub_intake_config(dsn=dsn, schema=schema)
+    intake_key = str(cfg.get("intake_api_key") or "").strip()
+    intake_url = str(cfg.get("intake_endpoint_url") or "").strip()
+
+    sent = 0
+    failed = 0
+    failed_clients: list[int] = []
+    last_error = None
+    for row in rows:
+        pending_id = int(row[0])
+        item_client_id = int(row[1])
+        attempts = int(row[2] or 0)
+
+        if not intake_key or not intake_url:
+            failed += 1
+            failed_clients.append(item_client_id)
+            last_error = "intake_nao_configurado"
+            _upsert_hub_intake_pending_failure(
+                dsn=dsn,
+                schema=schema,
+                client_id=item_client_id,
+                attempts=attempts,
+                reason="intake_api_key_or_url_not_configured",
+                status_code=None,
+                payload_json=None,
+                retry_delay_sec=retry_delay_sec,
+            )
+            continue
+
+        payload_obj = _build_hub_intake_client_payload(dsn=dsn, schema=schema, client_id=item_client_id)
+        if not payload_obj:
+            failed += 1
+            last_error = "payload_nao_encontrado"
+            _upsert_hub_intake_pending_failure(
+                dsn=dsn,
+                schema=schema,
+                client_id=item_client_id,
+                attempts=attempts,
+                reason="client_payload_not_found",
+                status_code=None,
+                payload_json=None,
+                retry_delay_sec=retry_delay_sec,
+            )
+            continue
+
+        send_result = _send_hub_intake_payload(
+            intake_url=intake_url,
+            intake_key=intake_key,
+            payload_obj=payload_obj,
+        )
+        if bool(send_result.get("sent")):
+            sent += 1
+            _mark_hub_intake_pending_sent(
+                dsn=dsn,
+                schema=schema,
+                pending_id=pending_id,
+                payload_json=payload_obj,
+                status_code=send_result.get("status_code"),
+            )
+            continue
+
+        failed += 1
+        failed_clients.append(item_client_id)
+        last_error = str(send_result.get("reason") or "send_failed")
+        _upsert_hub_intake_pending_failure(
+            dsn=dsn,
+            schema=schema,
+            client_id=item_client_id,
+            attempts=attempts,
+            reason=last_error,
+            status_code=send_result.get("status_code"),
+            payload_json=payload_obj,
+            retry_delay_sec=retry_delay_sec,
+        )
+
+    # Reagenda somente os clientes que ainda falharam.
+    if failed_clients:
+        try:
+            from iaops.jobs.queue import get_job_queue
+
+            queue = get_job_queue(dsn, schema)
+            for cid in sorted(set(failed_clients)):
+                queue.enqueue(
+                    tenant_id=None,
+                    job_kind="hub_intake_retry",
+                    payload={"client_id": int(cid), "retry_delay_sec": retry_delay_sec},
+                    delay_seconds=retry_delay_sec,
+                )
+        except Exception:
+            pass
+
+    return {
+        "status": "ok" if failed == 0 else ("partial" if sent > 0 else "error"),
+        "processed": len(rows),
+        "sent": sent,
+        "failed": failed,
+        "last_error": last_error,
+    }
+
+
 def search_rag_documents(*, tenant_id: int, query_text: str, limit: int = 8) -> list[dict[str, Any]]:
     if connect is None:
         return []
@@ -235,6 +378,240 @@ def search_rag_documents(*, tenant_id: int, query_text: str, limit: int = 8) -> 
         )
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item for _, item in scored[: max(1, min(limit, 50))]]
+
+
+def _ensure_hub_intake_pending_table(*, dsn: str, schema: str) -> None:
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.hub_intake_pending (
+                id BIGSERIAL PRIMARY KEY,
+                client_id BIGINT NOT NULL UNIQUE REFERENCES {schema}.client(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_status_code INTEGER,
+                payload_json JSONB,
+                next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                sent_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_hub_intake_pending_status_next_retry
+                ON {schema}.hub_intake_pending (status, next_retry_at)
+            """
+        )
+        conn.commit()
+
+
+def _load_hub_intake_config(*, dsn: str, schema: str) -> dict[str, str]:
+    env_key = str(
+        os.getenv("IAOPS_HUB_INTAKE_API_KEY")
+        or os.getenv("HUB_APP_KEY")
+        or ""
+    ).strip()
+    env_url = str(
+        os.getenv("IAOPS_HUB_INTAKE_URL")
+        or ""
+    ).strip()
+    if env_key and env_url:
+        return {"intake_api_key": env_key, "intake_endpoint_url": env_url}
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT intake_api_key_enc, intake_endpoint_url
+            FROM {schema}.app_hub_integration_config
+            WHERE id = 1
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    db_key = ""
+    db_url = ""
+    if row:
+        enc_key = str(row[0] or "").strip()
+        if enc_key:
+            try:
+                db_key = decrypt_text(enc_key)
+            except Exception:
+                db_key = ""
+        db_url = str(row[1] or "").strip()
+    return {
+        "intake_api_key": env_key or db_key,
+        "intake_endpoint_url": env_url or db_url,
+    }
+
+
+def _build_hub_intake_client_payload(*, dsn: str, schema: str, client_id: int) -> dict[str, Any] | None:
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                c.id,
+                c.fantasy_name,
+                c.legal_name,
+                c.cnpj,
+                COALESCE(c.contact_email, c.access_email),
+                COALESCE(c.financial_email, c.contact_email, c.access_email),
+                COALESCE(c.nf_email, c.notification_email, c.financial_email, c.contact_email, c.access_email),
+                c.contact_phone,
+                c.address_text,
+                c.bairro,
+                c.cidade,
+                c.uf,
+                c.cep,
+                c.created_at::date AS created_date,
+                c.status,
+                c.data_liberado,
+                COALESCE(bp.code, p.code, '-') AS plan_code,
+                COALESCE(bp.monthly_price_cents, p.monthly_price_cents, 0) AS monthly_price_cents
+            FROM {schema}.client c
+            LEFT JOIN LATERAL (
+                SELECT bs.plan_id
+                FROM {schema}.billing_subscription bs
+                WHERE bs.client_id = c.id
+                  AND bs.status = 'active'
+                ORDER BY bs.id DESC
+                LIMIT 1
+            ) bs ON TRUE
+            LEFT JOIN {schema}.billing_plan bp ON bp.id = bs.plan_id
+            LEFT JOIN LATERAL (
+                SELECT s.plan_id
+                FROM {schema}.subscription s
+                WHERE s.client_id = c.id
+                  AND s.status = 'active'
+                ORDER BY s.id DESC
+                LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN {schema}.plan p ON p.id = s.plan_id
+            WHERE c.id = %(client_id)s::bigint
+            LIMIT 1
+            """,
+            {"client_id": int(client_id)},
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    status_raw = str(row[14] or "").strip().lower()
+    status_access = "active" if status_raw in {"active", "ativo"} else ("blocked" if status_raw in {"blocked", "bloqueado"} else "inactive")
+    address_parts = [str(row[8] or "").strip(), str(row[9] or "").strip(), str(row[10] or "").strip(), str(row[11] or "").strip(), str(row[12] or "").strip()]
+    full_address = ", ".join([part for part in address_parts if part])
+    return {
+        "external_client_id": str(row[0]),
+        "nome": row[1] or row[2] or f"Cliente {row[0]}",
+        "cpf_cnpj": row[3],
+        "email_contato": row[4],
+        "email_financeiro": row[5] or row[4],
+        "email_nf": row[6] or row[5] or row[4],
+        "documento": row[3],
+        "telefone": row[7],
+        "endereco": full_address or row[8],
+        "plano": row[16],
+        "valor_cents": int(row[17] or 0),
+        "data_cadastro": row[13].isoformat() if row[13] else None,
+        "status_acesso": status_access,
+        "data_liberado": row[15].isoformat() if row[15] else None,
+    }
+
+
+def _send_hub_intake_payload(*, intake_url: str, intake_key: str, payload_obj: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url=str(intake_url),
+        method="POST",
+        data=json.dumps(payload_obj).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-HUB-APP-KEY": str(intake_key)},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return {"sent": True, "status_code": int(getattr(response, "status", 200) or 200)}
+    except urllib.error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            details = ""
+        return {"sent": False, "status_code": int(exc.code), "reason": details or str(exc.reason)}
+    except Exception as exc:
+        return {"sent": False, "reason": str(exc)}
+
+
+def _upsert_hub_intake_pending_failure(
+    *,
+    dsn: str,
+    schema: str,
+    client_id: int,
+    attempts: int,
+    reason: str,
+    status_code: Any,
+    payload_json: dict[str, Any] | None,
+    retry_delay_sec: int,
+) -> None:
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.hub_intake_pending (
+                client_id, status, attempts, last_error, last_status_code, payload_json, next_retry_at, updated_at
+            )
+            VALUES (
+                %(client_id)s, 'pending', %(attempts)s, %(last_error)s, %(last_status_code)s, %(payload_json)s::jsonb,
+                NOW() + (%(retry_delay_sec)s::text || ' seconds')::interval,
+                NOW()
+            )
+            ON CONFLICT (client_id)
+            DO UPDATE SET
+                status = 'pending',
+                attempts = GREATEST(1, {schema}.hub_intake_pending.attempts + 1),
+                last_error = EXCLUDED.last_error,
+                last_status_code = EXCLUDED.last_status_code,
+                payload_json = COALESCE(EXCLUDED.payload_json, {schema}.hub_intake_pending.payload_json),
+                next_retry_at = NOW() + (%(retry_delay_sec)s::text || ' seconds')::interval,
+                updated_at = NOW()
+            """,
+            {
+                "client_id": int(client_id),
+                "attempts": max(1, int(attempts or 0) + 1),
+                "last_error": str(reason or "")[:2000],
+                "last_status_code": int(status_code) if status_code not in (None, "") else None,
+                "payload_json": json.dumps(payload_json or {}, ensure_ascii=True),
+                "retry_delay_sec": int(max(60, retry_delay_sec)),
+            },
+        )
+        conn.commit()
+
+
+def _mark_hub_intake_pending_sent(
+    *,
+    dsn: str,
+    schema: str,
+    pending_id: int,
+    payload_json: dict[str, Any] | None,
+    status_code: Any,
+) -> None:
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {schema}.hub_intake_pending
+               SET status = 'sent',
+                   sent_at = NOW(),
+                   next_retry_at = NOW(),
+                   last_error = NULL,
+                   last_status_code = COALESCE(%(last_status_code)s, last_status_code),
+                   payload_json = COALESCE(%(payload_json)s::jsonb, payload_json),
+                   updated_at = NOW()
+             WHERE id = %(pending_id)s
+            """,
+            {
+                "pending_id": int(pending_id),
+                "last_status_code": int(status_code) if status_code not in (None, "") else None,
+                "payload_json": json.dumps(payload_json or {}, ensure_ascii=True),
+            },
+        )
+        conn.commit()
 
 
 def _load_data_sources(*, cur, schema: str, tenant_id: int, data_source_id: Any) -> list[dict]:

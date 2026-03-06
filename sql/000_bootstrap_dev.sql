@@ -12,5 +12,6 @@
 \i sql/010_client_signup.sql
 \i sql/011_platform_ops.sql
 \i sql/012_billing_consistency.sql
+\i sql/013_hub_intake_retry.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql

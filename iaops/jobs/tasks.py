@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover
     connect = None
 
 from .celery_app import celery_app
-from .pipeline import run_billing_cycle, run_housekeeping, run_ingest_metadata, run_monitor_scan, run_rag_rebuild
+from .pipeline import run_billing_cycle, run_housekeeping, run_hub_intake_retry, run_ingest_metadata, run_monitor_scan, run_rag_rebuild
 
 
 def _run_job_payload(job_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -25,6 +25,8 @@ def _run_job_payload(job_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         return run_billing_cycle(payload)
     if job_kind == "housekeeping":
         return run_housekeeping(payload)
+    if job_kind == "hub_intake_retry":
+        return run_hub_intake_retry(payload)
     time.sleep(0.05)
     return {"status": "ok", "details": f"job {job_kind} executed"}
 

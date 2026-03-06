@@ -16,6 +16,7 @@ Plataforma SaaS multi-tenant para governanca de dados, monitoramento operacional
 - [Contexto de tenant por canal](sql/008_channel_tenant_context.sql)
 - [Extensoes de plataforma (LGPD/Billing/RAG/Jobs)](sql/011_platform_ops.sql)
 - [Consistencia de billing (view unificada)](sql/012_billing_consistency.sql)
+- [Fila de retry do intake HUB](sql/013_hub_intake_retry.sql)
 - [Seed MCP baseline](sql/003_mcp_seed.sql)
 - [Dados demo locais](sql/004_demo_data.sql)
 - [Bootstrap dev unico](sql/000_bootstrap_dev.sql)
@@ -124,6 +125,7 @@ Ou aplicar scripts SQL manualmente:
 \i sql/008_channel_tenant_context.sql
 \i sql/011_platform_ops.sql
 \i sql/012_billing_consistency.sql
+\i sql/013_hub_intake_retry.sql
 \i sql/003_mcp_seed.sql
 \i sql/004_demo_data.sql
 ```
