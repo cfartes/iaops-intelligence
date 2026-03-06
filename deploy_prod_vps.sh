@@ -109,6 +109,18 @@ def encode_password(raw: str) -> str:
 
 with psycopg.connect(dsn) as conn, conn.cursor() as cur:
     pwd_hash = encode_password(password)
+    # Compatibilidade com bases antigas e schema novo de cadastro.
+    cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS financial_email TEXT")
+    cur.execute(f"ALTER TABLE {schema}.client ADD COLUMN IF NOT EXISTS nf_email TEXT")
+    cur.execute(
+        f"""
+        UPDATE {schema}.client
+           SET notification_email = COALESCE(notification_email, access_email, contact_email),
+               financial_email = COALESCE(financial_email, access_email, contact_email),
+               nf_email = COALESCE(nf_email, access_email, contact_email)
+        """
+    )
+
     cur.execute(
         f"SELECT id, client_id FROM {schema}.app_user WHERE LOWER(email)=LOWER(%s) LIMIT 1",
         (email,),
@@ -139,15 +151,15 @@ with psycopg.connect(dsn) as conn, conn.cursor() as cur:
                 f"""
                 INSERT INTO {schema}.client (
                     fantasy_name, legal_name, cnpj, address_text, contact_phone,
-                    contact_email, access_email, notification_email, password_hash,
+                    contact_email, access_email, notification_email, financial_email, nf_email, password_hash,
                     email_confirmed_at, status
                 ) VALUES (
                     'IAOps Platform', 'IAOps Platform', '00000000000000', '-', '-',
-                    %s, %s, %s, %s, NOW(), 'active'
+                    %s, %s, %s, %s, %s, %s, NOW(), 'active'
                 )
                 RETURNING id
                 """,
-                (email, email, email, pwd_hash),
+                (email, email, email, email, email, pwd_hash),
             )
             client_id = int(cur.fetchone()[0])
 
