@@ -44,6 +44,19 @@ if [ -z "${USE_EMBEDDED_EDGE}" ]; then
 fi
 
 COMPOSE_CMD=(docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml)
+PORTS_OVERRIDE_FILE="docker-compose.ports.yml"
+if [ "${USE_EMBEDDED_EDGE}" != "1" ]; then
+  if [ ! -f "${PORTS_OVERRIDE_FILE}" ]; then
+    cat > "${PORTS_OVERRIDE_FILE}" <<'YAML'
+services:
+  frontend:
+    ports:
+      - "127.0.0.1:${IAOPS_FRONTEND_BIND_PORT:-18080}:80"
+YAML
+    echo "[prod] ${PORTS_OVERRIDE_FILE} criado para publicar frontend local na porta ${FRONTEND_BIND_PORT}."
+  fi
+  COMPOSE_CMD+=(-f "${PORTS_OVERRIDE_FILE}")
+fi
 if [ "${USE_EMBEDDED_EDGE}" = "1" ]; then
   COMPOSE_CMD+=(--profile edge)
 fi

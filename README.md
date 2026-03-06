@@ -178,6 +178,7 @@ python -m unittest discover -s tests -p "test_*.py"
 Arquivos adicionados:
 - `docker-compose.yml`
 - `docker-compose.prod.yml`
+- `docker-compose.ports.yml`
 - `docker/backend.Dockerfile`
 - `docker/frontend.Dockerfile`
 - `docker/nginx.conf`
@@ -222,7 +223,7 @@ chmod +x deploy_prod_vps.sh
 ```
 
 O script:
-- sobe stack com `docker compose` + `docker-compose.prod.yml`
+- sobe stack com `docker compose` + `docker-compose.prod.yml` e, em modo proxy externo, inclui `docker-compose.ports.yml`
 - por padrao usa **proxy externo** (multi-app), publicando somente `127.0.0.1:${IAOPS_FRONTEND_BIND_PORT:-18080}`
 - opcionalmente publica via Caddy em `80/443` com TLS automatico se `IAOPS_USE_EMBEDDED_EDGE=1`
 - aplica politica para manter apenas o usuario:
